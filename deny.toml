@@ -1,0 +1,75 @@
+# cargo-deny — supply chain policy for mergeFox.
+#
+# Run locally:
+#   cargo install cargo-deny
+#   cargo deny check
+#
+# Run in CI: see .github/workflows/ci.yml (deny job).
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------- advisories
+# Security vulnerability + unmaintained crate policy.
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# `ignore` here for known-accepted advisories. Add as `{ id = "RUSTSEC-...", reason = "..." }`.
+ignore = []
+
+# --------------------------------------------------------------------- licenses
+# We ship under Apache-2.0; only allow compatible OSI-approved licenses.
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "OpenSSL",
+    "CC0-1.0",
+    "BSL-1.0",
+    "0BSD",
+]
+exceptions = []
+
+[licenses.private]
+ignore = true
+
+# --------------------------------------------------------------------- bans
+# No duplicate crates; keep binary size + build times down. If a dup is
+# unavoidable (common with ecosystem churn), add an explicit `skip`.
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = [
+    # Known-abandoned / prefer-alternatives can be added here.
+]
+# Common duplicates we tolerate — revisit each release.
+skip = []
+skip-tree = []
+
+# --------------------------------------------------------------------- sources
+# Only pull from crates.io + well-known git registries. No random URLs.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

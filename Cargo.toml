@@ -2,10 +2,23 @@
 name = "mergefox"
 version = "0.1.0-alpha.1"
 edition = "2021"
+rust-version = "1.76"
 description = "mergeFox — lightweight cross-platform Git GUI focused on branch management, undo/redo, and remote integrations"
 license = "Apache-2.0"
-repository = "https://github.com/yourname/mergefox"
+repository = "https://github.com/JeoungMyeoungHo/MergeFox"
+homepage = "https://github.com/JeoungMyeoungHo/MergeFox"
+documentation = "https://github.com/JeoungMyeoungHo/MergeFox#readme"
 readme = "README.md"
+keywords = ["git", "gui", "egui", "gitoxide", "desktop"]
+categories = ["development-tools", "gui", "command-line-utilities"]
+exclude = [
+    "assets/screenshot-*.png",
+    ".github/",
+    ".claude/",
+    ".claw/",
+    "TODO/",
+    "RELEASE_NOTES.md",
+]
 
 [[bin]]
 name = "mergefox"
@@ -95,6 +108,21 @@ url = "2"
 # SSH key generation / parsing (pure-Rust)
 ssh-key = { version = "0.6", features = ["ed25519", "rsa", "p256"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Structured logging. `tracing` gives us span/event macros that the
+# fmt subscriber renders as human-readable lines, or JSON when
+# `MERGEFOX_LOG_FORMAT=json` is set (useful for bug reports). The
+# rolling appender writes daily-rotated files under the OS log dir so
+# users can attach them to issues without reproducing the bug.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "env-filter",
+    "ansi",
+    "std",
+    "json",
+] }
+tracing-appender = "0.2"
 
 # Sensitive string wrapper — zero on drop
 secrecy = "0.8"
