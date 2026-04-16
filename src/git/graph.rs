@@ -18,8 +18,8 @@
 //! `edges_out` so the renderer can draw the diagonal "joining" lines.
 
 use anyhow::{Context, Result};
-use gix::ObjectId;
 use gix::revision::walk::Sorting;
+use gix::ObjectId;
 use gix_traverse::commit::simple::CommitTimeOrder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,10 +133,7 @@ impl CommitGraph {
             }) else {
                 continue;
             };
-            let parents: Vec<ObjectId> = commit
-                .parent_ids()
-                .map(|id| id.detach())
-                .collect();
+            let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
 
             // Step 1+2: find my lane (or allocate a fresh one) and free it.
             let incoming_lanes = matching_lanes(&active, oid);

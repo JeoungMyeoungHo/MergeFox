@@ -102,16 +102,11 @@ fn do_clone_dispatched(
 
     // Classify destination once; both backends need the same sanity
     // (don't overwrite a live repo, auto-clean failed-clone stubs, etc.).
-    match classify_destination(dest)
-        .with_context(|| format!("inspect {}", dest.display()))?
-    {
+    match classify_destination(dest).with_context(|| format!("inspect {}", dest.display()))? {
         DestinationState::Empty => {}
         DestinationState::PartialClone => {
             std::fs::remove_dir_all(dest).with_context(|| {
-                format!(
-                    "remove partial clone at {} before retrying",
-                    dest.display()
-                )
+                format!("remove partial clone at {} before retrying", dest.display())
             })?;
         }
         DestinationState::ExistingRepo => {
@@ -345,9 +340,8 @@ pub fn spawn_preflight(
 ) -> ClonePreflightHandle {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let outcome = crate::ai::runtime::block_on(async move {
-            probe_size(&host, &owner, &repo).await
-        });
+        let outcome =
+            crate::ai::runtime::block_on(async move { probe_size(&host, &owner, &repo).await });
         let _ = tx.send(outcome);
     });
     ClonePreflightHandle { url, dest, rx }

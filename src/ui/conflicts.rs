@@ -40,33 +40,81 @@ enum NavIntent {
     NextConflict,
 }
 
+enum ConflictIntent {
+    UseFile(PathBuf, ConflictChoice),
+    ResolveEditorRegion(PathBuf, usize, EditorResolution),
+    ResolveEditorAll(PathBuf, EditorResolution),
+    SaveManual(PathBuf, String),
+    Continue,
+    Abort,
+}
+
+/// Built-in editor-side resolution choice for a single conflict region.
+#[derive(Clone, Copy)]
+enum EditorResolution {
+    Ours,
+    Theirs,
+    Both,
+}
+
+#[derive(Clone)]
+struct ConflictRegion {
+    /// Byte range covering the full conflict block, including markers.
+    start: usize,
+    end: usize,
+    ours: String,
+    theirs: String,
+}
+
 /// State for the editor's conflict-navigation cursor. Recomputed every
 /// frame from the current text (cheap — conflict markers are rare).
 struct ConflictMarkers {
-    /// Byte offset of each `<<<<<<<` line opening a region.
-    starts: Vec<usize>,
-    /// Byte offset of each `>>>>>>>` line closing a region.
-    ends: Vec<usize>,
+    regions: Vec<ConflictRegion>,
 }
 
 impl ConflictMarkers {
     fn scan(text: &str) -> Self {
-        let mut starts = Vec::new();
-        let mut ends = Vec::new();
+        let mut regions = Vec::new();
         let mut pos = 0;
+        let mut conflict_start: Option<usize> = None;
+        let mut in_theirs = false;
+        let mut ours = String::new();
+        let mut theirs = String::new();
         for line in text.split_inclusive('\n') {
-            if line.starts_with("<<<<<<<") {
-                starts.push(pos);
-            } else if line.starts_with(">>>>>>>") {
-                ends.push(pos);
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.starts_with("<<<<<<<") {
+                conflict_start = Some(pos);
+                in_theirs = false;
+                ours.clear();
+                theirs.clear();
+            } else if trimmed.starts_with("=======") && conflict_start.is_some() {
+                in_theirs = true;
+            } else if trimmed.starts_with(">>>>>>>") && conflict_start.is_some() {
+                regions.push(ConflictRegion {
+                    start: conflict_start.take().unwrap_or(pos),
+                    end: pos + line.len(),
+                    ours: ours.clone(),
+                    theirs: theirs.clone(),
+                });
+                in_theirs = false;
+            } else if conflict_start.is_some() {
+                if in_theirs {
+                    theirs.push_str(line);
+                } else {
+                    ours.push_str(line);
+                }
             }
             pos += line.len();
         }
-        Self { starts, ends }
+        Self { regions }
     }
 
     fn count(&self) -> usize {
-        self.starts.len()
+        self.regions.len()
+    }
+
+    fn start_offsets(&self) -> impl Iterator<Item = usize> + '_ {
+        self.regions.iter().map(|region| region.start)
     }
 }
 
@@ -127,14 +175,6 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             }
         }
     };
-
-    enum ConflictIntent {
-        Use(PathBuf, ConflictChoice),
-        TakeBoth(PathBuf),
-        SaveManual(PathBuf, String),
-        Continue,
-        Abort,
-    }
 
     let mut intent: Option<ConflictIntent> = None;
     let mut nav_intent: Option<NavIntent> = None;
@@ -269,10 +309,10 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         .fill(palette::OURS);
                         ui.add_enabled_ui(entry.ours.is_some(), |ui| {
                             if ui.add(ours_btn).on_hover_text(format!(
-                                "Keep the {} version, discard the {} version",
+                                "Resolve the whole file to the {} version, discarding {}",
                                 labels.ours_short, labels.theirs_short
                             )).clicked() {
-                                intent = Some(ConflictIntent::Use(
+                                intent = Some(ConflictIntent::UseFile(
                                     entry.path.clone(),
                                     ConflictChoice::Ours,
                                 ));
@@ -287,33 +327,15 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         .fill(palette::THEIRS);
                         ui.add_enabled_ui(entry.theirs.is_some(), |ui| {
                             if ui.add(theirs_btn).on_hover_text(format!(
-                                "Keep the {} version, discard the {} version",
+                                "Resolve the whole file to the {} version, discarding {}",
                                 labels.theirs_short, labels.ours_short
                             )).clicked() {
-                                intent = Some(ConflictIntent::Use(
+                                intent = Some(ConflictIntent::UseFile(
                                     entry.path.clone(),
                                     ConflictChoice::Theirs,
                                 ));
                             }
                         });
-
-                        ui.add_enabled_ui(
-                            !entry.is_binary
-                                && ConflictMarkers::scan(&ws.conflict_editor_text).count()
-                                    > 0,
-                            |ui| {
-                                if ui
-                                    .button("⇵ Take Both")
-                                    .on_hover_text(
-                                        "Keep both sides in every conflict region\n\
-                                        (ours first, then theirs)",
-                                    )
-                                    .clicked()
-                                {
-                                    intent = Some(ConflictIntent::TakeBoth(entry.path.clone()));
-                                }
-                            },
-                        );
 
                         ui.separator();
 
@@ -373,6 +395,75 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                                 }
                             });
                         });
+
+                        if markers.count() > 0 {
+                            ui.add_space(6.0);
+                            ui.group(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("Built-in Conflict Tools").strong());
+                                    ui.weak(
+                                        "Resolve each region with ours, theirs, or both without asking AI.",
+                                    );
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .button(format!("Use {} In All Regions", labels.ours_short))
+                                        .on_hover_text(
+                                            "Replace every conflict block in the editor with the ours side",
+                                        )
+                                        .clicked()
+                                    {
+                                        intent = Some(ConflictIntent::ResolveEditorAll(
+                                            entry.path.clone(),
+                                            EditorResolution::Ours,
+                                        ));
+                                    }
+                                    if ui
+                                        .button(format!(
+                                            "Use {} In All Regions",
+                                            labels.theirs_short
+                                        ))
+                                        .on_hover_text(
+                                            "Replace every conflict block in the editor with the theirs side",
+                                        )
+                                        .clicked()
+                                    {
+                                        intent = Some(ConflictIntent::ResolveEditorAll(
+                                            entry.path.clone(),
+                                            EditorResolution::Theirs,
+                                        ));
+                                    }
+                                    if ui
+                                        .button("Take Both In All Regions")
+                                        .on_hover_text(
+                                            "Replace every conflict block with ours first, then theirs",
+                                        )
+                                        .clicked()
+                                    {
+                                        intent = Some(ConflictIntent::ResolveEditorAll(
+                                            entry.path.clone(),
+                                            EditorResolution::Both,
+                                        ));
+                                    }
+                                });
+                                ui.add_space(4.0);
+                                ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .max_height(180.0)
+                                    .show(ui, |ui| {
+                                        for (idx, region) in markers.regions.iter().enumerate() {
+                                            render_region_card(
+                                                ui,
+                                                entry,
+                                                idx,
+                                                region,
+                                                &labels,
+                                                &mut intent,
+                                            );
+                                        }
+                                    });
+                            });
+                        }
                     }
 
                     ui.add_space(4.0);
@@ -506,24 +597,14 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         });
 
     match intent {
-        Some(ConflictIntent::Use(path, choice)) => {
+        Some(ConflictIntent::UseFile(path, choice)) => {
             resolve_conflict_choice(app, &path, choice);
         }
-        Some(ConflictIntent::TakeBoth(path)) => {
-            let merged = if let View::Workspace(tabs) = &app.view {
-                take_both(&tabs.current().conflict_editor_text)
-            } else {
-                return;
-            };
-            // Replace the editor contents so the user can still tweak
-            // before saving, rather than saving immediately.
-            if let View::Workspace(tabs) = &mut app.view {
-                tabs.current_mut().conflict_editor_text = merged.clone();
-            }
-            app.hud = Some(crate::app::Hud::new(
-                format!("Combined both sides in {}", format_path(&path)),
-                1800,
-            ));
+        Some(ConflictIntent::ResolveEditorRegion(path, index, choice)) => {
+            apply_editor_resolution(app, &path, Some(index), choice);
+        }
+        Some(ConflictIntent::ResolveEditorAll(path, choice)) => {
+            apply_editor_resolution(app, &path, None, choice);
         }
         Some(ConflictIntent::SaveManual(path, text)) => {
             resolve_conflict_manual(app, &path, &text);
@@ -532,6 +613,89 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         Some(ConflictIntent::Abort) => app.abort_conflict_operation(),
         None => {}
     }
+}
+
+fn render_region_card(
+    ui: &mut egui::Ui,
+    entry: &ConflictEntry,
+    idx: usize,
+    region: &ConflictRegion,
+    labels: &SideLabels,
+    intent: &mut Option<ConflictIntent>,
+) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("Conflict {}", idx + 1)).strong());
+                ui.weak(format!(
+                    "{} line{} vs {} line{}",
+                    line_count(&region.ours),
+                    if line_count(&region.ours) == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    line_count(&region.theirs),
+                    if line_count(&region.theirs) == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+                if ui
+                    .small_button(format!("Use {}", labels.ours_short))
+                    .on_hover_text("Replace this region with the ours side")
+                    .clicked()
+                {
+                    *intent = Some(ConflictIntent::ResolveEditorRegion(
+                        entry.path.clone(),
+                        idx,
+                        EditorResolution::Ours,
+                    ));
+                }
+                if ui
+                    .small_button(format!("Use {}", labels.theirs_short))
+                    .on_hover_text("Replace this region with the theirs side")
+                    .clicked()
+                {
+                    *intent = Some(ConflictIntent::ResolveEditorRegion(
+                        entry.path.clone(),
+                        idx,
+                        EditorResolution::Theirs,
+                    ));
+                }
+                if ui
+                    .small_button("Both")
+                    .on_hover_text("Replace this region with ours first, then theirs")
+                    .clicked()
+                {
+                    *intent = Some(ConflictIntent::ResolveEditorRegion(
+                        entry.path.clone(),
+                        idx,
+                        EditorResolution::Both,
+                    ));
+                }
+            });
+            ui.horizontal_top(|ui| {
+                ui.colored_label(
+                    palette::OURS,
+                    RichText::new(format!("{}:", labels.ours_short))
+                        .small()
+                        .strong(),
+                );
+                ui.weak(snippet(&region.ours));
+            });
+            ui.horizontal_top(|ui| {
+                ui.colored_label(
+                    palette::THEIRS,
+                    RichText::new(format!("{}:", labels.theirs_short))
+                        .small()
+                        .strong(),
+                );
+                ui.weak(snippet(&region.theirs));
+            });
+        });
 }
 
 /// File-list row with an inline conflict-count badge.
@@ -552,19 +716,16 @@ fn file_list_row(
                 .horizontal(|ui| {
                     ui.set_width(ui.available_width());
                     let path_resp = ui.selectable_label(selected, label_text);
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if entry.is_binary {
-                                ui.colored_label(palette::DANGER, "Bin");
-                            } else if conflict_count > 0 {
-                                ui.colored_label(
-                                    palette::DANGER,
-                                    RichText::new(format!("⚠{conflict_count}")).small().strong(),
-                                );
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if entry.is_binary {
+                            ui.colored_label(palette::DANGER, "Bin");
+                        } else if conflict_count > 0 {
+                            ui.colored_label(
+                                palette::DANGER,
+                                RichText::new(format!("⚠{conflict_count}")).small().strong(),
+                            );
+                        }
+                    });
                     path_resp
                 })
                 .inner;
@@ -636,9 +797,7 @@ struct SideLabels {
 
 impl SideLabels {
     fn resolve(state: RepoState, head_branch: Option<&str>) -> Self {
-        let branch_suffix = head_branch
-            .map(|b| format!(" ({b})"))
-            .unwrap_or_default();
+        let branch_suffix = head_branch.map(|b| format!(" ({b})")).unwrap_or_default();
         match state {
             RepoState::Merge => Self {
                 ours_short: "Ours".into(),
@@ -787,15 +946,12 @@ fn render_blob_preview(
             ui.horizontal(|ui| {
                 ui.colored_label(accent, RichText::new(title).strong());
                 if let Some(blob) = blob {
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.weak(format_size(blob.size));
-                            if let Some(oid) = blob.oid {
-                                ui.weak(RichText::new(short_sha(&oid)).monospace());
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak(format_size(blob.size));
+                        if let Some(oid) = blob.oid {
+                            ui.weak(RichText::new(short_sha(&oid)).monospace());
+                        }
+                    });
                 }
             });
             match blob {
@@ -926,16 +1082,11 @@ fn pick_marker(
     editor_id: egui::Id,
     nav: &NavIntent,
 ) -> Option<usize> {
-    if markers.starts.is_empty() {
+    if markers.regions.is_empty() {
         return None;
     }
     let current_char = TextEdit::load_state(ctx, editor_id)
-        .and_then(|state| {
-            state
-                .cursor
-                .char_range()
-                .map(|r| r.primary.index)
-        })
+        .and_then(|state| state.cursor.char_range().map(|r| r.primary.index))
         .unwrap_or(0);
 
     // We compare in BYTE offsets because that's how we recorded markers.
@@ -945,53 +1096,140 @@ fn pick_marker(
     let current_byte = current_char;
     match nav {
         NavIntent::NextConflict => markers
-            .starts
-            .iter()
-            .copied()
+            .start_offsets()
             .find(|&m| m > current_byte)
-            .or_else(|| markers.starts.first().copied()),
+            .or_else(|| markers.start_offsets().next()),
         NavIntent::PrevConflict => markers
-            .starts
-            .iter()
+            .start_offsets()
+            .collect::<Vec<_>>()
+            .into_iter()
             .rev()
-            .copied()
             .find(|&m| m < current_byte)
-            .or_else(|| markers.starts.last().copied()),
+            .or_else(|| markers.start_offsets().last()),
     }
 }
 
-/// Combine both sides (ours first, then theirs) in every conflict region.
-fn take_both(text: &str) -> String {
-    let mut out = String::new();
-    let mut in_conflict = false;
-    let mut in_theirs = false;
-    let mut ours = String::new();
-    let mut theirs = String::new();
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.starts_with("<<<<<<<") {
-            in_conflict = true;
-            in_theirs = false;
-            ours.clear();
-            theirs.clear();
-        } else if trimmed.starts_with("=======") && in_conflict {
-            in_theirs = true;
-        } else if trimmed.starts_with(">>>>>>>") && in_conflict {
-            out.push_str(&ours);
-            out.push_str(&theirs);
-            in_conflict = false;
-            in_theirs = false;
-        } else if in_conflict {
-            if in_theirs {
-                theirs.push_str(line);
-            } else {
-                ours.push_str(line);
-            }
+fn apply_editor_resolution(
+    app: &mut MergeFoxApp,
+    path: &Path,
+    region_index: Option<usize>,
+    choice: EditorResolution,
+) {
+    let result = {
+        let View::Workspace(tabs) = &mut app.view else {
+            return;
+        };
+        let ws = tabs.current_mut();
+        let updated = match region_index {
+            Some(index) => resolve_region_in_editor(&ws.conflict_editor_text, index, choice),
+            None => Some(resolve_all_regions_in_editor(
+                &ws.conflict_editor_text,
+                choice,
+            )),
+        };
+        if let Some(text) = updated {
+            ws.conflict_editor_text = text;
+            Ok(())
         } else {
-            out.push_str(line);
+            Err(anyhow::anyhow!(
+                "conflict region no longer exists in the editor"
+            ))
+        }
+    };
+
+    match result {
+        Ok(()) => {
+            let action = match (region_index, choice) {
+                (Some(_), EditorResolution::Ours) => "Applied ours to one region",
+                (Some(_), EditorResolution::Theirs) => "Applied theirs to one region",
+                (Some(_), EditorResolution::Both) => "Applied both sides to one region",
+                (None, EditorResolution::Ours) => "Applied ours to all regions",
+                (None, EditorResolution::Theirs) => "Applied theirs to all regions",
+                (None, EditorResolution::Both) => "Applied both sides to all regions",
+            };
+            app.hud = Some(crate::app::Hud::new(
+                format!("{action} in {}", format_path(path)),
+                1800,
+            ));
+        }
+        Err(err) => {
+            app.last_error = Some(format!("editor conflict tool: {err:#}"));
         }
     }
+}
+
+fn resolve_region_in_editor(
+    text: &str,
+    region_index: usize,
+    choice: EditorResolution,
+) -> Option<String> {
+    let markers = ConflictMarkers::scan(text);
+    let region = markers.regions.get(region_index)?;
+    let replacement = match choice {
+        EditorResolution::Ours => region.ours.as_str(),
+        EditorResolution::Theirs => region.theirs.as_str(),
+        EditorResolution::Both => {
+            return Some(replace_region(
+                text,
+                region,
+                &(region.ours.clone() + &region.theirs),
+            ))
+        }
+    };
+    Some(replace_region(text, region, replacement))
+}
+
+fn resolve_all_regions_in_editor(text: &str, choice: EditorResolution) -> String {
+    let markers = ConflictMarkers::scan(text);
+    if markers.regions.is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for region in &markers.regions {
+        out.push_str(&text[cursor..region.start]);
+        match choice {
+            EditorResolution::Ours => out.push_str(&region.ours),
+            EditorResolution::Theirs => out.push_str(&region.theirs),
+            EditorResolution::Both => {
+                out.push_str(&region.ours);
+                out.push_str(&region.theirs);
+            }
+        }
+        cursor = region.end;
+    }
+    out.push_str(&text[cursor..]);
     out
+}
+
+fn replace_region(text: &str, region: &ConflictRegion, replacement: &str) -> String {
+    let mut out = String::with_capacity(text.len() + replacement.len());
+    out.push_str(&text[..region.start]);
+    out.push_str(replacement);
+    out.push_str(&text[region.end..]);
+    out
+}
+
+fn line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.lines().count().max(1)
+    }
+}
+
+fn snippet(text: &str) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        "(empty)".to_string()
+    } else {
+        let mut out: String = first.chars().take(72).collect();
+        if first.chars().count() > 72 {
+            out.push_str("...");
+        }
+        out
+    }
 }
 
 fn conflict_title(state: RepoState, rebase_summary: Option<&str>) -> String {

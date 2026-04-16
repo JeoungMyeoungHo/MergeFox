@@ -132,11 +132,10 @@ pub fn diff_for_commit(repo_path: &Path, oid: gix::ObjectId) -> Result<RepoDiff>
     let gix_repo = gix::discover(repo_path).context("open gix repo for diff")?;
     let t_gix_discover = t0.elapsed();
 
-    let (title, commit_message, commit_author) =
-        commit_meta(&gix_repo, oid).unwrap_or_else(|| {
-            let s = oid.to_string();
-            (s[..7.min(s.len())].to_string(), None, None)
-        });
+    let (title, commit_message, commit_author) = commit_meta(&gix_repo, oid).unwrap_or_else(|| {
+        let s = oid.to_string();
+        (s[..7.min(s.len())].to_string(), None, None)
+    });
     let t_meta = t0.elapsed();
 
     // Single `git show` that emits BOTH `--raw` (file OIDs + status) and
@@ -200,11 +199,7 @@ fn commit_meta(
     gix_repo: &gix::Repository,
     oid: gix::ObjectId,
 ) -> Option<(String, Option<String>, Option<String>)> {
-    let commit = gix_repo
-        .find_object(oid)
-        .ok()?
-        .try_into_commit()
-        .ok()?;
+    let commit = gix_repo.find_object(oid).ok()?.try_into_commit().ok()?;
     let parent_ids: Vec<gix::ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
     let msg = commit.message().ok()?;
     let summary = msg.summary().to_string();
@@ -285,10 +280,7 @@ fn parse_raw_lines(lines: &[&str]) -> Vec<RawEntry> {
         let (path, orig_path) = if matches!(status, 'R' | 'C') {
             let old = tab_iter.next().unwrap_or("");
             let new = tab_iter.next().unwrap_or("");
-            (
-                PathBuf::from(new),
-                Some(PathBuf::from(old)),
-            )
+            (PathBuf::from(new), Some(PathBuf::from(old)))
         } else {
             let p = tab_iter.next().unwrap_or("");
             (PathBuf::from(p), None)
@@ -515,26 +507,25 @@ fn build_file_diffs(raw: Vec<RawEntry>, patches: Vec<PatchSection>) -> Vec<FileD
         } else if is_binary {
             FileKind::Binary
         } else {
-            let (hunks, lines_added, lines_removed, truncated) =
-                if let Some(ps) = patch {
-                    let mut add = 0usize;
-                    let mut rem = 0usize;
-                    let mut total = 0usize;
-                    for h in &ps.hunks {
-                        for l in &h.lines {
-                            match l.kind {
-                                LineKind::Add => add += 1,
-                                LineKind::Remove => rem += 1,
-                                _ => {}
-                            }
-                            total += 1;
+            let (hunks, lines_added, lines_removed, truncated) = if let Some(ps) = patch {
+                let mut add = 0usize;
+                let mut rem = 0usize;
+                let mut total = 0usize;
+                for h in &ps.hunks {
+                    for l in &h.lines {
+                        match l.kind {
+                            LineKind::Add => add += 1,
+                            LineKind::Remove => rem += 1,
+                            _ => {}
                         }
+                        total += 1;
                     }
-                    let trunc = total >= MAX_LINES_PER_FILE;
-                    (ps.hunks.clone(), add, rem, trunc)
-                } else {
-                    (Vec::new(), 0, 0, false)
-                };
+                }
+                let trunc = total >= MAX_LINES_PER_FILE;
+                (ps.hunks.clone(), add, rem, trunc)
+            } else {
+                (Vec::new(), 0, 0, false)
+            };
             FileKind::Text {
                 hunks,
                 lines_added,
@@ -561,7 +552,10 @@ fn build_file_diffs(raw: Vec<RawEntry>, patches: Vec<PatchSection>) -> Vec<FileD
 // ---- blob loading ----
 
 /// Load a blob's raw bytes from the gix object store.
-pub fn load_blob_bytes(gix_repo: &gix::Repository, oid: Option<gix::ObjectId>) -> Option<Arc<[u8]>> {
+pub fn load_blob_bytes(
+    gix_repo: &gix::Repository,
+    oid: Option<gix::ObjectId>,
+) -> Option<Arc<[u8]>> {
     let oid = oid?;
     let obj = gix_repo.find_object(oid).ok()?;
     let blob = obj.try_into_blob().ok()?;

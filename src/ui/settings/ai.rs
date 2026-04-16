@@ -151,10 +151,7 @@ impl AiDraft {
     /// Build a draft from the current Config. If an endpoint is configured
     /// we preload its API key from the keyring so the user can see the key
     /// is present (as a masked field) without re-entering it.
-    pub fn from_config(
-        config: &Config,
-        secret_store: &crate::secrets::SecretStore,
-    ) -> Self {
+    pub fn from_config(config: &Config, secret_store: &crate::secrets::SecretStore) -> Self {
         if let Some(endpoint) = &config.ai_endpoint {
             // Key may be in either the OS keyring or the internal file
             // store, depending on user preference. `SecretStore` caches

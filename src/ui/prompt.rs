@@ -280,9 +280,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                                 remote_branch
                             ));
                         } else {
-                            ui.weak(format!(
-                                "→ will clear upstream tracking for `{branch}`"
-                            ));
+                            ui.weak(format!("→ will clear upstream tracking for `{branch}`"));
                         }
                     }
 
@@ -360,8 +358,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 PendingPrompt::StashPush { message, .. } => {
                     ui.label("Stash message (optional):");
                     let resp = ui.text_edit_singleline(message);
-                    let enter = resp.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(4.0);
                     ui.weak(
                         "Saves the working tree + index (including untracked files) and resets\n\

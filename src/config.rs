@@ -384,6 +384,15 @@ pub struct RepoSettings {
     pub default_remote: Option<String>,
     #[serde(default)]
     pub pull_strategy: PullStrategyPref,
+    /// Which connected provider account to use for push / pull / fetch
+    /// on this repo. `None` = auto-detect from remote URL host (first
+    /// matching account). `Some(slug)` = use this specific account,
+    /// where `slug` is `AccountId::slug()` (e.g. `github::alice`).
+    ///
+    /// This lets users with multiple GitHub accounts (personal + work)
+    /// pick which one pushes to which repo.
+    #[serde(default)]
+    pub provider_account: Option<String>,
 }
 
 impl Config {

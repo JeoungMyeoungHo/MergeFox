@@ -134,27 +134,33 @@ impl SecretStore {
     /// when no key is stored — mirrors the previous `ai::load_api_key`
     /// semantics so call sites don't have to unwrap `Option`.
     pub fn load_api_key(&self, endpoint_name: &str) -> Result<SecretString> {
-        let cred = Credential::new(crate::ai::config::EndpointKeyringKey::SERVICE, endpoint_name);
+        let cred = Credential::new(
+            crate::ai::config::EndpointKeyringKey::SERVICE,
+            endpoint_name,
+        );
         Ok(self
             .load(&cred)?
             .unwrap_or_else(|| SecretString::new(String::new())))
     }
 
     pub fn save_api_key(&self, endpoint_name: &str, key: &SecretString) -> Result<()> {
-        let cred = Credential::new(crate::ai::config::EndpointKeyringKey::SERVICE, endpoint_name);
+        let cred = Credential::new(
+            crate::ai::config::EndpointKeyringKey::SERVICE,
+            endpoint_name,
+        );
         self.save(&cred, SecretString::new(key.expose_secret().clone()))
     }
 
     pub fn delete_api_key(&self, endpoint_name: &str) -> Result<()> {
-        let cred = Credential::new(crate::ai::config::EndpointKeyringKey::SERVICE, endpoint_name);
+        let cred = Credential::new(
+            crate::ai::config::EndpointKeyringKey::SERVICE,
+            endpoint_name,
+        );
         self.delete(&cred)
     }
 
     /// Provider Personal Access Token.
-    pub fn load_pat(
-        &self,
-        account: &crate::providers::AccountId,
-    ) -> Result<Option<SecretString>> {
+    pub fn load_pat(&self, account: &crate::providers::AccountId) -> Result<Option<SecretString>> {
         let cred = Credential::new(account.keyring_service(), account.keyring_user());
         self.load(&cred)
     }
@@ -199,8 +205,9 @@ const FILE_WARNING: &str = "mergefox secrets — PLAINTEXT tokens. Anyone with r
 
 fn load_doc(path: &Path) -> Result<FileStoreDoc> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse {}", path.display())),
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileStoreDoc::default()),
         Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
     }
@@ -215,8 +222,7 @@ fn save_doc(path: &Path, doc: &FileStoreDoc) -> Result<()> {
     // half-written secrets file never exists and readers always see a
     // fully-formed document.
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
+    fs::write(&tmp, json.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

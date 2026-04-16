@@ -30,15 +30,12 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
     // Tracking info for HEAD: upstream name + ahead/behind counts.
     // Cached on `repo_ui_cache` to avoid per-frame subprocess calls.
-    let upstream_info = ws
-        .repo_ui_cache
-        .as_ref()
-        .and_then(|c| {
-            c.branches
-                .iter()
-                .find(|b| b.is_head && !b.is_remote)
-                .and_then(|b| b.upstream.as_ref().map(|u| (b.name.clone(), u.clone())))
-        });
+    let upstream_info = ws.repo_ui_cache.as_ref().and_then(|c| {
+        c.branches
+            .iter()
+            .find(|b| b.is_head && !b.is_remote)
+            .and_then(|b| b.upstream.as_ref().map(|u| (b.name.clone(), u.clone())))
+    });
     let (ahead, behind) = ws
         .repo_ui_cache
         .as_ref()
@@ -129,18 +126,20 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
             // ---- Fetch / Push / Pull buttons with dropdown options ----
             ui.separator();
+            let git_btn_size = egui::vec2(64.0, 22.0);
+            let dropdown_size = egui::vec2(16.0, 22.0);
             ui.add_enabled_ui(!has_active_job, |ui| {
                 // ── Fetch ──
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     if ui
-                        .button(format!("⟳ {}", labels.fetch))
+                        .add_sized(git_btn_size, egui::Button::new(format!("⟳ {}", labels.fetch)))
                         .on_hover_text(format!("{} ({})", labels.fetch_hint, default_remote))
                         .clicked()
                     {
                         start_fetch = Some(default_remote.clone());
                     }
-                    ui.menu_button("▾", |ui| {
+                    ui.menu_button(egui::RichText::new("⏷").size(10.0), |ui| {
                         for r in &cached_remotes {
                             if ui.button(format!("Fetch '{r}'")).clicked() {
                                 start_fetch = Some(r.clone());
@@ -161,7 +160,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     if ui
                         .add_enabled(
                             has_upstream,
-                            egui::Button::new(format!("↓ {}", labels.pull)),
+                            egui::Button::new(format!("↓ {}", labels.pull)).min_size(git_btn_size),
                         )
                         .on_hover_text(if has_upstream {
                             labels.pull_hint
@@ -175,7 +174,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         }
                     }
                     ui.add_enabled_ui(has_upstream, |ui| {
-                        ui.menu_button("▾", |ui| {
+                        ui.menu_button(egui::RichText::new("⏷").size(10.0), |ui| {
                             if let Some(h) = head.as_ref() {
                                 if ui.button("Pull (merge)").clicked() {
                                     start_pull = Some((h.clone(), crate::git::PullStrategy::Merge));
@@ -198,7 +197,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     if ui
-                        .button(format!("↑ {}", labels.push))
+                        .add_sized(git_btn_size, egui::Button::new(format!("↑ {}", labels.push)))
                         .on_hover_text(labels.push_hint)
                         .clicked()
                     {
@@ -206,7 +205,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                             start_push = Some((h.clone(), false));
                         }
                     }
-                    ui.menu_button("▾", |ui| {
+                    ui.menu_button(egui::RichText::new("⏷").size(10.0), |ui| {
                         if let Some(h) = head.as_ref() {
                             if ui.button("Push").clicked() {
                                 start_push = Some((h.clone(), false));

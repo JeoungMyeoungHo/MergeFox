@@ -13,8 +13,7 @@ use crate::config::{ThemeColor, ThemeSettings};
 pub fn apply(ctx: &Context, settings: &ThemeSettings) {
     let hash = settings_hash(settings);
     let cache_id = Id::new("__mergefox_theme_hash");
-    let hash_unchanged =
-        ctx.data(|d| d.get_temp::<u64>(cache_id)) == Some(hash);
+    let hash_unchanged = ctx.data(|d| d.get_temp::<u64>(cache_id)) == Some(hash);
 
     // Even when the user's ThemeSettings hasn't changed, egui may
     // reset its visuals back to system defaults on events like:
