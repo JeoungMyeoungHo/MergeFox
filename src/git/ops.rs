@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusEntry {
     pub path: PathBuf,
     pub kind: EntryKind,
@@ -39,6 +39,30 @@ impl EntryKind {
             Self::Untracked => "?",
             Self::Conflicted => "!",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitAuthor {
+    pub name: String,
+    pub email: String,
+}
+
+impl CommitAuthor {
+    pub fn normalized(name: &str, email: &str) -> Result<Self> {
+        let name = name.trim();
+        let email = email.trim();
+        if name.is_empty() || email.is_empty() {
+            anyhow::bail!("author name and email are required");
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            email: email.to_owned(),
+        })
+    }
+
+    pub fn display(&self) -> String {
+        format!("{} <{}>", self.name, self.email)
     }
 }
 
@@ -240,13 +264,25 @@ pub fn commit(repo_path: &Path, message: &str) -> Result<gix::ObjectId> {
     head_oid(repo_path)
 }
 
+pub fn head_commit_author(repo_path: &Path) -> Result<CommitAuthor> {
+    let name = super::cli::run_line(repo_path, ["log", "-1", "--format=%an"])?;
+    let email = super::cli::run_line(repo_path, ["log", "-1", "--format=%ae"])?;
+    CommitAuthor::normalized(&name, &email)
+}
+
 /// Amend HEAD with an optional new message. Returns the amended OID.
-pub fn amend(repo_path: &Path, new_message: Option<&str>) -> Result<gix::ObjectId> {
-    let cmd = match new_message {
-        Some(msg) => super::cli::GitCommand::new(repo_path)
-            .args(["commit", "--amend", "-F", "-"])
-            .stdin(msg.as_bytes().to_vec()),
-        None => super::cli::GitCommand::new(repo_path).args(["commit", "--amend", "--no-edit"]),
+pub fn amend(
+    repo_path: &Path,
+    new_message: Option<&str>,
+    author: Option<&CommitAuthor>,
+) -> Result<gix::ObjectId> {
+    let mut cmd = super::cli::GitCommand::new(repo_path).args(["commit", "--amend"]);
+    if let Some(author) = author {
+        cmd = cmd.arg("--author").arg(author.display());
+    }
+    cmd = match new_message {
+        Some(msg) => cmd.args(["-F", "-"]).stdin(msg.as_bytes().to_vec()),
+        None => cmd.arg("--no-edit"),
     };
     cmd.run().context("git commit --amend")?;
     head_oid(repo_path)
@@ -309,4 +345,15 @@ pub struct StashEntry {
     pub index: usize,
     pub message: String,
     pub oid: gix::ObjectId,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommitAuthor;
+
+    #[test]
+    fn commit_author_display_formats_git_author_flag() {
+        let author = CommitAuthor::normalized("Merge Fox", "mergefox@example.com").unwrap();
+        assert_eq!(author.display(), "Merge Fox <mergefox@example.com>");
+    }
 }

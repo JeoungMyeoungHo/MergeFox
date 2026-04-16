@@ -6,7 +6,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let sidebar_fill = crate::ui::theme::sidebar_fill(&app.config.theme);
     let language = app.config.ui_language;
 
-    let (branch_error, local, remote, stashes, current_branch, forge, lfs) = {
+    let (branch_error, local, remote, configured_remotes, stashes, current_branch, head_branch, forge, lfs) = {
         let View::Workspace(tabs) = &mut app.view else {
             return;
         };
@@ -26,6 +26,15 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             ),
             None => (None, Vec::new(), None),
         };
+        let configured_remotes = ws
+            .repo_ui_cache
+            .as_ref()
+            .map(|cache| cache.remotes.clone())
+            .unwrap_or_default();
+        let head_branch = branches
+            .iter()
+            .find(|branch| branch.is_head && !branch.is_remote)
+            .map(|branch| branch.name.clone());
         let (local, remote): (Vec<_>, Vec<_>) =
             branches.into_iter().partition(|branch| !branch.is_remote);
 
@@ -42,8 +51,10 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             branch_error,
             local,
             remote,
+            configured_remotes,
             stashes,
             ws.selected_branch.clone(),
+            head_branch,
             ws.forge.clone(),
             lfs,
         )
@@ -54,6 +65,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let mut dismiss_lfs = false;
     let mut stash_action: Option<CommitAction> = None;
     let mut branch_action: Option<CommitAction> = None;
+    let mut open_publish_remote: Option<String> = None;
 
     egui::SidePanel::left("branches")
         .resizable(true)
@@ -75,19 +87,35 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                             ui,
                             branch,
                             current_branch.as_deref(),
+                            configured_remotes.is_empty() && branch.is_head && branch.upstream.is_none(),
                             &mut select_branch,
                             &mut branch_action,
+                            &mut open_publish_remote,
                         );
                     }
                 });
                 ui.collapsing("Remote", |ui| {
+                    if configured_remotes.is_empty() {
+                        ui.weak("No remotes configured yet.");
+                        if let Some(branch) = head_branch.as_deref() {
+                            if ui.small_button("Publish current branch…").clicked() {
+                                open_publish_remote = Some(branch.to_string());
+                            }
+                        }
+                        ui.add_space(4.0);
+                    } else if remote.is_empty() {
+                        ui.weak("No remote-tracking branches yet.");
+                        ui.add_space(4.0);
+                    }
                     for branch in &remote {
                         branch_row(
                             ui,
                             branch,
                             current_branch.as_deref(),
+                            false,
                             &mut select_branch,
                             &mut branch_action,
+                            &mut open_publish_remote,
                         );
                     }
                 });
@@ -151,6 +179,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     if let Some(action) = branch_action {
         crate::ui::main_panel::dispatch_action(app, action);
     }
+    if let Some(branch) = open_publish_remote {
+        app.open_publish_remote_modal(Some(branch));
+    }
 
     if let Some(action) = forge_action {
         match action {
@@ -170,8 +201,10 @@ fn branch_row(
     ui: &mut egui::Ui,
     branch: &BranchInfo,
     current_branch: Option<&str>,
+    show_publish_button: bool,
     select_branch: &mut Option<String>,
     branch_action: &mut Option<CommitAction>,
+    publish_branch: &mut Option<String>,
 ) {
     let selected = current_branch == Some(branch.name.as_str());
     let label = if branch.is_head {
@@ -195,6 +228,9 @@ fn branch_row(
                             .small()
                             .color(egui::Color32::from_rgb(220, 150, 80)),
                     );
+                    if show_publish_button && ui.small_button("Publish…").clicked() {
+                        *publish_branch = Some(branch.name.clone());
+                    }
                 }
             }
         }
@@ -227,6 +263,10 @@ fn branch_row(
     // Remote-tracking branches don't get write actions here.
     if !branch.is_remote {
         row.context_menu(|ui| {
+            if show_publish_button && ui.button("Publish to new remote…").clicked() {
+                *publish_branch = Some(branch.name.clone());
+                ui.close_menu();
+            }
             if ui.button("Set upstream…").clicked() {
                 *branch_action = Some(CommitAction::SetUpstreamPrompt {
                     branch: branch.name.clone(),

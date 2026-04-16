@@ -27,6 +27,7 @@ pub enum GitJobKind {
         /// Full refspec, e.g. `refs/heads/main:refs/heads/main`.
         refspec: String,
         force: bool,
+        set_upstream: bool,
         credentials: Option<HttpsCredentials>,
     },
     Pull {
@@ -152,12 +153,14 @@ fn run_job(
             remote,
             refspec,
             force,
+            set_upstream,
             credentials,
         } => do_push(
             path,
             &remote,
             &refspec,
             force,
+            set_upstream,
             credentials.as_ref(),
             progress,
         ),
@@ -238,6 +241,7 @@ fn do_push(
     remote_name: &str,
     refspec: &str,
     force: bool,
+    set_upstream: bool,
     credentials: Option<&HttpsCredentials>,
     progress: Arc<Mutex<JobProgress>>,
 ) -> Result<()> {
@@ -247,9 +251,25 @@ fn do_push(
     } else {
         refspec.to_owned()
     };
-    build_cmd_with_creds(path, credentials)
-        .args(["push", remote_name, &final_refspec])
-        .run()?;
+    let mut cmd = build_cmd_with_creds(path, credentials);
+    cmd = cmd.arg("push");
+    if set_upstream {
+        cmd = cmd.arg("-u");
+    }
+    cmd.args([remote_name, &final_refspec]).run()?;
+    if set_upstream {
+        mark(&progress, "refreshing");
+        let branch = refspec
+            .rsplit(':')
+            .next()
+            .and_then(|target| target.strip_prefix("refs/heads/"))
+            .unwrap_or_default();
+        if !branch.is_empty() {
+            build_cmd_with_creds(path, credentials)
+                .args(["fetch", remote_name, branch])
+                .run()?;
+        }
+    }
     mark(&progress, "done");
     Ok(())
 }

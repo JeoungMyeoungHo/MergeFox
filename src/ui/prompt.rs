@@ -45,6 +45,10 @@ pub enum PendingPrompt {
         branch: String,
         /// Remotes pulled from `repo_ui_cache` at open time.
         remotes: Vec<String>,
+        /// Existing tracking ref for this branch, if any.
+        current_upstream: Option<String>,
+        /// Known remote-tracking branches such as `origin/main`.
+        remote_branches: Vec<String>,
         /// Currently-selected remote. `None` = "(remove upstream)".
         selected_remote: Option<String>,
         /// What branch on the remote to track. Defaults to the local name.
@@ -56,6 +60,10 @@ pub enum PendingPrompt {
     },
     AmendMessage {
         message: String,
+        current_author: Option<crate::git::ops::CommitAuthor>,
+        author_override: bool,
+        author_name: String,
+        author_email: String,
         submitted: bool,
     },
     /// Create a new stash entry. `message` is optional (empty → git uses its
@@ -214,6 +222,8 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 PendingPrompt::SetUpstream {
                     branch,
                     remotes,
+                    current_upstream,
+                    remote_branches,
                     selected_remote,
                     remote_branch,
                     new_remote,
@@ -223,6 +233,10 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         "Track a remote branch for local branch `{branch}`."
                     ));
                     ui.add_space(4.0);
+                    if let Some(upstream) = current_upstream.as_deref() {
+                        ui.weak(format!("Current upstream: {upstream}"));
+                        ui.add_space(4.0);
+                    }
 
                     if remotes.is_empty() && new_remote.is_none() {
                         // Zero-remotes happy path: tell the user + offer a
@@ -274,6 +288,36 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                                 ui.label("Remote branch:");
                                 ui.text_edit_singleline(remote_branch);
                             });
+                            let known_branches = selected_remote
+                                .as_deref()
+                                .map(|remote| remote_branch_candidates(remote, remote_branches))
+                                .unwrap_or_default();
+                            if !known_branches.is_empty() {
+                                let selected_known = if known_branches
+                                    .iter()
+                                    .any(|candidate| candidate == remote_branch)
+                                {
+                                    remote_branch.clone()
+                                } else {
+                                    "Choose existing…".to_string()
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label("Known:");
+                                    egui::ComboBox::from_id_salt("set_upstream_remote_branch")
+                                        .selected_text(selected_known)
+                                        .show_ui(ui, |ui| {
+                                            for candidate in &known_branches {
+                                                let selected = remote_branch == candidate;
+                                                if ui
+                                                    .selectable_label(selected, candidate)
+                                                    .clicked()
+                                                {
+                                                    *remote_branch = candidate.clone();
+                                                }
+                                            }
+                                        });
+                                });
+                            }
                             ui.weak(format!(
                                 "→ will track `{}/{}`",
                                 selected_remote.as_deref().unwrap_or(""),
@@ -336,14 +380,37 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         });
                     });
                 }
-                PendingPrompt::AmendMessage { message, .. } => {
+                PendingPrompt::AmendMessage {
+                    message,
+                    current_author,
+                    author_override,
+                    author_name,
+                    author_email,
+                    ..
+                } => {
                     ui.label("New commit message:");
                     ui.add(
                         egui::TextEdit::multiline(message)
                             .desired_rows(4)
                             .desired_width(f32::INFINITY),
                     );
-                    let ok = !message.trim().is_empty();
+                    ui.add_space(6.0);
+                    if let Some(author) = current_author.as_ref() {
+                        ui.weak(format!("Current author: {}", author.display()));
+                    } else {
+                        ui.weak("Current author couldn't be read. You can still type a replacement author.");
+                    }
+                    ui.checkbox(author_override, "Change author");
+                    if *author_override {
+                        ui.add_space(4.0);
+                        ui.label("Author name:");
+                        ui.text_edit_singleline(author_name);
+                        ui.label("Author email:");
+                        ui.text_edit_singleline(author_email);
+                    }
+                    let author_ok = !*author_override
+                        || (!author_name.trim().is_empty() && !author_email.trim().is_empty());
+                    let ok = !message.trim().is_empty() && author_ok;
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
                             close = true;
@@ -479,14 +546,27 @@ pub fn create_tag_prompt(at: Oid, annotated: bool) -> PendingPrompt {
     }
 }
 
-pub fn set_upstream_prompt(branch: String, remotes: Vec<String>) -> PendingPrompt {
-    // Default to `origin` when it exists, otherwise the first remote,
-    // otherwise no selection (triggers the "add remote" empty state).
-    let selected_remote = remotes
-        .iter()
-        .find(|r| *r == "origin")
-        .or_else(|| remotes.first())
-        .cloned();
+pub fn set_upstream_prompt(
+    branch: String,
+    remotes: Vec<String>,
+    current_upstream: Option<String>,
+    remote_branches: Vec<String>,
+) -> PendingPrompt {
+    let current_remote = current_upstream
+        .as_deref()
+        .and_then(|upstream| upstream.split_once('/').map(|(remote, _)| remote.to_string()));
+    let current_branch = current_upstream
+        .as_deref()
+        .and_then(|upstream| upstream.split_once('/').map(|(_, branch)| branch.to_string()));
+    // Default to the existing upstream's remote when present, otherwise
+    // `origin` when it exists, otherwise the first remote, otherwise no
+    // selection (which triggers the "add remote" empty state).
+    let selected_remote = current_remote
+        .as_ref()
+        .filter(|remote| remotes.iter().any(|r| r == *remote))
+        .cloned()
+        .or_else(|| remotes.iter().find(|r| *r == "origin").cloned())
+        .or_else(|| remotes.first().cloned());
     // If no remotes exist at all, auto-open the "add remote" form so the
     // modal is immediately useful rather than a dead end.
     let new_remote = if remotes.is_empty() {
@@ -498,18 +578,39 @@ pub fn set_upstream_prompt(branch: String, remotes: Vec<String>) -> PendingPromp
         None
     };
     PendingPrompt::SetUpstream {
-        remote_branch: branch.clone(),
+        remote_branch: current_branch.unwrap_or_else(|| branch.clone()),
         branch,
         remotes,
+        current_upstream,
+        remote_branches,
         selected_remote,
         new_remote,
         submitted: false,
     }
 }
 
-pub fn amend_message_prompt(initial: String) -> PendingPrompt {
+fn remote_branch_candidates(selected_remote: &str, remote_branches: &[String]) -> Vec<String> {
+    let prefix = format!("{selected_remote}/");
+    remote_branches
+        .iter()
+        .filter_map(|name| name.strip_prefix(&prefix).map(str::to_string))
+        .collect()
+}
+
+pub fn amend_message_prompt(
+    initial: String,
+    current_author: Option<crate::git::ops::CommitAuthor>,
+) -> PendingPrompt {
+    let (author_name, author_email) = current_author
+        .as_ref()
+        .map(|author| (author.name.clone(), author.email.clone()))
+        .unwrap_or_default();
     PendingPrompt::AmendMessage {
         message: initial,
+        current_author,
+        author_override: false,
+        author_name,
+        author_email,
         submitted: false,
     }
 }

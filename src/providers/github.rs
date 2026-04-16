@@ -14,8 +14,9 @@ use serde::Deserialize;
 
 use super::error::{ProviderError, ProviderResult};
 use super::types::{
-    IssueDraft, IssueRef, IssueState, IssueSummary, PrState, ProviderKind, ProviderProfile,
-    PullRequestDraft, PullRequestRef, PullRequestSummary, RemoteRepoSummary, RepoMeta,
+    CreateRepositoryDraft, CreatedRepositoryRef, IssueDraft, IssueRef, IssueState, IssueSummary,
+    PrState, ProviderKind, ProviderProfile, PullRequestDraft, PullRequestRef,
+    PullRequestSummary, RemoteRepoOwner, RemoteRepoOwnerKind, RemoteRepoSummary, RepoMeta,
 };
 
 pub struct GitHubProvider;
@@ -23,6 +24,45 @@ pub struct GitHubProvider;
 impl GitHubProvider {
     pub fn new() -> Self {
         Self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_repository_url_uses_user_endpoint() {
+        let url = create_repository_url(
+            "https://api.github.com",
+            &CreateRepositoryDraft {
+                owner: "alice".into(),
+                owner_kind: RemoteRepoOwnerKind::User,
+                name: "demo".into(),
+                description: None,
+                private: true,
+                auto_init: false,
+            },
+        );
+
+        assert_eq!(url, "https://api.github.com/user/repos");
+    }
+
+    #[test]
+    fn create_repository_url_uses_org_endpoint() {
+        let url = create_repository_url(
+            "https://api.github.com",
+            &CreateRepositoryDraft {
+                owner: "acme".into(),
+                owner_kind: RemoteRepoOwnerKind::Organization,
+                name: "demo".into(),
+                description: None,
+                private: true,
+                auto_init: false,
+            },
+        );
+
+        assert_eq!(url, "https://api.github.com/orgs/acme/repos");
     }
 }
 
@@ -67,6 +107,13 @@ struct UserResp {
     name: Option<String>,
     #[serde(default)]
     avatar_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OrgResp {
+    login: String,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +173,29 @@ struct CreateIssueBody<'a> {
     body: &'a str,
 }
 
+#[derive(serde::Serialize)]
+struct CreateRepositoryBody<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    private: bool,
+    auto_init: bool,
+}
+
+#[derive(Deserialize)]
+struct CreateRepositoryResp {
+    name: String,
+    owner: OwnerResp,
+    #[serde(default)]
+    default_branch: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    private: bool,
+    ssh_url: String,
+    clone_url: String,
+    html_url: String,
+}
+
 fn apply_headers(req: reqwest::RequestBuilder, token: &SecretString) -> reqwest::RequestBuilder {
     req.header("User-Agent", "mergefox")
         .header("X-GitHub-Api-Version", "2022-11-28")
@@ -144,6 +214,18 @@ fn issue_state_from_api(state: &str) -> IssueState {
     match state {
         "closed" => IssueState::Closed,
         _ => IssueState::Open,
+    }
+}
+
+fn owner_display_name(login: &str, name: Option<String>) -> String {
+    name.filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| login.to_string())
+}
+
+fn create_repository_url(api_base: &str, req: &CreateRepositoryDraft) -> String {
+    match req.owner_kind {
+        RemoteRepoOwnerKind::User => format!("{api_base}/user/repos"),
+        RemoteRepoOwnerKind::Organization => format!("{api_base}/orgs/{}/repos", req.owner),
     }
 }
 
@@ -293,6 +375,89 @@ impl super::Provider for GitHubProvider {
             }
 
             Ok(repos)
+        })
+    }
+
+    fn list_repository_owners<'a>(
+        &'a self,
+        client: &'a Client,
+        token: &'a SecretString,
+    ) -> super::BoxFuture<'a, ProviderResult<Vec<RemoteRepoOwner>>> {
+        Box::pin(async move {
+            let resp = apply_headers(client.get(format!("{}/user", self.api_base())), token)
+                .send()
+                .await?;
+            let resp = map_status(resp).await?;
+            let user: UserResp = resp.json().await?;
+
+            let mut owners = vec![RemoteRepoOwner {
+                login: user.login.clone(),
+                display_name: owner_display_name(&user.login, user.name),
+                kind: RemoteRepoOwnerKind::User,
+            }];
+
+            for page in 1..=10 {
+                let page = page.to_string();
+                let resp =
+                    apply_headers(client.get(format!("{}/user/orgs", self.api_base())), token)
+                        .query(&[("per_page", "100"), ("page", page.as_str())])
+                        .send()
+                        .await?;
+                let resp = map_status(resp).await?;
+                let batch: Vec<OrgResp> = resp.json().await?;
+                let count = batch.len();
+
+                owners.extend(batch.into_iter().map(|org| RemoteRepoOwner {
+                    login: org.login.clone(),
+                    display_name: owner_display_name(&org.login, org.name),
+                    kind: RemoteRepoOwnerKind::Organization,
+                }));
+
+                if count < 100 {
+                    break;
+                }
+            }
+
+            Ok(owners)
+        })
+    }
+
+    fn create_repository<'a>(
+        &'a self,
+        client: &'a Client,
+        token: &'a SecretString,
+        req: &'a CreateRepositoryDraft,
+    ) -> super::BoxFuture<'a, ProviderResult<CreatedRepositoryRef>> {
+        Box::pin(async move {
+            let description = req
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let resp = apply_headers(
+                client.post(create_repository_url(&self.api_base(), req)),
+                token,
+            )
+            .json(&CreateRepositoryBody {
+                name: &req.name,
+                description,
+                private: req.private,
+                auto_init: req.auto_init,
+            })
+            .send()
+            .await?;
+            let resp = map_status(resp).await?;
+            let repo: CreateRepositoryResp = resp.json().await?;
+            Ok(CreatedRepositoryRef {
+                owner: repo.owner.login,
+                repo: repo.name,
+                description: repo.description,
+                default_branch: repo.default_branch,
+                private: repo.private,
+                clone_https: repo.clone_url,
+                clone_ssh: repo.ssh_url,
+                web_url: repo.html_url,
+            })
         })
     }
 

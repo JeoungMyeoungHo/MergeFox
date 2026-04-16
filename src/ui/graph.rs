@@ -336,7 +336,6 @@ impl GraphView {
         // Working Tree virtual row (fixed at top, above scrollable commits)
         if has_working_changes {
             if let (Some(entries), Some(summary)) = (working_entries, working_summary.as_ref()) {
-                let top_lane = self.graph.rows.first().map(|r| r.lane).unwrap_or(0);
                 render_working_tree_row(
                     ui,
                     &layout,
@@ -344,7 +343,7 @@ impl GraphView {
                     self.graph_scroll_x,
                     entries,
                     summary,
-                    top_lane,
+                    self.graph.rows.first().map(|r| r.lane),
                     working_selected,
                     &mut out,
                 );
@@ -1558,7 +1557,7 @@ fn render_working_tree_row(
     graph_scroll_x: f32,
     _entries: &[crate::git::StatusEntry],
     summary: &WorkingTreeSummary,
-    head_lane: u16,
+    connected_lane: Option<u16>,
     selected: &mut bool,
     out: &mut GraphInteraction,
 ) {
@@ -1608,15 +1607,18 @@ fn render_working_tree_row(
     // Paint virtual graph node like a normal commit row (if graph column visible)
     if layout.show_graph {
         let clipped = ui.painter().with_clip_rect(cells.graph);
+        let head_lane = connected_lane.unwrap_or(0);
         let lane_x = cells.graph.left()
             + (head_lane.min(crate::git::graph::MAX_GRAPH_LANES) as f32 + 0.5) * lane_w
             - graph_scroll_x;
         let dot_center = egui::pos2(lane_x, rect.center().y);
         let lane_color = lane_color(head_lane);
-        clipped.line_segment(
-            [dot_center, egui::pos2(lane_x, cells.graph.bottom())],
-            egui::Stroke::new(LINE_WIDTH, lane_color),
-        );
+        if connected_lane.is_some() {
+            clipped.line_segment(
+                [dot_center, egui::pos2(lane_x, cells.graph.bottom())],
+                egui::Stroke::new(LINE_WIDTH, lane_color),
+            );
+        }
         clipped.circle_filled(dot_center, DOT_RADIUS, lane_color);
         clipped.circle_stroke(
             dot_center,
