@@ -7,7 +7,8 @@ pub mod ops;
 pub mod repo;
 
 pub use diff::{
-    diff_for_commit, DeltaStatus, DiffLine, FileDiff, FileKind, Hunk, LineKind, RepoDiff,
+    diff_for_commit, diff_text_for_working_entry, file_diff_for_working_entry, DeltaStatus,
+    DiffLine, FileDiff, FileKind, Hunk, LineKind, RepoDiff,
 };
 pub use graph::{CommitGraph, GraphRow, GraphScope, RefKind, RefLabel};
 pub use jobs::{GitJob, GitJobKind, JobProgress, PullStrategy};

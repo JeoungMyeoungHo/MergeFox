@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use super::ops::{EntryKind, StatusEntry};
+
 /// Max bytes we'll load into memory for *any single blob*.
 pub const MAX_BLOB_BYTES: usize = 2 * 1024 * 1024;
 
@@ -193,6 +195,116 @@ pub fn diff_for_commit(repo_path: &Path, oid: gix::ObjectId) -> Result<RepoDiff>
     })
 }
 
+/// Compute a unified diff text for a single working-tree entry.
+///
+/// We prefer `git diff HEAD -- <path>` for tracked paths so files that have
+/// both staged *and* unstaged edits render as one virtual "working tree
+/// commit" against HEAD. If that fails (for example in an unborn repository),
+/// we fall back to staged-only / unstaged-only plumbing.
+pub fn diff_text_for_working_entry(repo_path: &Path, entry: &StatusEntry) -> Result<String> {
+    if !matches!(entry.kind, EntryKind::Untracked) {
+        let mut cmd =
+            super::cli::GitCommand::new(repo_path).args(["diff", "HEAD", "--binary", "--unified=3", "--"]);
+        cmd = cmd.arg(&entry.path);
+        if let Ok(text) = run_diff_command(cmd) {
+            return Ok(text);
+        }
+    }
+
+    let text = if matches!(entry.kind, EntryKind::New | EntryKind::Untracked) {
+        super::cli::GitCommand::new(repo_path)
+            .args(["diff", "--no-index", "--binary", "--unified=3", "--", "/dev/null"])
+            .arg(&entry.path)
+    } else if entry.kind == EntryKind::Deleted {
+        super::cli::GitCommand::new(repo_path)
+            .args(["diff", "--no-index", "--binary", "--unified=3", "--"])
+            .arg(&entry.path)
+            .arg("/dev/null")
+    } else if entry.staged {
+        super::cli::GitCommand::new(repo_path)
+            .args(["diff", "--cached", "--binary", "--unified=3", "--"])
+            .arg(&entry.path)
+    } else {
+        super::cli::GitCommand::new(repo_path)
+            .args(["diff", "--binary", "--unified=3", "--"])
+            .arg(&entry.path)
+    };
+
+    run_diff_command(text)
+}
+
+/// Convert cached unified diff text for a working-tree entry into the same
+/// `FileDiff` structure used by commit diffs, so the UI can reuse the normal
+/// renderer without a special-case text widget.
+pub fn file_diff_for_working_entry(entry: &StatusEntry, patch_text: &str) -> FileDiff {
+    let fallback_status = delta_status_for_working_entry(entry);
+    let (fallback_old_path, fallback_new_path) = fallback_paths_for_working_entry(entry);
+
+    let patch = parse_patches(patch_text)
+        .into_iter()
+        .find(|p| {
+            p.new_path.as_ref() == Some(&entry.path) || p.old_path.as_ref() == Some(&entry.path)
+        });
+
+    let old_path = patch
+        .as_ref()
+        .and_then(|p| p.old_path.clone())
+        .or_else(|| fallback_old_path.clone());
+    let new_path = patch
+        .as_ref()
+        .and_then(|p| p.new_path.clone())
+        .or_else(|| fallback_new_path.clone());
+
+    let ext = extension_of(new_path.as_ref().or(old_path.as_ref()));
+    let is_image = ext.as_deref().map(is_image_ext).unwrap_or(false);
+    let is_binary = patch.as_ref().map(|p| p.is_binary).unwrap_or(false);
+
+    let kind = if is_image {
+        FileKind::Image {
+            ext: ext.unwrap_or_else(|| "img".into()),
+        }
+    } else if is_binary {
+        FileKind::Binary
+    } else {
+        let (hunks, lines_added, lines_removed, truncated) = if let Some(patch) = patch.as_ref() {
+            let mut add = 0usize;
+            let mut rem = 0usize;
+            let mut total = 0usize;
+            for hunk in &patch.hunks {
+                for line in &hunk.lines {
+                    match line.kind {
+                        LineKind::Add => add += 1,
+                        LineKind::Remove => rem += 1,
+                        _ => {}
+                    }
+                    total += 1;
+                }
+            }
+            (patch.hunks.clone(), add, rem, total >= MAX_LINES_PER_FILE)
+        } else {
+            (Vec::new(), 0, 0, false)
+        };
+
+        FileKind::Text {
+            hunks,
+            lines_added,
+            lines_removed,
+            truncated,
+        }
+    };
+
+    FileDiff {
+        old_path,
+        new_path,
+        status: fallback_status,
+        kind,
+        old_size: 0,
+        new_size: 0,
+        old_oid: None,
+        new_oid: None,
+    }
+}
+
 // ---- internal helpers ----
 
 fn commit_meta(
@@ -215,6 +327,34 @@ fn commit_meta(
     };
 
     Some((title, Some(summary), author_name))
+}
+
+fn run_diff_command(cmd: super::cli::GitCommand) -> Result<String> {
+    let output = cmd.run_raw().context("run git diff")?;
+    let code = output.status.code().unwrap_or(-1);
+    if code != 0 && code != 1 {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git diff failed: {}", stderr.trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn delta_status_for_working_entry(entry: &StatusEntry) -> DeltaStatus {
+    match entry.kind {
+        EntryKind::New | EntryKind::Untracked => DeltaStatus::Added,
+        EntryKind::Modified | EntryKind::Conflicted => DeltaStatus::Modified,
+        EntryKind::Deleted => DeltaStatus::Deleted,
+        EntryKind::Renamed => DeltaStatus::Renamed,
+        EntryKind::Typechange => DeltaStatus::Typechange,
+    }
+}
+
+fn fallback_paths_for_working_entry(entry: &StatusEntry) -> (Option<PathBuf>, Option<PathBuf>) {
+    match delta_status_for_working_entry(entry) {
+        DeltaStatus::Added => (None, Some(entry.path.clone())),
+        DeltaStatus::Deleted => (Some(entry.path.clone()), None),
+        _ => (Some(entry.path.clone()), Some(entry.path.clone())),
+    }
 }
 
 /// A file entry from `git diff-tree --raw`.

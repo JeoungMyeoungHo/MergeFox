@@ -26,7 +26,9 @@ use egui::{Color32, FontId, Layout, RichText, ScrollArea, Stroke, Vec2};
 use crate::app::{
     MergeFoxApp, SelectedFileView, SelectedImageCache, SnapshotCache, View, WorkspaceState,
 };
-use crate::git::{DeltaStatus, DiffLine, FileDiff, FileKind, LineKind, RepoDiff};
+use crate::git::{
+    DeltaStatus, DiffLine, EntryKind, FileDiff, FileKind, LineKind, RepoDiff, StatusEntry,
+};
 
 const PANEL_MIN_WIDTH: f32 = 280.0;
 const PANEL_DEFAULT_WIDTH: f32 = 340.0;
@@ -34,17 +36,19 @@ const FILE_ROW_HEIGHT: f32 = 20.0;
 
 pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let needs_image_loaders = match &app.view {
-        View::Workspace(tabs) => tabs
-            .current()
-            .current_diff
-            .as_ref()
-            .and_then(|diff| {
-                tabs.current()
-                    .selected_file_idx
-                    .and_then(|idx| diff.files.get(idx))
-            })
-            .map(|file| matches!(file.kind, FileKind::Image { .. }))
-            .unwrap_or(false),
+        View::Workspace(tabs) => {
+            let ws = tabs.current();
+            ws.current_diff
+                .as_ref()
+                .and_then(|diff| ws.selected_file_idx.and_then(|idx| diff.files.get(idx)))
+                .map(|file| matches!(file.kind, FileKind::Image { .. }))
+                .unwrap_or(false)
+                || ws
+                    .selected_working_file
+                    .as_ref()
+                    .map(|path| path_looks_like_image(path))
+                    .unwrap_or(false)
+        }
         _ => false,
     };
     if needs_image_loaders {
@@ -55,6 +59,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         return;
     };
     let ws = tabs.current_mut();
+    let show_working_tree_panel = ws.selected_working_tree;
 
     // If a diff is computing and none is ready yet, render a slim
     // "Computing diff…" panel instead of silently doing nothing. This
@@ -67,7 +72,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     // the diff panel snap-shake each time the diff hop-scotched between
     // these two ids.
     let diff = ws.current_diff.clone();
-    if diff.is_none() && ws.diff_task.is_none() {
+    if !show_working_tree_panel && diff.is_none() && ws.diff_task.is_none() {
         // Nothing to show and nothing computing — don't render the panel.
         return;
     }
@@ -79,6 +84,10 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         .min_width(PANEL_MIN_WIDTH)
         .default_width(PANEL_DEFAULT_WIDTH)
         .show(ctx, |ui| {
+            if show_working_tree_panel {
+                render_working_tree_panel(ui, ws);
+                return;
+            }
             // Computing state: show spinner inside the SAME panel so the
             // panel width + neighbours don't twitch when the diff lands.
             if diff.is_none() {
@@ -171,25 +180,348 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     }
 }
 
+fn render_working_tree_panel(ui: &mut egui::Ui, ws: &mut WorkspaceState) {
+    let entries: Vec<StatusEntry> = ws
+        .repo_ui_cache
+        .as_ref()
+        .and_then(|c| c.working.clone())
+        .unwrap_or_default();
+
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.heading("Working Tree");
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                let close_button =
+                    egui::Button::new(RichText::new("x").strong().size(16.0).monospace())
+                        .frame(true);
+                if ui
+                    .add_sized([30.0, 30.0], close_button)
+                    .on_hover_text("Close working tree panel")
+                    .clicked()
+                {
+                    ws.selected_working_tree = false;
+                    ws.selected_working_file = None;
+                    ws.set_image_cache(None);
+                    ws.working_file_diff = None;
+                }
+            });
+        });
+        render_working_tree_summary(ui, &entries);
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Files ({})", entries.len())).strong());
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                let btn_size = egui::vec2(26.0, 22.0);
+                if ui
+                    .add_sized(
+                        btn_size,
+                        egui::SelectableLabel::new(ws.file_list_tree, "🌲"),
+                    )
+                    .on_hover_text("Tree view — group files by directory")
+                    .clicked()
+                {
+                    ws.file_list_tree = true;
+                }
+                if ui
+                    .add_sized(
+                        btn_size,
+                        egui::SelectableLabel::new(!ws.file_list_tree, "≡"),
+                    )
+                    .on_hover_text("Flat list — files sorted by path")
+                    .clicked()
+                {
+                    ws.file_list_tree = false;
+                }
+            });
+        });
+
+        if ws.file_list_tree {
+            render_working_tree_tree(ui, ws, &entries);
+        } else {
+            render_working_tree_flat(ui, ws, &entries);
+        }
+    });
+}
+
+fn render_working_tree_summary(ui: &mut egui::Ui, entries: &[StatusEntry]) {
+    let staged = entries.iter().filter(|e| e.staged).count();
+    let unstaged = entries.iter().filter(|e| e.unstaged).count();
+    let untracked = entries
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::Untracked))
+        .count();
+    let conflicted = entries.iter().filter(|e| e.conflicted).count();
+
+    let mut parts = Vec::new();
+    if conflicted > 0 {
+        parts.push(format!("{conflicted} conflicted"));
+    }
+    if staged > 0 {
+        parts.push(format!("{staged} staged"));
+    }
+    if unstaged > 0 {
+        parts.push(format!("{unstaged} unstaged"));
+    }
+    if untracked > 0 {
+        parts.push(format!("{untracked} untracked"));
+    }
+
+    if parts.is_empty() {
+        ui.weak("Working tree is clean.");
+    } else {
+        ui.weak(parts.join(" · "));
+    }
+}
+
+fn render_working_tree_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, entries: &[StatusEntry]) {
+    let total_files = entries.len();
+    ScrollArea::vertical()
+        .id_salt("working_tree_files")
+        .auto_shrink([false, false])
+        .show_rows(ui, FILE_ROW_HEIGHT, total_files, |ui, range| {
+            let row_width = ui.available_width();
+            for i in range {
+                let entry = &entries[i];
+                let selected = ws
+                    .selected_working_file
+                    .as_ref()
+                    .map(|path| path == &entry.path)
+                    .unwrap_or(false);
+                let color = working_tree_status_color(entry);
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(row_width, FILE_ROW_HEIGHT),
+                    egui::Sense::click(),
+                );
+
+                if selected {
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        ui.visuals().selection.bg_fill.gamma_multiply(0.4),
+                    );
+                } else if resp.hovered() {
+                    ui.painter()
+                        .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+                }
+
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                child.label(
+                    RichText::new(entry.kind.glyph())
+                        .color(color)
+                        .monospace()
+                        .strong(),
+                );
+                child.add_space(4.0);
+                child.add(
+                    egui::Label::new(RichText::new(entry.path.display().to_string()).monospace())
+                        .truncate()
+                        .selectable(false),
+                );
+
+                let galley = ui.painter().layout_no_wrap(
+                    working_tree_stats_str(entry),
+                    FontId::monospace(11.0),
+                    ui.visuals().weak_text_color(),
+                );
+                ui.painter().galley(
+                    egui::pos2(
+                        rect.right() - galley.size().x - 4.0,
+                        rect.center().y - galley.size().y * 0.5,
+                    ),
+                    galley,
+                    ui.visuals().weak_text_color(),
+                );
+
+                if resp.clicked() {
+                    if selected {
+                        ws.selected_working_file = None;
+                        ws.working_file_diff = None;
+                    } else {
+                        ws.selected_working_file = Some(entry.path.clone());
+                        ws.working_file_diff =
+                            crate::git::diff_text_for_working_entry(ws.repo.path(), entry).ok();
+                    }
+                    ws.selected_file_view = SelectedFileView::Diff;
+                    ws.set_image_cache(None);
+                }
+
+                resp.on_hover_text(entry.path.display().to_string());
+            }
+        });
+}
+
+fn render_working_tree_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, entries: &[StatusEntry]) {
+    let mut dirs: std::collections::BTreeMap<String, Vec<&StatusEntry>> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        let path = entry.path.display().to_string();
+        let (dir, _name) = match path.rfind('/') {
+            Some(pos) => (&path[..pos], &path[pos + 1..]),
+            None => (".", path.as_str()),
+        };
+        dirs.entry(dir.to_string()).or_default().push(entry);
+    }
+
+    ScrollArea::vertical()
+        .id_salt("working_tree_files_tree")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (dir, files) in &dirs {
+                let dir_label = if dir == "." {
+                    "(root)".to_string()
+                } else {
+                    format!("📁 {dir}/")
+                };
+                egui::CollapsingHeader::new(
+                    RichText::new(format!("{dir_label}  ({})", files.len())).weak(),
+                )
+                .default_open(true)
+                .show(ui, |ui| {
+                    for entry in files {
+                        let selected = ws
+                            .selected_working_file
+                            .as_ref()
+                            .map(|path| path == &entry.path)
+                            .unwrap_or(false);
+                        let display = entry.path.display().to_string();
+                        let file_name = display.rsplit('/').next().unwrap_or(&display);
+                        let color = working_tree_status_color(entry);
+                        let row_w = ui.available_width();
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(row_w, FILE_ROW_HEIGHT),
+                            egui::Sense::click(),
+                        );
+                        if selected {
+                            ui.painter().rect_filled(
+                                rect,
+                                0.0,
+                                ui.visuals().selection.bg_fill.gamma_multiply(0.4),
+                            );
+                        } else if resp.hovered() {
+                            ui.painter()
+                                .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+                        }
+
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        child.label(
+                            RichText::new(entry.kind.glyph())
+                                .color(color)
+                                .monospace()
+                                .strong(),
+                        );
+                        child.add_space(4.0);
+                        child.add(
+                            egui::Label::new(RichText::new(file_name).monospace())
+                                .truncate()
+                                .selectable(false),
+                        );
+
+                        let galley = ui.painter().layout_no_wrap(
+                            working_tree_stats_str(entry),
+                            FontId::monospace(11.0),
+                            ui.visuals().weak_text_color(),
+                        );
+                        ui.painter().galley(
+                            egui::pos2(
+                                rect.right() - galley.size().x - 4.0,
+                                rect.center().y - galley.size().y * 0.5,
+                            ),
+                            galley,
+                            ui.visuals().weak_text_color(),
+                        );
+
+                        if resp.clicked() {
+                            if selected {
+                                ws.selected_working_file = None;
+                                ws.working_file_diff = None;
+                            } else {
+                                ws.selected_working_file = Some(entry.path.clone());
+                                ws.working_file_diff = crate::git::diff_text_for_working_entry(
+                                    ws.repo.path(),
+                                    entry,
+                                )
+                                .ok();
+                            }
+                            ws.selected_file_view = SelectedFileView::Diff;
+                            ws.set_image_cache(None);
+                        }
+                    }
+                });
+            }
+        });
+}
+
+fn working_tree_status_color(entry: &StatusEntry) -> Color32 {
+    match entry.kind {
+        EntryKind::New | EntryKind::Untracked => Color32::from_rgb(90, 180, 120),
+        EntryKind::Modified => Color32::from_rgb(220, 190, 90),
+        EntryKind::Deleted => Color32::from_rgb(220, 100, 100),
+        EntryKind::Renamed => Color32::from_rgb(150, 150, 220),
+        EntryKind::Typechange => Color32::from_rgb(200, 120, 200),
+        EntryKind::Conflicted => Color32::from_rgb(255, 80, 80),
+    }
+}
+
+fn working_tree_stats_str(entry: &StatusEntry) -> String {
+    if entry.conflicted {
+        "conflicted".to_string()
+    } else if matches!(entry.kind, EntryKind::Untracked) {
+        "[new]".to_string()
+    } else if entry.staged && entry.unstaged {
+        "[staged+wt]".to_string()
+    } else if entry.staged {
+        "[staged]".to_string()
+    } else {
+        "[wt]".to_string()
+    }
+}
+
 pub(crate) fn has_selected_file(ws: &WorkspaceState) -> bool {
-    ws.current_diff
+    // Check if a commit file is selected
+    let commit_file_selected = ws
+        .current_diff
         .as_ref()
         .and_then(|diff| ws.selected_file_idx.and_then(|idx| diff.files.get(idx)))
-        .is_some()
+        .is_some();
+    // Or a working tree file is selected
+    let working_file_selected = ws.selected_working_tree && ws.selected_working_file.is_some();
+    commit_file_selected || working_file_selected
 }
 
 pub(crate) fn show_selected_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceState) {
+    // Working Tree file selected: render it inline
+    if ws.selected_working_tree {
+        if let Some(path) = ws.selected_working_file.clone() {
+            render_working_file_center(ui, ws, &path);
+            return;
+        }
+    }
+
+    // Commit file selected: existing logic
     let Some(diff) = ws.current_diff.clone() else {
         ui.vertical_centered(|ui| ui.weak("No commit selected."));
         return;
     };
     let Some(selected_idx) = ws.selected_file_idx else {
-        ui.vertical_centered(|ui| ui.weak("Select a file from the right panel."));
+        ui.vertical_centered(|ui| {
+            ui.weak("Select a file from the right panel to open its diff or file view.")
+        });
         return;
     };
     let Some(file) = diff.files.get(selected_idx).cloned() else {
         ws.selected_file_idx = None;
-        ui.vertical_centered(|ui| ui.weak("Select a file from the right panel."));
+        ui.vertical_centered(|ui| {
+            ui.weak("Select a file from the right panel to open its diff or file view.")
+        });
         return;
     };
     let image_cache = selected_image_cache(ws, &file);
@@ -230,6 +562,239 @@ pub(crate) fn show_selected_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceSta
             render_file_snapshot(ui, ws, &file, image_cache.as_ref());
         }
     }
+}
+
+/// Render a working tree file (staged or unstaged) in the center pane.
+fn render_working_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceState, path: &std::path::Path) {
+    let Some(entry) = selected_working_entry(ws, path) else {
+        ws.selected_working_file = None;
+        ws.working_file_diff = None;
+        ui.vertical_centered(|ui| {
+            ui.weak("Select a file from the right panel to open its diff or file view.")
+        });
+        return;
+    };
+    let path_str = path.display().to_string();
+
+    ui.horizontal(|ui| {
+        if ui.button("← Working Tree").clicked() {
+            ws.selected_working_file = None;
+            ws.set_image_cache(None);
+            ws.working_file_diff = None;
+        }
+        ui.separator();
+        ui.label(RichText::new(&path_str).strong());
+        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .selectable_label(ws.selected_file_view == SelectedFileView::File, "File View")
+                .clicked()
+            {
+                ws.selected_file_view = SelectedFileView::File;
+            }
+            if ui
+                .selectable_label(ws.selected_file_view == SelectedFileView::Diff, "Diff View")
+                .clicked()
+            {
+                ws.selected_file_view = SelectedFileView::Diff;
+            }
+        });
+    });
+    ui.small(format!(
+        "Working Tree · {}",
+        working_tree_stats_str(&entry)
+    ));
+    ui.separator();
+
+    if ws.working_file_diff.is_none() {
+        ws.working_file_diff = crate::git::diff_text_for_working_entry(ws.repo.path(), &entry).ok();
+    }
+
+    let working_file = ws
+        .working_file_diff
+        .as_deref()
+        .map(|text| crate::git::file_diff_for_working_entry(&entry, text));
+    let image_cache = working_file
+        .as_ref()
+        .and_then(|file| working_tree_image_cache(ws.repo.path(), file));
+
+    match ws.selected_file_view {
+        SelectedFileView::Diff => {
+            if let Some(file) = working_file.as_ref() {
+                render_file_detail(ui, file, image_cache.as_ref());
+            } else {
+                ui.weak("Could not compute diff for this file.");
+            }
+        }
+        SelectedFileView::File => {
+            if let Some(file) = working_file.as_ref() {
+                render_working_file_snapshot(ui, ws.repo.path(), file, image_cache.as_ref());
+            } else {
+                ui.weak("Could not load file contents for this working tree file.");
+            }
+        }
+    }
+}
+
+fn selected_working_entry(
+    ws: &WorkspaceState,
+    path: &std::path::Path,
+) -> Option<crate::git::StatusEntry> {
+    ws.repo_ui_cache
+        .as_ref()
+        .and_then(|cache| cache.working.as_ref())
+        .and_then(|entries| entries.iter().find(|entry| entry.path == path))
+        .cloned()
+}
+
+fn working_tree_image_cache(
+    repo_path: &std::path::Path,
+    file: &FileDiff,
+) -> Option<SelectedImageCache> {
+    let FileKind::Image { ext } = &file.kind else {
+        return None;
+    };
+
+    Some(SelectedImageCache {
+        old_oid: None,
+        new_oid: None,
+        old_bytes: file
+            .old_path
+            .as_ref()
+            .and_then(|path| load_git_snapshot_bytes(repo_path, path)),
+        new_bytes: file
+            .new_path
+            .as_ref()
+            .and_then(|path| load_working_tree_bytes(repo_path, path))
+            .or_else(|| {
+                file.new_path
+                    .as_ref()
+                    .and_then(|path| load_git_snapshot_bytes(repo_path, path))
+            }),
+        ext: ext.clone(),
+    })
+}
+
+fn render_working_file_snapshot(
+    ui: &mut egui::Ui,
+    repo_path: &std::path::Path,
+    file: &FileDiff,
+    image_cache: Option<&SelectedImageCache>,
+) {
+    match &file.kind {
+        FileKind::Text { .. } => {
+            let Some(text) = load_working_tree_snapshot_text(repo_path, file) else {
+                ui.weak("Could not load file contents for this working tree file.");
+                return;
+            };
+            let bounds = compute_line_bounds(&text);
+            if bounds.is_empty() {
+                ui.weak("(empty file)");
+                return;
+            }
+            render_text_snapshot(ui, &file.display_path(), &text, &bounds);
+        }
+        FileKind::Image { ext } => {
+            ScrollArea::both()
+                .id_salt("working_snapshot_image")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let image = image_cache
+                        .and_then(|cache| cache.new_bytes.clone().or(cache.old_bytes.clone()));
+                    if let Some(bytes) = image {
+                        let caption = if file.new_path.is_some() {
+                            "Current working tree file"
+                        } else {
+                            "Deleted file (last committed contents)"
+                        };
+                        image_panel(
+                            ui,
+                            caption,
+                            bytes,
+                            file.new_size.max(file.old_size),
+                            ext,
+                            None,
+                        );
+                    } else {
+                        ui.weak("Could not load image contents for this working tree file.");
+                    }
+                });
+        }
+        FileKind::Binary => {
+            ui.weak("Binary working tree file snapshot is not shown inline.");
+        }
+        FileKind::TooLarge => {
+            ui.weak(format!(
+                "File snapshot is too large to render inline (>{} MB).",
+                crate::git::diff::MAX_BLOB_BYTES / (1024 * 1024)
+            ));
+        }
+    }
+}
+
+fn load_working_tree_snapshot_text(repo_path: &std::path::Path, file: &FileDiff) -> Option<String> {
+    file.new_path
+        .as_ref()
+        .and_then(|path| load_working_tree_text(repo_path, path))
+        .or_else(|| {
+            file.old_path
+                .as_ref()
+                .and_then(|path| load_git_snapshot_text(repo_path, path))
+        })
+}
+
+fn load_working_tree_text(repo_path: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(repo_path.join(path)).ok()
+}
+
+fn load_working_tree_bytes(
+    repo_path: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<Arc<[u8]>> {
+    let bytes = std::fs::read(repo_path.join(path)).ok()?;
+    if bytes.len() > crate::git::diff::MAX_BLOB_BYTES {
+        return None;
+    }
+    Some(Arc::from(bytes))
+}
+
+fn load_git_snapshot_text(repo_path: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let bytes = load_git_snapshot_bytes(repo_path, path)?;
+    std::str::from_utf8(&bytes).ok().map(str::to_owned)
+}
+
+fn load_git_snapshot_bytes(
+    repo_path: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<Arc<[u8]>> {
+    let path_str = path.display().to_string();
+    for spec in [format!(":{path_str}"), format!("HEAD:{path_str}")] {
+        let Ok(out) = crate::git::cli::run(repo_path, ["show", &spec]) else {
+            continue;
+        };
+        if out.stdout.len() > crate::git::diff::MAX_BLOB_BYTES {
+            return None;
+        }
+        return Some(Arc::from(out.stdout));
+    }
+    None
+}
+
+fn path_looks_like_image(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("png")
+            | Some("jpg")
+            | Some("jpeg")
+            | Some("gif")
+            | Some("webp")
+            | Some("bmp")
+            | Some("ico")
+            | Some("tiff")
+            | Some("tif")
+    )
 }
 
 fn render_commit_summary(ui: &mut egui::Ui, diff: &RepoDiff) {
@@ -764,11 +1329,18 @@ const SNAPSHOT_GUTTER_WIDTH: f32 = 52.0;
 
 fn render_highlighted_snapshot(ui: &mut egui::Ui, file: &FileDiff, cache: &SnapshotCache) {
     let path = file.display_path();
+    render_text_snapshot(ui, &path, &cache.text, &cache.line_bounds);
+}
+
+fn render_text_snapshot(
+    ui: &mut egui::Ui,
+    path: &str,
+    text: &str,
+    bounds: &[(u32, u32)],
+) {
     let gutter_color = ui.visuals().widgets.noninteractive.fg_stroke.color;
     let line_bg = ui.visuals().faint_bg_color.gamma_multiply(0.22);
-    let total = cache.line_bounds.len();
-    let text = cache.text.clone();
-    let bounds = &cache.line_bounds;
+    let total = bounds.len();
 
     ScrollArea::vertical()
         .id_salt("snapshot_text")
@@ -793,7 +1365,7 @@ fn render_highlighted_snapshot(ui: &mut egui::Ui, file: &FileDiff, cache: &Snaps
 
                     let job = crate::ui::syntax::highlighted_code_job(
                         line,
-                        Some(path.as_str()),
+                        Some(path),
                         ui.visuals(),
                     );
                     ui.add(egui::Label::new(job).sense(egui::Sense::hover()));

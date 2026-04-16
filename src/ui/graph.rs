@@ -26,7 +26,7 @@ use crate::ui::columns::ColumnPrefs;
 
 pub const ROW_HEIGHT: f32 = 24.0;
 pub const LANE_WIDTH: f32 = 16.0;
-const COMPACT_LANE_WIDTH: f32 = 10.0;
+pub const COMPACT_LANE_WIDTH: f32 = 10.0;
 const DOT_RADIUS: f32 = 4.5;
 const LINE_WIDTH: f32 = 1.8;
 
@@ -196,6 +196,8 @@ pub struct GraphView {
 pub struct GraphInteraction {
     pub clicked: Option<usize>,
     pub action: Option<CommitAction>,
+    pub clear_commit_selection: bool,
+    pub open_commit: bool,
 }
 
 impl GraphView {
@@ -219,20 +221,32 @@ impl GraphView {
     /// else has an explicit (user-draggable) width.
     ///
     ///   `[ graph | refs | message (flex) | author | date | sha ]`
+    ///
+    /// If `working_entries` is provided and not empty, renders a "Working Tree"
+    /// virtual row as the first row above the actual commits.
     pub fn show(
         &mut self,
         ui: &mut Ui,
         head_oid: Option<Oid>,
         prefs: &mut ColumnPrefs,
+        working_entries: Option<&[crate::git::StatusEntry]>,
+        working_selected: &mut bool,
+        _working_expanded: &mut bool,
     ) -> GraphInteraction {
         let row_count = self.graph.rows.len();
-        if row_count == 0 {
+        if row_count == 0 && working_entries.map(|e| e.is_empty()).unwrap_or(true) {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
                 ui.weak("No commits in this scope.");
             });
             return GraphInteraction::default();
         }
+
+        let working_summary = working_entries.map(summarize_working_tree);
+        let has_working_changes = working_summary
+            .as_ref()
+            .map(WorkingTreeSummary::has_changes)
+            .unwrap_or(false);
 
         let lane_w = if prefs.compact_graph {
             COMPACT_LANE_WIDTH
@@ -319,6 +333,27 @@ impl GraphView {
         // per-column label, no interaction.
         render_column_header(ui, &layout, self.graph_scroll_x);
 
+        // Working Tree virtual row (fixed at top, above scrollable commits)
+        if has_working_changes {
+            if let (Some(entries), Some(summary)) = (working_entries, working_summary.as_ref()) {
+                let top_lane = self.graph.rows.first().map(|r| r.lane).unwrap_or(0);
+                render_working_tree_row(
+                    ui,
+                    &layout,
+                    lane_w,
+                    self.graph_scroll_x,
+                    entries,
+                    summary,
+                    top_lane,
+                    working_selected,
+                    &mut out,
+                );
+                if out.clear_commit_selection {
+                    self.selected_row = None;
+                }
+            }
+        }
+
         let scroll_output = egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show_rows(ui, ROW_HEIGHT, row_count, |ui, range| {
@@ -375,6 +410,7 @@ impl GraphView {
                             cells.graph,
                             row,
                             prev,
+                            (idx == 0 && has_working_changes).then_some(row.lane),
                             lane_w,
                             self.graph_scroll_x,
                         );
@@ -764,6 +800,7 @@ fn paint_graph_cell(
     rect: Rect,
     row: &GraphRow,
     prev: Option<&GraphRow>,
+    top_connector_lane: Option<u16>,
     lane_w: f32,
     scroll_x: f32,
 ) {
@@ -798,6 +835,10 @@ fn paint_graph_cell(
                 painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, mid_y)], stroke);
             }
         }
+    } else if let Some(lane) = top_connector_lane {
+        let x = lane_x(lane);
+        let stroke = Stroke::new(LINE_WIDTH, lane_color(lane));
+        painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, mid_y)], stroke);
     }
 
     // ---- BOTTOM HALF ----
@@ -994,23 +1035,24 @@ fn paint_refs_cell(ui: &mut Ui, rect: Rect, row: &GraphRow, is_head: bool, prefs
                 child
                     .painter()
                     .layout_no_wrap(left_text, font.clone(), Color32::WHITE);
-            let right_galley =
-                child
-                    .painter()
-                    .layout_no_wrap(right_text, font, Color32::WHITE);
+            let right_galley = child
+                .painter()
+                .layout_no_wrap(right_text, font, Color32::WHITE);
             let left_w = left_galley.size().x + pad.x * 2.0;
             let right_w = right_galley.size().x + pad.x * 2.0;
             let h = left_galley.size().y.max(right_galley.size().y) + pad.y * 2.0;
             let total_w = left_w + right_w;
-            let (chip_rect, _) = child.allocate_exact_size(
-                Vec2::new(total_w, h),
-                Sense::hover(),
-            );
+            let (chip_rect, _) = child.allocate_exact_size(Vec2::new(total_w, h), Sense::hover());
             // Left zone: local green with left-rounded corners.
             let left_rect = Rect::from_min_size(chip_rect.min, Vec2::new(left_w, h));
             child.painter().rect_filled(
                 left_rect,
-                egui::Rounding { nw: 3.0, sw: 3.0, ne: 0.0, se: 0.0 },
+                egui::Rounding {
+                    nw: 3.0,
+                    sw: 3.0,
+                    ne: 0.0,
+                    se: 0.0,
+                },
                 LOCAL_BG,
             );
             // Center the left galley inside the left zone.
@@ -1029,7 +1071,12 @@ fn paint_refs_cell(ui: &mut Ui, rect: Rect, row: &GraphRow, is_head: bool, prefs
             );
             child.painter().rect_filled(
                 right_rect,
-                egui::Rounding { nw: 0.0, sw: 0.0, ne: 3.0, se: 3.0 },
+                egui::Rounding {
+                    nw: 0.0,
+                    sw: 0.0,
+                    ne: 3.0,
+                    se: 3.0,
+                },
                 REMOTE_BG,
             );
             child.painter().galley(
@@ -1292,6 +1339,119 @@ fn short_sha_str(oid: &gix::ObjectId) -> String {
     s[..7.min(s.len())].to_string()
 }
 
+#[derive(Clone, Copy, Default)]
+struct WorkingTreeSummary {
+    staged: usize,
+    unstaged: usize,
+    untracked: usize,
+    conflicted: usize,
+}
+
+impl WorkingTreeSummary {
+    fn has_changes(&self) -> bool {
+        self.staged > 0 || self.unstaged > 0 || self.untracked > 0 || self.conflicted > 0
+    }
+
+    fn message(&self) -> String {
+        let mut parts = Vec::new();
+        if self.conflicted > 0 {
+            parts.push(format!("{} conflicted", self.conflicted));
+        }
+        if self.staged > 0 {
+            parts.push(format!("{} staged", self.staged));
+        }
+        if self.unstaged > 0 {
+            parts.push(format!("{} unstaged", self.unstaged));
+        }
+        if self.untracked > 0 {
+            parts.push(format!("{} untracked", self.untracked));
+        }
+        if parts.is_empty() {
+            "clean".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+
+fn summarize_working_tree(entries: &[crate::git::StatusEntry]) -> WorkingTreeSummary {
+    WorkingTreeSummary {
+        staged: entries.iter().filter(|e| e.staged).count(),
+        unstaged: entries.iter().filter(|e| e.unstaged).count(),
+        untracked: entries
+            .iter()
+            .filter(|e| matches!(e.kind, crate::git::EntryKind::Untracked))
+            .count(),
+        conflicted: entries.iter().filter(|e| e.conflicted).count(),
+    }
+}
+
+fn paint_working_tree_refs_cell(ui: &mut Ui, rect: Rect, summary: &WorkingTreeSummary) {
+    if rect.width() <= 0.0 {
+        return;
+    }
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.set_clip_rect(rect);
+
+    paint_ref_chip(
+        &mut child,
+        "WORKTREE",
+        Color32::from_rgb(98, 124, 186),
+        Color32::WHITE,
+    );
+    if summary.conflicted > 0 {
+        paint_ref_chip(
+            &mut child,
+            "CONFLICT",
+            Color32::from_rgb(192, 86, 86),
+            Color32::from_rgb(255, 240, 240),
+        );
+    }
+}
+
+fn paint_working_tree_message_cell(ui: &mut Ui, rect: Rect, summary: &WorkingTreeSummary) {
+    if rect.width() <= 0.0 {
+        return;
+    }
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.set_clip_rect(rect);
+    child.add(egui::Label::new(egui::RichText::new("Working tree").strong()).selectable(false));
+    child.add_space(8.0);
+    child.add(
+        egui::Label::new(egui::RichText::new(summary.message()).weak())
+            .truncate()
+            .selectable(false),
+    );
+}
+
+fn paint_working_tree_text_cell(ui: &mut Ui, rect: Rect, text: &str, weak: bool, monospace: bool) {
+    if rect.width() <= 0.0 {
+        return;
+    }
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.set_clip_rect(rect);
+    let mut text = egui::RichText::new(text);
+    if weak {
+        text = text.weak();
+    }
+    if monospace {
+        text = text.monospace();
+    }
+    child.add(egui::Label::new(text).truncate().selectable(false));
+}
+
 /// Draw a smooth S-curve from `start` to `end` as a cubic Bézier.
 ///
 /// We choose control points that pull strongly toward the midpoint (both
@@ -1386,5 +1546,100 @@ fn relative_time(ts: i64) -> String {
         d if d < 86_400 => format!("{}h", d / 3600),
         d if d < 2_592_000 => format!("{}d", d / 86_400),
         d => format!("{}mo", d / 2_592_000),
+    }
+}
+
+/// Render Working Tree as a virtual commit row at the top of the graph.
+/// This uses the same ColumnLayout as real commit rows for perfect alignment.
+fn render_working_tree_row(
+    ui: &mut Ui,
+    layout: &ColumnLayout,
+    lane_w: f32,
+    graph_scroll_x: f32,
+    _entries: &[crate::git::StatusEntry],
+    summary: &WorkingTreeSummary,
+    head_lane: u16,
+    selected: &mut bool,
+    out: &mut GraphInteraction,
+) {
+    use egui::{Sense, Vec2};
+
+    // Allocate row space (same as commit rows)
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
+
+    let cells = layout.compute(rect);
+    let is_hovered = resp.hovered();
+
+    // Selection/hover background (same style as commits)
+    if *selected {
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            ui.visuals()
+                .selection
+                .bg_fill
+                .gamma_multiply(if ui.visuals().dark_mode { 0.42 } else { 0.18 }),
+        );
+    } else if is_hovered {
+        ui.painter()
+            .rect_filled(rect, 0.0, ui.visuals().faint_bg_color.gamma_multiply(1.1));
+    }
+
+    // Click handling
+    if resp.clicked() {
+        *selected = true;
+        out.clear_commit_selection = true;
+        out.clicked = None;
+    }
+
+    // Context menu
+    resp.context_menu(|ui| {
+        if ui.button("Commit…").clicked() {
+            out.open_commit = true;
+            ui.close_menu();
+        }
+        if ui.button("Create stash…").clicked() {
+            out.action = Some(CommitAction::StashPushPrompt);
+            ui.close_menu();
+        }
+    });
+
+    // Paint virtual graph node like a normal commit row (if graph column visible)
+    if layout.show_graph {
+        let clipped = ui.painter().with_clip_rect(cells.graph);
+        let lane_x = cells.graph.left()
+            + (head_lane.min(crate::git::graph::MAX_GRAPH_LANES) as f32 + 0.5) * lane_w
+            - graph_scroll_x;
+        let dot_center = egui::pos2(lane_x, rect.center().y);
+        let lane_color = lane_color(head_lane);
+        clipped.line_segment(
+            [dot_center, egui::pos2(lane_x, cells.graph.bottom())],
+            egui::Stroke::new(LINE_WIDTH, lane_color),
+        );
+        clipped.circle_filled(dot_center, DOT_RADIUS, lane_color);
+        clipped.circle_stroke(
+            dot_center,
+            DOT_RADIUS,
+            egui::Stroke::new(1.0, Color32::from_black_alpha(80)),
+        );
+    }
+
+    if layout.show_refs_column {
+        paint_working_tree_refs_cell(ui, cells.refs, summary);
+    }
+
+    if layout.show_message {
+        paint_working_tree_message_cell(ui, cells.message, summary);
+    }
+
+    if layout.show_author {
+        paint_working_tree_text_cell(ui, cells.author, "Uncommitted", true, false);
+    }
+    if layout.show_date {
+        paint_working_tree_text_cell(ui, cells.date, "now", true, false);
+    }
+    if layout.show_sha {
+        paint_working_tree_text_cell(ui, cells.sha, "WT", true, true);
     }
 }

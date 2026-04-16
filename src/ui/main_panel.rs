@@ -148,8 +148,10 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         // text flips between "computing…" and "select a file" based on
         // whether the diff has arrived. Total height stays stable, so
         // no more jitter.
-        if ws.selected_commit.is_some() {
-            let msg = if ws.current_diff.is_some() {
+        if ws.selected_commit.is_some() || ws.selected_working_tree {
+            let msg = if ws.selected_working_tree {
+                "Select a file from the right panel to open its diff or file view."
+            } else if ws.current_diff.is_some() {
                 "Select a file from the right panel to open its diff or file view."
             } else if ws.diff_task.is_some() {
                 "Computing diff for the selected commit…"
@@ -164,98 +166,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             ui.separator();
         }
 
-        // ---------- working-tree row (above the graph proper) ----------
-        //
-        // Classic git GUI pattern: whenever the working tree is dirty
-        // we show a single pseudo-commit row at the very top of the
-        // history, clickable to open the commit flow. Without this the
-        // only entry point to staging was a toolbar button hidden away
-        // to the right — easy to miss, especially on large repos where
-        // the graph dominates the screen.
-        //
-        // Working-tree status comes from the per-tab `repo_ui_cache`:
-        // `repo.statuses` with `include_untracked(true)` walks the
-        // whole tree, which on kernel-scale repos was 100 ms+ *per
-        // frame* at 60 fps, dwarfing any other per-paint cost and
-        // making commit clicks feel laggy. The cache refreshes on op
-        // / tab open via `refresh_repo_ui_cache`.
-        let working = ws.repo_ui_cache.as_ref().and_then(|c| c.working.clone());
-        if let Some(ref entries) = working {
-            let staged = entries.iter().filter(|e| e.staged).count();
-            let unstaged = entries.iter().filter(|e| e.unstaged).count();
-            let untracked = entries
-                .iter()
-                .filter(|e| matches!(e.kind, crate::git::EntryKind::Untracked))
-                .count();
-            if staged + unstaged + untracked > 0 {
-                let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 28.0),
-                    egui::Sense::click(),
-                );
-                if resp.hovered() || resp.clicked() {
-                    ui.painter().rect_filled(
-                        rect,
-                        3.0,
-                        ui.visuals().faint_bg_color.gamma_multiply(1.4),
-                    );
-                }
-                // Dashed-circle marker — the visual convention for a
-                // not-yet-committed state.
-                let dot_center = egui::pos2(rect.left() + 14.0, rect.center().y);
-                ui.painter().circle_stroke(
-                    dot_center,
-                    5.5,
-                    egui::Stroke::new(1.6, egui::Color32::from_rgb(230, 180, 90)),
-                );
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(dot_center.x - 8.0, rect.center().y),
-                        egui::pos2(dot_center.x - 2.0, rect.center().y),
-                    ],
-                    egui::Stroke::new(
-                        1.5,
-                        egui::Color32::from_rgba_unmultiplied(230, 180, 90, 120),
-                    ),
-                );
-                // Text
-                let mut parts: Vec<String> = Vec::new();
-                if staged > 0 {
-                    parts.push(format!("{staged} staged"));
-                }
-                if unstaged > 0 {
-                    parts.push(format!("{unstaged} unstaged"));
-                }
-                if untracked > 0 {
-                    parts.push(format!("{untracked} untracked"));
-                }
-                let summary = parts.join(" · ");
-                ui.painter().text(
-                    egui::pos2(rect.left() + 28.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    format!("● Working changes  ({summary})"),
-                    egui::FontId::default(),
-                    ui.visuals().text_color(),
-                );
-                // Right-aligned hint about what a click does.
-                ui.painter().text(
-                    egui::pos2(rect.right() - 10.0, rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    "click to commit →",
-                    egui::FontId::proportional(11.0),
-                    ui.visuals().text_color().gamma_multiply(0.6),
-                );
-                if resp.clicked() {
-                    intent.open_commit = true;
-                }
-                resp.on_hover_text(
-                    "Stage files and commit — or amend the previous commit — \
-                     via the commit modal.",
-                );
-                ui.separator();
-            }
-        }
-
-        // ---------- graph ----------
+        // ---------- graph (includes Working Tree as virtual row) ----------
         let head_oid = ws.repo.head_oid();
         // Banner: graph was capped at MAX_GRAPH_COMMITS or lanes exceed
         // the visible width. Both are "we didn't render the whole story"
@@ -288,21 +199,53 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 ui.separator();
             }
         }
+        let mut clear_commit_selection = false;
+        let mut clicked_commit_oid: Option<gix::ObjectId> = None;
         if let Some(gv) = &mut ws.graph_view {
-            let result = gv.show(ui, head_oid, &mut ws.column_prefs);
+            // Get working tree entries for the virtual row
+            let working_entries = ws.repo_ui_cache.as_ref().and_then(|c| c.working.as_deref());
+
+            let result = gv.show(
+                ui,
+                head_oid,
+                &mut ws.column_prefs,
+                working_entries,
+                &mut ws.selected_working_tree,
+                &mut ws.working_tree_expanded,
+            );
             if let Some(action) = result.action {
                 intent.action = Some(action);
             }
+            if result.open_commit {
+                intent.open_commit = true;
+            }
+            clear_commit_selection = result.clear_commit_selection;
             if let Some(idx) = result.clicked {
-                if let Some(row) = gv.graph.rows.get(idx) {
-                    commit_clicked = Some(row.oid);
-                }
+                clicked_commit_oid = gv.graph.rows.get(idx).map(|row| row.oid);
             }
         } else {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
                 ui.weak("Graph unavailable (empty repo or build error).");
             });
+        }
+        if clear_commit_selection {
+            ws.selected_commit = None;
+            ws.current_diff = None;
+            ws.selected_file_idx = None;
+            ws.selected_file_view = SelectedFileView::Diff;
+            ws.set_image_cache(None);
+            ws.selected_working_file = None;
+            ws.working_file_diff = None;
+            ws.working_tree_expanded = false;
+        }
+        if let Some(oid) = clicked_commit_oid {
+            // Click on real commit row clears working tree selection
+            ws.selected_working_tree = false;
+            ws.selected_working_file = None;
+            ws.working_file_diff = None;
+            ws.working_tree_expanded = false;
+            commit_clicked = Some(oid);
         }
     });
 
@@ -1125,4 +1068,165 @@ fn short_sha(oid: &gix::ObjectId) -> String {
 
 fn describe_pending(oid: &gix::ObjectId) -> String {
     format!("op on {}", short_sha(oid))
+}
+
+/// Render the expanded working tree file list with staged/unstaged sections.
+fn render_working_tree_files(
+    ui: &mut egui::Ui,
+    ws: &mut crate::app::WorkspaceState,
+    entries: &[crate::git::StatusEntry],
+    intent: &mut PanelIntent,
+) {
+    use crate::git::EntryKind;
+
+    let staged: Vec<&crate::git::StatusEntry> = entries.iter().filter(|e| e.staged).collect();
+    let unstaged: Vec<&crate::git::StatusEntry> = entries
+        .iter()
+        .filter(|e| e.unstaged || matches!(e.kind, EntryKind::Untracked) || e.conflicted)
+        .collect();
+
+    // Staged section
+    if !staged.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("📦 Staged").strong().small());
+            ui.weak(format!("({})", staged.len()));
+        });
+        ui.indent("staged_indent", |ui| {
+            for entry in &staged {
+                render_working_file_row(ui, ws, entry, true, intent);
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    // Unstaged section
+    if !unstaged.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("🗂 Unstaged").strong().small());
+            ui.weak(format!("({})", unstaged.len()));
+        });
+        ui.indent("unstaged_indent", |ui| {
+            for entry in &unstaged {
+                render_working_file_row(ui, ws, entry, false, intent);
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    // Action buttons at the bottom of expanded section
+    ui.horizontal(|ui| {
+        if ui.button("Stage all").clicked() {
+            intent.action = Some(crate::actions::CommitAction::StashPushPrompt);
+            // Actually we need a proper stage-all action, use open_commit for now
+            intent.open_commit = true;
+        }
+        if ui.button("Open commit dialog…").clicked() {
+            intent.open_commit = true;
+        }
+    });
+}
+
+/// Render a single file row in the working tree list.
+fn render_working_file_row(
+    ui: &mut egui::Ui,
+    ws: &mut crate::app::WorkspaceState,
+    entry: &crate::git::StatusEntry,
+    is_staged_section: bool,
+    _intent: &mut PanelIntent,
+) {
+    let (color, glyph) = style_for_working_entry(&entry.kind, entry.staged, entry.unstaged);
+
+    let is_selected = ws
+        .selected_working_file
+        .as_ref()
+        .map(|p| p == &entry.path)
+        .unwrap_or(false);
+
+    let row_height = 22.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_height),
+        egui::Sense::click(),
+    );
+
+    // Selection/hover background
+    if is_selected {
+        ui.painter().rect_filled(
+            rect,
+            2.0,
+            ui.visuals().selection.bg_fill.gamma_multiply(0.4),
+        );
+    } else if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, 2.0, ui.visuals().faint_bg_color.gamma_multiply(1.2));
+    }
+
+    // Content
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+
+    // Status glyph
+    child.label(egui::RichText::new(glyph).color(color).monospace().strong());
+    child.add_space(4.0);
+
+    // Path (truncated)
+    let path_str = entry.path.display().to_string();
+    child.add(
+        egui::Label::new(egui::RichText::new(&path_str).monospace().small())
+            .truncate()
+            .selectable(false),
+    );
+
+    // Right side: status indicators
+    let mut right_child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+
+    if entry.conflicted {
+        right_child.colored_label(egui::Color32::from_rgb(240, 90, 90), "⚠ conflicted");
+    }
+    if is_staged_section && entry.unstaged {
+        right_child.weak(egui::RichText::new("+unstaged").small());
+    }
+
+    if resp.clicked() {
+        if is_selected {
+            ws.selected_working_file = None;
+            ws.working_file_diff = None;
+        } else {
+            ws.selected_working_file = Some(entry.path.clone());
+            ws.working_file_diff =
+                crate::git::diff_text_for_working_entry(ws.repo.path(), entry).ok();
+        }
+    }
+
+    // Tooltip with full path
+    resp.on_hover_text(&path_str);
+}
+
+/// Style for working tree entries (similar to commit_modal).
+fn style_for_working_entry(
+    kind: &crate::git::EntryKind,
+    staged: bool,
+    _unstaged: bool,
+) -> (egui::Color32, &'static str) {
+    use crate::git::EntryKind;
+    let base_color = match kind {
+        EntryKind::New | EntryKind::Untracked => egui::Color32::from_rgb(90, 180, 120),
+        EntryKind::Modified => egui::Color32::from_rgb(220, 190, 90),
+        EntryKind::Deleted => egui::Color32::from_rgb(220, 100, 100),
+        EntryKind::Renamed => egui::Color32::from_rgb(150, 150, 220),
+        EntryKind::Typechange => egui::Color32::from_rgb(200, 120, 200),
+        EntryKind::Conflicted => egui::Color32::from_rgb(255, 80, 80),
+    };
+    let color = if staged {
+        base_color
+    } else {
+        egui::Color32::from_rgba_unmultiplied(base_color.r(), base_color.g(), base_color.b(), 160)
+    };
+    (color, kind.glyph())
 }

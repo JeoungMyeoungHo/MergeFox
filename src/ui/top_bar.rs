@@ -14,18 +14,26 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let forge_ready = ws.forge.repo.is_some();
     let forge_loading = ws.forge.loading;
     let has_active_job = ws.active_job.is_some();
-    let active_job_label = ws.active_job.as_ref().map(|j| {
+
+    // 진행률 데이터 추출 - 프로그레스바 표시용
+    let active_job_progress = ws.active_job.as_ref().map(|j| {
         let p = j.snapshot();
-        let pct = if p.total > 0 {
-            format!("{}%", (p.current * 100) / p.total.max(1))
+        let fraction = if p.total > 0 {
+            p.current as f32 / p.total as f32
         } else {
-            "…".to_string()
+            0.0
         };
-        format!("{}  {}  {}", j.label(), p.stage, pct)
+        let pct = if p.total > 0 {
+            (p.current * 100) / p.total.max(1)
+        } else {
+            0
+        };
+        (j.label(), p.stage, fraction, pct)
     });
-    let nav_task_label = ws.nav_task.as_ref().map(|t| {
+    let nav_task_progress = ws.nav_task.as_ref().map(|t| {
         let elapsed = t.started_at.elapsed().as_secs();
-        format!("{}  ({elapsed}s)", t.label)
+        // nav_task는 완료 시간을 알 수 없으므로 인디터미네이트 스타일 사용 (0.0)
+        (t.label.clone(), elapsed, 0.0_f32)
     });
 
     // Tracking info for HEAD: upstream name + ahead/behind counts.
@@ -272,15 +280,33 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 open_settings = true;
             }
 
-            if let Some(label) = &active_job_label {
+            // ---- 프로그레스바 표시 (스피너 대신 선형 프로그레스바) ----
+            if let Some((label, stage, fraction, pct)) = active_job_progress {
                 ui.separator();
-                ui.spinner();
-                ui.weak(label);
+                // 상단바 공간이 제한적이므로 컴팩트한 형태로 표시
+                let text = if pct > 0 {
+                    format!("{label} — {stage} ({pct}%)")
+                } else {
+                    format!("{label} — {stage}")
+                };
+                ui.weak(&text);
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_width(120.0)
+                        .show_percentage()
+                        .animate(true),
+                );
             }
-            if let Some(label) = &nav_task_label {
+            if let Some((label, elapsed, fraction)) = nav_task_progress {
                 ui.separator();
-                ui.spinner();
-                ui.weak(label);
+                let text = format!("{label} ({elapsed}s)");
+                ui.weak(&text);
+                // nav_task는 진행률을 알 수 없으므로 인디터미네이트 스타일 (animate만)
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_width(80.0)
+                        .animate(true),
+                );
             }
 
             if let Some(err) = last_error {

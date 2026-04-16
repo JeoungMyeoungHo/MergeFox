@@ -203,6 +203,33 @@ pub fn unstage_paths(repo_path: &Path, paths: &[&Path]) -> Result<()> {
     Ok(())
 }
 
+/// Discard working-tree changes for tracked paths and remove untracked
+/// paths. Tracked files restore from the index (`git restore --worktree`)
+/// so any already-staged content is preserved.
+pub fn discard_paths(
+    repo_path: &Path,
+    tracked_paths: &[&Path],
+    untracked_paths: &[&Path],
+) -> Result<()> {
+    if !tracked_paths.is_empty() {
+        let mut cmd = super::cli::GitCommand::new(repo_path).args(["restore", "--worktree", "--"]);
+        for p in tracked_paths {
+            cmd = cmd.arg(p);
+        }
+        cmd.run().context("git restore --worktree")?;
+    }
+
+    if !untracked_paths.is_empty() {
+        let mut cmd = super::cli::GitCommand::new(repo_path).args(["clean", "-f", "--"]);
+        for p in untracked_paths {
+            cmd = cmd.arg(p);
+        }
+        cmd.run().context("git clean -f")?;
+    }
+
+    Ok(())
+}
+
 /// Create a commit on HEAD from the current index. Returns the new OID.
 pub fn commit(repo_path: &Path, message: &str) -> Result<gix::ObjectId> {
     super::cli::GitCommand::new(repo_path)
