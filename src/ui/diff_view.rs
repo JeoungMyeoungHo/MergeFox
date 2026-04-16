@@ -181,6 +181,10 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 }
 
 fn render_working_tree_panel(ui: &mut egui::Ui, ws: &mut WorkspaceState) {
+    let working_error = ws
+        .repo_ui_cache
+        .as_ref()
+        .and_then(|c| c.working_error.clone());
     let entries: Vec<StatusEntry> = ws
         .repo_ui_cache
         .as_ref()
@@ -206,6 +210,10 @@ fn render_working_tree_panel(ui: &mut egui::Ui, ws: &mut WorkspaceState) {
                 }
             });
         });
+        if let Some(err) = working_error {
+            ui.colored_label(egui::Color32::from_rgb(230, 180, 90), err);
+            ui.add_space(6.0);
+        }
         render_working_tree_summary(ui, &entries);
         ui.separator();
 

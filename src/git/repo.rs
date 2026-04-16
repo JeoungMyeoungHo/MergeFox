@@ -71,6 +71,117 @@ pub struct RemoteInfo {
     pub push_url: Option<String>,
 }
 
+/// One entry from `git worktree list --porcelain`. The main working tree
+/// shows up with `is_main = true`; subsequent entries are linked worktrees.
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    pub path: std::path::PathBuf,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    /// True for the main worktree (the one containing `.git/`, not a
+    /// `.git` file that points elsewhere).
+    pub is_main: bool,
+    pub is_bare: bool,
+    pub is_detached: bool,
+    pub is_locked: bool,
+    pub lock_reason: Option<String>,
+    /// True if `--prunable` (stale directory, ready for `worktree prune`).
+    pub is_prunable: bool,
+}
+
+/// Parse `git worktree list --porcelain` output. The format is:
+///
+///   worktree /path/to/wt
+///   HEAD <oid>
+///   branch refs/heads/<name>  (or "detached")
+///   locked [<reason>]          (only if locked)
+///   prunable [<reason>]        (only if prunable)
+///   bare                       (only for bare main repos)
+///   (blank line separates entries)
+///
+/// Extracted from the method so it's unit-testable without spawning git.
+fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeInfo> {
+    let mut out = Vec::new();
+    let mut current: Option<WorktreeInfo> = None;
+    let mut first_entry = true;
+    let push = |out: &mut Vec<WorktreeInfo>, entry: &mut Option<WorktreeInfo>, first: &mut bool| {
+        if let Some(mut wt) = entry.take() {
+            if *first {
+                wt.is_main = true;
+                *first = false;
+            }
+            out.push(wt);
+        }
+    };
+    for line in text.lines() {
+        if line.is_empty() {
+            push(&mut out, &mut current, &mut first_entry);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            push(&mut out, &mut current, &mut first_entry);
+            current = Some(WorktreeInfo {
+                path: std::path::PathBuf::from(rest),
+                head: None,
+                branch: None,
+                is_main: false,
+                is_bare: false,
+                is_detached: false,
+                is_locked: false,
+                lock_reason: None,
+                is_prunable: false,
+            });
+            continue;
+        }
+        let Some(wt) = current.as_mut() else { continue };
+        if let Some(rest) = line.strip_prefix("HEAD ") {
+            wt.head = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            wt.branch = Some(rest.trim_start_matches("refs/heads/").to_string());
+        } else if line == "detached" {
+            wt.is_detached = true;
+        } else if line == "bare" {
+            wt.is_bare = true;
+        } else if line == "locked" {
+            wt.is_locked = true;
+        } else if let Some(rest) = line.strip_prefix("locked ") {
+            wt.is_locked = true;
+            wt.lock_reason = Some(rest.to_string());
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            wt.is_prunable = true;
+        }
+    }
+    push(&mut out, &mut current, &mut first_entry);
+    out
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::*;
+
+    #[test]
+    fn parses_main_only() {
+        let input = "worktree /a/b\nHEAD deadbeef\nbranch refs/heads/main\n\n";
+        let w = parse_worktree_porcelain(input);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].is_main);
+        assert_eq!(w[0].branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn parses_linked_and_detached() {
+        let input = "worktree /a\nHEAD 1\nbranch refs/heads/main\n\n\
+                     worktree /b\nHEAD 2\ndetached\n\n\
+                     worktree /c\nHEAD 3\nbranch refs/heads/topic\nlocked on external drive\n\n";
+        let w = parse_worktree_porcelain(input);
+        assert_eq!(w.len(), 3);
+        assert!(w[0].is_main);
+        assert!(!w[1].is_main && w[1].is_detached);
+        assert!(w[2].is_locked);
+        assert_eq!(w[2].lock_reason.as_deref(), Some("on external drive"));
+    }
+}
+
 /// Pending repo operation, detected via marker files inside `.git/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoState {
@@ -133,7 +244,7 @@ impl Repo {
         let mut repo = Self { gix, path };
 
         if let Err(e) = repo.prune_autostashes(AUTOSTASH_RETENTION_SECS) {
-            eprintln!("mergefox: auto-stash retention prune failed: {e:#}");
+            tracing::warn!(error = %e, "auto-stash retention prune failed");
         }
         Ok(repo)
     }
@@ -594,6 +705,63 @@ impl Repo {
 
     pub fn delete_remote(&self, name: &str) -> Result<()> {
         super::cli::run(&self.path, ["remote", "remove", name])?;
+        Ok(())
+    }
+
+    /// Rename a configured remote. Git automatically rewrites upstream
+    /// tracking config for any branch that was following `old_name/*`,
+    /// which is the main reason this is a first-class op rather than
+    /// remove + add (that path would orphan every tracking ref).
+    pub fn rename_remote(&self, old_name: &str, new_name: &str) -> Result<()> {
+        if old_name == new_name {
+            return Ok(());
+        }
+        super::cli::run(&self.path, ["remote", "rename", old_name, new_name])?;
+        Ok(())
+    }
+
+    /// Enumerate every worktree attached to this repository, including
+    /// the main one. Parses the `--porcelain` output of `worktree list`
+    /// because the default format is locale-sensitive and breaks when
+    /// paths contain spaces.
+    pub fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>> {
+        let out = super::cli::run(&self.path, ["worktree", "list", "--porcelain"])?;
+        Ok(parse_worktree_porcelain(&out.stdout_str()))
+    }
+
+    /// Remove a linked worktree by its path. `force=true` maps to
+    /// `--force`, which is required if the worktree has uncommitted
+    /// changes or is locked. The caller should confirm with the user
+    /// before forcing.
+    pub fn remove_worktree(&self, path: &Path, force: bool) -> Result<()> {
+        let path_str = path.to_string_lossy().into_owned();
+        let mut args: Vec<&str> = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.push(&path_str);
+        super::cli::run(&self.path, args)?;
+        Ok(())
+    }
+
+    /// Mark a worktree as locked. Locking prevents `git worktree prune`
+    /// from removing it if its directory is temporarily unavailable
+    /// (common for worktrees on external drives).
+    pub fn lock_worktree(&self, path: &Path, reason: Option<&str>) -> Result<()> {
+        let path_str = path.to_string_lossy().into_owned();
+        let mut args: Vec<&str> = vec!["worktree", "lock"];
+        if let Some(r) = reason {
+            args.push("--reason");
+            args.push(r);
+        }
+        args.push(&path_str);
+        super::cli::run(&self.path, args)?;
+        Ok(())
+    }
+
+    pub fn unlock_worktree(&self, path: &Path) -> Result<()> {
+        let path_str = path.to_string_lossy().into_owned();
+        super::cli::run(&self.path, ["worktree", "unlock", &path_str])?;
         Ok(())
     }
 

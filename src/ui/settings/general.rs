@@ -174,8 +174,69 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
         persist_config(app, labels.theme_saved);
     }
 
+    render_git_runtime(ui, app, &labels);
     render_git_identity(ui, app, &labels);
     render_clone_defaults(ui, app, &labels);
+}
+
+fn render_git_runtime(ui: &mut egui::Ui, app: &mut MergeFoxApp, labels: &Labels) {
+    ui.add_space(18.0);
+    ui.heading(labels.git_runtime_heading);
+    ui.separator();
+    ui.weak(labels.git_runtime_hint);
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        let (text, color) = if app.git_capability.is_available() {
+            (
+                app.git_capability.summary(),
+                egui::Color32::from_rgb(120, 200, 140),
+            )
+        } else {
+            (
+                app.git_missing_message("MergeFox"),
+                egui::Color32::from_rgb(230, 180, 90),
+            )
+        };
+        ui.colored_label(color, text);
+        if ui.button(labels.git_runtime_refresh).clicked() {
+            app.refresh_git_capability();
+        }
+    });
+
+    if !app.git_capability.is_available() {
+        ui.weak(app.git_capability.install_guidance());
+    }
+
+    ui.add_space(10.0);
+    egui::CollapsingHeader::new(labels.git_runtime_log)
+        .default_open(false)
+        .show(ui, |ui| {
+            let entries = crate::git::recent_git_log();
+            if entries.is_empty() {
+                ui.weak(labels.git_runtime_log_empty);
+                return;
+            }
+            for entry in entries.iter().rev().take(12) {
+                let status = if entry.exit_code == 0 {
+                    "ok".to_string()
+                } else {
+                    format!("exit {}", entry.exit_code)
+                };
+                ui.monospace(format!(
+                    "[t={} | {} ms | {}] git {}",
+                    entry.timestamp,
+                    entry.duration_ms,
+                    status,
+                    entry.args.join(" ")
+                ));
+                ui.weak(&entry.cwd);
+                if !entry.stderr_head.is_empty() {
+                    ui.weak(format!("stderr: {}", entry.stderr_head));
+                }
+                ui.add_space(6.0);
+            }
+        });
 }
 
 /// Git author identity subsection.
@@ -281,7 +342,7 @@ fn render_git_identity(ui: &mut egui::Ui, app: &mut MergeFoxApp, labels: &Labels
             Ok(())
         })();
         if let Err(e) = result {
-            app.last_error = Some(format!("git config: {e:#}"));
+            app.set_git_error("Updating git identity", format!("{e:#}"));
         }
     }
 }
@@ -544,6 +605,11 @@ struct Labels {
     custom_bases: &'static str,
     enabled: &'static str,
     disabled: &'static str,
+    git_runtime_heading: &'static str,
+    git_runtime_hint: &'static str,
+    git_runtime_refresh: &'static str,
+    git_runtime_log: &'static str,
+    git_runtime_log_empty: &'static str,
     identity_heading: &'static str,
     identity_hint: &'static str,
     identity_name: &'static str,
@@ -596,6 +662,12 @@ fn labels(lang: UiLanguage) -> Labels {
             custom_bases: "기본값으로 다시 시작:",
             enabled: "사용",
             disabled: "해제",
+            git_runtime_heading: "System Git",
+            git_runtime_hint:
+                "MergeFox는 읽기 경로는 gix를 쓰고, 커밋/스태시/리베이스/네트워크 작업은 설치된 git CLI를 사용합니다.",
+            git_runtime_refresh: "다시 확인",
+            git_runtime_log: "최근 git 명령",
+            git_runtime_log_empty: "아직 실행한 git 명령이 없습니다.",
             identity_heading: "Git 사용자 정보",
             identity_hint: "커밋할 때 기록되는 이름과 이메일입니다. 앱 간 공유되는 git config 값입니다.",
             identity_name: "이름",
@@ -649,6 +721,12 @@ fn labels(lang: UiLanguage) -> Labels {
             custom_bases: "Start from preset:",
             enabled: "Enabled",
             disabled: "Disabled",
+            git_runtime_heading: "System Git",
+            git_runtime_hint:
+                "MergeFox uses gix for fast in-process reads, but commit/stash/rebase/network actions run through the installed git CLI.",
+            git_runtime_refresh: "Refresh",
+            git_runtime_log: "Recent git commands",
+            git_runtime_log_empty: "No git commands have run yet.",
             identity_heading: "Git identity",
             identity_hint: "Name and email recorded in every commit you make. Shared across all apps that use git config.",
             identity_name: "Name",
