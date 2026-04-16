@@ -172,18 +172,19 @@ pub fn diff_for_commit(repo_path: &Path, oid: gix::ObjectId) -> Result<RepoDiff>
     let t_build = t0.elapsed();
 
     if profile {
-        eprintln!(
-            "[diff {:.7}] gix_discover={:?} meta={:?} git_show={:?} utf8={:?} split={:?} build={:?} total={:?} bytes={} files={}",
-            &oid.to_string()[..7],
-            t_gix_discover,
-            t_meta - t_gix_discover,
-            t_show - t_meta,
-            t_utf8 - t_show,
-            t_split - t_utf8,
-            t_build - t_split,
-            t_build,
+        tracing::debug!(
+            target: "mergefox::profile::diff",
+            oid = %&oid.to_string()[..7],
+            gix_discover_us = t_gix_discover.as_micros() as u64,
+            meta_us = (t_meta - t_gix_discover).as_micros() as u64,
+            show_us = (t_show - t_meta).as_micros() as u64,
+            utf8_us = (t_utf8 - t_show).as_micros() as u64,
+            split_us = (t_split - t_utf8).as_micros() as u64,
+            build_us = (t_build - t_split).as_micros() as u64,
+            total_us = t_build.as_micros() as u64,
             bytes,
-            n_files,
+            files = n_files,
+            "diff profile"
         );
     }
 
