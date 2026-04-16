@@ -203,10 +203,10 @@ fn render_git_identity(ui: &mut egui::Ui, app: &mut MergeFoxApp, labels: &Labels
     // Lazy-init: read from git config on first render.
     if !modal.identity_loaded {
         if let Some(path) = modal.repo_path.as_ref() {
-            modal.identity_name = crate::git::cli::run_line(path, ["config", "user.name"])
-                .unwrap_or_default();
-            modal.identity_email = crate::git::cli::run_line(path, ["config", "user.email"])
-                .unwrap_or_default();
+            modal.identity_name =
+                crate::git::cli::run_line(path, ["config", "user.name"]).unwrap_or_default();
+            modal.identity_email =
+                crate::git::cli::run_line(path, ["config", "user.email"]).unwrap_or_default();
         } else {
             modal.identity_name = crate::git::cli::GitCommand::new(std::path::Path::new("."))
                 .args(["config", "--global", "user.name"])

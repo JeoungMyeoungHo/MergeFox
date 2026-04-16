@@ -53,8 +53,8 @@ pub fn do_clone_gix(
 
     // Parse first so we surface "bad URL" as a Result rather than a panic
     // inside gix.
-    let parsed_url = gix::url::parse(url.as_bytes().into())
-        .with_context(|| format!("parse clone URL {url}"))?;
+    let parsed_url =
+        gix::url::parse(url.as_bytes().into()).with_context(|| format!("parse clone URL {url}"))?;
 
     // Prodash tree. Handed to the cloner as the progress sink, and
     // cloned-by-reference into the poller thread. Item is taken as the
@@ -147,11 +147,7 @@ fn mark_completion(progress: &Arc<Mutex<CloneProgress>>) {
 /// root-level "mergefox-clone" node stays at 0/0 the whole time — if we
 /// surfaced that, the UI would look frozen. Picking the busiest concrete
 /// subtask is the heuristic git's own CLI uses for the same reason.
-fn poll_progress(
-    root: Arc<Root>,
-    progress: Arc<Mutex<CloneProgress>>,
-    stop: Arc<AtomicBool>,
-) {
+fn poll_progress(root: Arc<Root>, progress: Arc<Mutex<CloneProgress>>, stop: Arc<AtomicBool>) {
     // `sorted_snapshot` fills a `Vec<(Key, Task)>` but we don't care
     // about the key type — let type inference pick the correct Key
     // impl from prodash's private tree module.
@@ -167,9 +163,7 @@ fn poll_progress(
                 continue;
             };
             let Value {
-                ref step,
-                done_at,
-                ..
+                ref step, done_at, ..
             } = *v;
             let step_now = step.load(Ordering::Relaxed);
             if step_now == 0 {

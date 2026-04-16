@@ -333,10 +333,8 @@ impl Repo {
     pub fn conflict_entries(&self) -> Result<Vec<ConflictEntry>> {
         // List conflicted files via `git diff --name-only --diff-filter=U`
         // then load the three blob stages via `git show :N:<path>`.
-        let status_out = super::cli::run(
-            &self.path,
-            ["diff", "--name-only", "--diff-filter=U", "-z"],
-        )?;
+        let status_out =
+            super::cli::run(&self.path, ["diff", "--name-only", "--diff-filter=U", "-z"])?;
         let paths: Vec<PathBuf> = status_out
             .stdout
             .split(|&b| b == 0)
@@ -349,10 +347,7 @@ impl Repo {
             // The diff filter above only catches U entries after the index
             // has conflicts; on a fresh cherry-pick the index may show
             // AA / DD instead.
-            let status = super::cli::run(
-                &self.path,
-                ["status", "--porcelain=v1", "-z"],
-            )?;
+            let status = super::cli::run(&self.path, ["status", "--porcelain=v1", "-z"])?;
             if !status.stdout.is_empty() {
                 // Parse conflicted paths from status
                 let entries = super::ops::status_entries(&self.path)?;
@@ -403,8 +398,7 @@ impl Repo {
                 if let Some(parent) = abs.parent() {
                     fs::create_dir_all(parent).ok();
                 }
-                fs::write(&abs, &out.stdout)
-                    .with_context(|| format!("write {}", abs.display()))?;
+                fs::write(&abs, &out.stdout).with_context(|| format!("write {}", abs.display()))?;
             }
             Err(_) => {
                 // Stage doesn't exist → the file was deleted on that side.
@@ -475,8 +469,7 @@ impl Repo {
     }
 
     pub fn continue_merge(&self) -> Result<gix::ObjectId> {
-        super::cli::run(&self.path, ["merge", "--continue"])
-            .context("merge --continue")?;
+        super::cli::run(&self.path, ["merge", "--continue"]).context("merge --continue")?;
         head_oid_cli(&self.path)
     }
 
@@ -487,8 +480,7 @@ impl Repo {
     }
 
     pub fn continue_revert(&self) -> Result<gix::ObjectId> {
-        super::cli::run(&self.path, ["revert", "--continue"])
-            .context("revert --continue")?;
+        super::cli::run(&self.path, ["revert", "--continue"]).context("revert --continue")?;
         head_oid_cli(&self.path)
     }
 
@@ -519,9 +511,7 @@ impl Repo {
                 format!("{branch}.backup-{ts}-{suffix}")
             };
             // Try to create; fail means it exists → try next suffix.
-            if super::cli::run(&self.path, ["branch", &name])
-                .is_ok()
-            {
+            if super::cli::run(&self.path, ["branch", &name]).is_ok() {
                 return Ok(name);
             }
         }
@@ -557,7 +547,11 @@ impl Repo {
             let push_url = remote
                 .url(gix::remote::Direction::Push)
                 .map(|u| u.to_bstring().to_string());
-            let push_url = if push_url == fetch_url { None } else { push_url };
+            let push_url = if push_url == fetch_url {
+                None
+            } else {
+                push_url
+            };
             out.push(RemoteInfo {
                 name: name_str,
                 fetch_url,
@@ -607,8 +601,7 @@ impl Repo {
         let staged = super::cli::run(&self.path, ["diff", "--cached", "--no-color", "-U3"])?;
         let mut text = staged.stdout_str();
         if text.trim().is_empty() {
-            let unstaged =
-                super::cli::run(&self.path, ["diff", "HEAD", "--no-color", "-U3"])?;
+            let unstaged = super::cli::run(&self.path, ["diff", "HEAD", "--no-color", "-U3"])?;
             text = unstaged.stdout_str();
         }
         if text.len() > max_bytes {
@@ -688,11 +681,8 @@ impl Repo {
     }
 
     pub fn revert_commit(&self, oid: gix::ObjectId) -> Result<gix::ObjectId> {
-        super::cli::run(
-            &self.path,
-            ["revert", "--no-edit", &oid.to_string()],
-        )
-        .with_context(|| format!("revert {oid}"))?;
+        super::cli::run(&self.path, ["revert", "--no-edit", &oid.to_string()])
+            .with_context(|| format!("revert {oid}"))?;
         head_oid_cli(&self.path)
     }
 
@@ -739,18 +729,20 @@ impl Repo {
 
     pub fn set_upstream(&self, branch: &str, upstream: Option<&str>) -> Result<()> {
         match upstream {
-            Some(u) => super::cli::run(
-                &self.path,
-                ["branch", "--set-upstream-to", u, branch],
-            )
-            .with_context(|| format!("set upstream {u} on {branch}"))?,
+            Some(u) => super::cli::run(&self.path, ["branch", "--set-upstream-to", u, branch])
+                .with_context(|| format!("set upstream {u} on {branch}"))?,
             None => super::cli::run(&self.path, ["branch", "--unset-upstream", branch])
                 .with_context(|| format!("unset upstream on {branch}"))?,
         };
         Ok(())
     }
 
-    pub fn create_tag(&self, name: &str, at: gix::ObjectId, message: Option<&str>) -> Result<gix::ObjectId> {
+    pub fn create_tag(
+        &self,
+        name: &str,
+        at: gix::ObjectId,
+        message: Option<&str>,
+    ) -> Result<gix::ObjectId> {
         match message {
             Some(msg) if !msg.is_empty() => {
                 super::cli::GitCommand::new(&self.path)
@@ -815,10 +807,8 @@ pub fn auto_stash_path(
 
     // 3. Stash tracked-dirty files only (no untracked — fast on large repos).
     let msg = format!("mergefox: auto-stash before {reason}");
-    super::cli::run(repo_path, ["stash", "push", "-m", &msg])
-        .context("auto-stash")?;
-    let s = super::cli::run_line(repo_path, ["rev-parse", "stash@{0}"])
-        .unwrap_or_default();
+    super::cli::run(repo_path, ["stash", "push", "-m", &msg]).context("auto-stash")?;
+    let s = super::cli::run_line(repo_path, ["rev-parse", "stash@{0}"]).unwrap_or_default();
     let oid = gix::ObjectId::from_hex(s.trim().as_bytes())
         .unwrap_or_else(|_| gix::ObjectId::null(gix::hash::Kind::Sha1));
     Ok(AutoStashOutcome::Stashed { oid, bytes: size })
@@ -900,19 +890,17 @@ fn load_conflict_stage(repo_path: &Path, path: &Path, stage: u8) -> Option<Confl
     )
     .ok()
     .and_then(|o| {
-        o.stdout_str()
-            .lines()
-            .find_map(|line| {
-                let mut parts = line.split_whitespace();
-                let _mode = parts.next()?;
-                let sha = parts.next()?;
-                let st = parts.next()?;
-                if st == stage_str {
-                    gix::ObjectId::from_hex(sha.as_bytes()).ok()
-                } else {
-                    None
-                }
-            })
+        o.stdout_str().lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let _mode = parts.next()?;
+            let sha = parts.next()?;
+            let st = parts.next()?;
+            if st == stage_str {
+                gix::ObjectId::from_hex(sha.as_bytes()).ok()
+            } else {
+                None
+            }
+        })
     });
     Some(ConflictBlob { oid, size, text })
 }

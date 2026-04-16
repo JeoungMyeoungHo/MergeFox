@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use egui::{Color32, RichText, Rounding, ScrollArea, Stroke, TextEdit};
 
 use crate::app::{MergeFoxApp, RebaseAction, View};
-use crate::git::{RepoDiff, DeltaStatus};
+use crate::git::{DeltaStatus, RepoDiff};
 
 /// Which bottom-pane tab is active. Re-used across frames via
 /// `egui::Memory` so we don't need to plumb state through the modal.
@@ -125,9 +125,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             });
 
             ui.add_space(4.0);
-            ui.weak(
-                "Reorder commits with ↑/↓, pick an action per commit, then press Rebase.",
-            );
+            ui.weak("Reorder commits with ↑/↓, pick an action per commit, then press Rebase.");
 
             if let Some(err) = &modal.last_error {
                 ui.add_space(4.0);
@@ -227,20 +225,14 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     "Backup current state with tag",
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let rebase_btn = egui::Button::new(
-                        RichText::new("Rebase")
-                            .color(Color32::WHITE)
-                            .strong(),
-                    )
-                    .fill(palette::ACCENT)
-                    .min_size(egui::vec2(96.0, 26.0));
+                    let rebase_btn =
+                        egui::Button::new(RichText::new("Rebase").color(Color32::WHITE).strong())
+                            .fill(palette::ACCENT)
+                            .min_size(egui::vec2(96.0, 26.0));
                     if ui.add(rebase_btn).clicked() {
                         start = true;
                     }
-                    if ui
-                        .button(RichText::new("Cancel"))
-                        .clicked()
-                    {
+                    if ui.button(RichText::new("Cancel")).clicked() {
                         cancel = true;
                     }
                 });
@@ -324,18 +316,13 @@ fn render_plan_row(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Action dot (clickable selection)
-                let (dot_rect, dot_resp) = ui.allocate_exact_size(
-                    egui::vec2(14.0, 14.0),
-                    egui::Sense::click(),
-                );
+                let (dot_rect, dot_resp) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                 ui.painter().circle_filled(dot_rect.center(), 5.0, accent);
                 if dimmed {
                     // Hollow out for Drop so it reads as "removed"
-                    ui.painter().circle_stroke(
-                        dot_rect.center(),
-                        5.0,
-                        Stroke::new(1.5, accent),
-                    );
+                    ui.painter()
+                        .circle_stroke(dot_rect.center(), 5.0, Stroke::new(1.5, accent));
                 }
                 if dot_resp.clicked() {
                     *select_idx = Some(idx);
@@ -343,11 +330,7 @@ fn render_plan_row(
 
                 // Action label + inline dropdown (Pick / Reword / Squash / Drop).
                 egui::ComboBox::from_id_salt(("rebase_action", idx))
-                    .selected_text(
-                        RichText::new(item.action.label())
-                            .color(accent)
-                            .strong(),
-                    )
+                    .selected_text(RichText::new(item.action.label()).color(accent).strong())
                     .width(82.0)
                     .show_ui(ui, |ui| {
                         for action in [
@@ -394,13 +377,8 @@ fn render_plan_row(
                         squash_target.map(|i| i + 1).unwrap_or(0)
                     ));
                 } else if squashed {
-                    ui.label(
-                        RichText::new("↳")
-                            .color(palette::DROP)
-                            .monospace()
-                            .strong(),
-                    )
-                    .on_hover_text("Squash has no preceding commit to merge into!");
+                    ui.label(RichText::new("↳").color(palette::DROP).monospace().strong())
+                        .on_hover_text("Squash has no preceding commit to merge into!");
                 }
 
                 // Subject (selectable). We use selectable_label + ui.interact
@@ -421,28 +399,25 @@ fn render_plan_row(
                 }
 
                 // Right-aligned metadata: author · sha · date.
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let date = relative_time(item.timestamp);
-                        let sha = short_sha(&item.oid);
-                        let meta = format!("{}   {}   {}", item.author, sha, date);
-                        let mut rt = RichText::new(meta)
-                            .color(if dimmed {
-                                palette::MUTED
-                            } else if selected {
-                                Color32::from_rgba_unmultiplied(255, 255, 255, 210)
-                            } else {
-                                palette::MUTED
-                            })
-                            .monospace()
-                            .small();
-                        if dimmed {
-                            rt = rt.strikethrough();
-                        }
-                        ui.add(egui::Label::new(rt).truncate());
-                    },
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let date = relative_time(item.timestamp);
+                    let sha = short_sha(&item.oid);
+                    let meta = format!("{}   {}   {}", item.author, sha, date);
+                    let mut rt = RichText::new(meta)
+                        .color(if dimmed {
+                            palette::MUTED
+                        } else if selected {
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 210)
+                        } else {
+                            palette::MUTED
+                        })
+                        .monospace()
+                        .small();
+                    if dimmed {
+                        rt = rt.strikethrough();
+                    }
+                    ui.add(egui::Label::new(rt).truncate());
+                });
                 // Keep strike stroke variable used (silence lints when
                 // the theme doesn't surface it visually).
                 let _ = strike;
@@ -530,22 +505,17 @@ fn render_commit_detail(ui: &mut egui::Ui, item: &mut crate::app::RebasePlanItem
 /// "Changes" tab — shows a compact file list for the selected commit's
 /// diff. Diff computation runs synchronously inside the modal (it's only
 /// for the one selected commit, and this modal is already blocking).
-fn render_changes_detail(
-    ui: &mut egui::Ui,
-    repo_path: &std::path::Path,
-    oid: gix::ObjectId,
-) {
+fn render_changes_detail(ui: &mut egui::Ui, repo_path: &std::path::Path, oid: gix::ObjectId) {
     // Cache the diff by oid in memory so re-selecting the same row
     // doesn't re-invoke git.
     let cache_id = egui::Id::new(("rebase_changes_diff", oid));
-    let cached: Option<RepoDiff> = ui
-        .ctx()
-        .data(|d| d.get_temp::<RepoDiff>(cache_id));
+    let cached: Option<RepoDiff> = ui.ctx().data(|d| d.get_temp::<RepoDiff>(cache_id));
     let diff: Result<RepoDiff, String> = match cached {
         Some(d) => Ok(d),
         None => match crate::git::diff_for_commit(repo_path, oid) {
             Ok(d) => {
-                ui.ctx().data_mut(|mem| mem.insert_temp(cache_id, d.clone()));
+                ui.ctx()
+                    .data_mut(|mem| mem.insert_temp(cache_id, d.clone()));
                 Ok(d)
             }
             Err(e) => Err(format!("{e:#}")),

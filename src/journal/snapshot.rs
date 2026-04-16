@@ -70,7 +70,21 @@ pub fn restore_refs(repo_path: &Path, target: &RepoSnapshot) -> Result<()> {
     }
 
     // 2. Delete refs present now but absent from the snapshot.
+    //
+    // SAFETY: never delete the ref that HEAD currently points at.
+    // Undoing past the initial commit produces a "before" snapshot
+    // with an empty refs map. Without this guard, restore would
+    // `update-ref -d refs/heads/main` and leave the repo in a
+    // broken detached-HEAD-with-no-commit state that confuses every
+    // tool (including ourselves). The user's branch ref is sacred;
+    // if undo wants to rewind further, it should reset the branch
+    // tip rather than delete the branch.
     let gix_repo = gix::discover(repo_path).context("open gix for restore")?;
+    let head_ref_name = gix_repo
+        .head_name()
+        .ok()
+        .flatten()
+        .map(|n| n.as_bstr().to_string());
     let mut current: Vec<String> = Vec::new();
     if let Ok(platform) = gix_repo.references() {
         if let Ok(iter) = platform.all() {
@@ -84,6 +98,11 @@ pub fn restore_refs(repo_path: &Path, target: &RepoSnapshot) -> Result<()> {
     }
     for name in current {
         if !target.refs.contains_key(&name) {
+            // Never delete the branch HEAD is on — that would orphan
+            // the working tree.
+            if Some(&name) == head_ref_name.as_ref() {
+                continue;
+            }
             crate::git::cli::run(repo_path, ["update-ref", "-d", &name]).ok();
         }
     }
