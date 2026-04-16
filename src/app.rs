@@ -105,6 +105,9 @@ pub struct CommitModal {
     /// path's display string so we don't have to re-key whenever the
     /// entries list rebuilds. Selection survives across `status` polls.
     pub selection: std::collections::BTreeSet<std::path::PathBuf>,
+    /// Last clicked path used as the range-selection anchor for
+    /// Shift-click in the commit dialog.
+    pub selection_anchor: Option<std::path::PathBuf>,
 }
 
 pub struct SettingsModal {
@@ -350,11 +353,22 @@ pub struct WorkspaceState {
     /// gix / git calls (`repo.statuses` walks the entire working tree
     /// including untracked, `list_branches` scans every ref, etc.).
     /// At 60 fps on a moderately large repo this was 50–150 ms of
-    /// gix / git work per frame, which made commit-click feel sticky
+    /// gix / git work per frame, which made commit clicks feel sticky
     /// because the click frame couldn't finish before the worker's
     /// "Computing diff…" panel appeared. We now refresh this cache
     /// only on repo mutation (ops, rebuild_graph, tab open).
     pub repo_ui_cache: Option<RepoUiCache>,
+    /// Whether the working tree changes section is expanded in the main panel.
+    /// When expanded, file list is shown inline above the graph.
+    pub working_tree_expanded: bool,
+    /// Selected working tree file for inline diff preview.
+    /// Stored as path string to persist across frames.
+    pub selected_working_file: Option<std::path::PathBuf>,
+    /// Diff of the selected working tree file (staged or unstaged).
+    pub working_file_diff: Option<String>,
+    /// Whether the Working Tree virtual node is selected (like a commit selection).
+    /// When true, the diff panel shows working tree changes instead of a commit.
+    pub selected_working_tree: bool,
 }
 
 /// Per-tab cached view of repo state. Populated by
@@ -930,6 +944,10 @@ impl MergeFoxApp {
             diff_cache: DiffCache::default(),
             graph_task: None,
             repo_ui_cache: None,
+            working_tree_expanded: false,
+            selected_working_file: None,
+            working_file_diff: None,
+            selected_working_tree: false,
         };
 
         // If we came from an existing workspace, append the new tab
@@ -3315,6 +3333,29 @@ impl eframe::App for MergeFoxApp {
             eprintln!("[frame end] cost={:?}", frame_t0.elapsed());
         }
     }
+
+    // Note: on_event is not a member of eframe::App trait in current version.
+    // File drop handling should be implemented via raw_window_event instead.
+    // fn on_event(&mut self, _ctx: &egui::Context, event: &egui::Event) -> bool {
+    //     match event {
+    //         egui::Event::DroppedFile(egui::DroppedFile { path: Some(path), .. }) => {
+    //             // 폴더 드롭 - Git 저장소 열기
+    //             if path.is_dir() {
+    //                 self.open_repo(path);
+    //                 return true;
+    //             }
+    //             // 파일 드롭 - .git 폴더 또는 일반 파일이 포함된 폴더에서 저장소 검색
+    //             if let Some(parent) = path.parent() {
+    //                 if parent.join(".git").exists() || parent.join("HEAD").exists() {
+    //                     self.open_repo(parent);
+    //                     return true;
+    //                 }
+    //             }
+    //         }
+    //         _ => {}
+    //     }
+    //     false
+    // }
 }
 
 fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
