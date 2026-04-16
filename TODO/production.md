@@ -4,6 +4,14 @@
 **프로덕션 인프라 · UX · 제어성 · 자율성** 중심. 두 문서는 상호보완이며
 이 파일의 항목은 `features.md`의 기능 작업과 병렬 진행 가능한 횡단 과제.
 
+## 최근 진행 (2026-04-17 세션)
+
+**완료**: A1 · A6 · B2 · B3 · F4 · E5 · E8
+**부분**: A2(문서+훅만, 인증서 미보유) · E3(dispatcher만, UI 미배선) ·
+E6(rename 추가, 나머지는 이전부터 존재) · E12(timeout env + lock 감지)
+**부수**: `src/git/graph.rs`의 ref 라벨링 버그 수정 (`refs/stash` 등이
+"Delete" 메뉴에 노출되던 문제)
+
 ## 범례
 
 **우선순위**
@@ -19,17 +27,20 @@
 
 ## A. 배포 / 인프라
 
-### A1. CI/CD 파이프라인  ⛔  **P0**
-- GitHub Actions: `cargo build --release` + `test` + `clippy -D warnings` + `fmt --check`
-- 3-매트릭스(macOS-arm64/x86_64, Windows, Linux-x86_64/arm64)
-- 태그 푸시 시 릴리스 아티팩트 자동 빌드 (dmg/msi/AppImage/deb)
-- `cargo-deny` + `cargo-audit` 단계 포함
-- PR에 clippy diff 코멘트
+### A1. CI/CD 파이프라인  🟢  **P0**
+- ✅ `.github/workflows/ci.yml` — fmt(advisory) + clippy(advisory) + build + test + deny + audit(weekly)
+- ✅ 3-OS 매트릭스 (ubuntu-latest, macos-latest, windows-latest)
+- ✅ `.github/workflows/release.yml` — tag push 시 빌드 + 서명 훅 + draft release
+- ⚠️ 알파 단계는 advisory 모드 (fmt/clippy 엄격 모드는 §6.2 dead-code 해소 후)
+- ⚠️ PR clippy diff 코멘트는 미구현 (선택적)
+- ⚠️ macOS arm64+x86_64 빌드는 release 워크플로우에만 있고 ci에는 macos-latest만
 
-### A2. 코드 서명 / 공증  ⛔  **P0**
-- macOS: Developer ID Application + `notarytool` 파이프라인
-- Windows: OV 또는 EV 코드 서명 인증서 (EV는 SmartScreen 즉시 통과)
-- Linux: AppImage에 GPG 서명 + `.sig` 아티팩트 공개
+### A2. 코드 서명 / 공증  🟡  **P0**
+- ✅ `RELEASE.md` — 서명/공증 절차 문서 + 시크릿 목록
+- ✅ release 워크플로우에 조건부 서명/공증 훅 (secrets 존재 시에만 실행)
+- ⛔ macOS: Developer ID 인증서 조달 필요 ($99/년)
+- ⛔ Windows: OV/EV 인증서 조달 필요
+- ⛔ Linux: AppImage GPG 서명은 워크플로우에 미포함 (베타 이후)
 
 ### A3. 자동 업데이트  ⛔  **P1**
 - 최소: "새 버전 있음" 알림 + 다운로드 페이지 링크
@@ -46,9 +57,10 @@
 - Homebrew cask, winget, Flathub (베타 이후)
 - `Dockerfile.build`는 재현 빌드용으로 유지
 
-### A6. `Cargo.toml` 메타데이터 정리  🟡  **P0**
-- `repository = "https://github.com/yourname/mergefox"` **플레이스홀더**
-- `homepage`, `documentation`, `keywords`, `categories` 추가
+### A6. `Cargo.toml` 메타데이터 정리  🟢  **P0**
+- ✅ `repository`, `homepage`, `documentation` 실제 URL
+- ✅ `keywords`, `categories`, `rust-version = "1.76"`
+- ✅ `exclude = [...]` — TODO/, .github/, screenshots 등 배포 제외
 
 ---
 
@@ -60,15 +72,17 @@
 - fixture 레포 기반 통합 테스트 디렉토리 신설
 - UI 스냅샷 테스트 (egui `ImageBuilder` 또는 insta)
 
-### B2. `tracing` 기반 로깅  ⛔  **P0**
-- `println!` / `eprintln!` 10건 제거
-- `~/Library/Logs/mergefox/` (OS별 경로) + 파일 로테이션
-- `MERGEFOX_LOG` 레벨 제어
-- release에서 `RUST_BACKTRACE=full` 강제
+### B2. `tracing` 기반 로깅  🟢  **P0**
+- ✅ `src/logging.rs` — tracing-subscriber + env-filter + rolling daily file
+- ✅ OS별 로그 경로 (macOS `~/Library/Logs/mergefox/`, Linux XDG_STATE, Windows LOCALAPPDATA)
+- ✅ `MERGEFOX_LOG` env-filter, `MERGEFOX_LOG_FORMAT=json`, `MERGEFOX_LOG_STDERR=0`
+- ✅ 10건 전부 `tracing::warn!`/`debug!`/`trace!`로 마이그레이션
+- ⛔ release에서 `RUST_BACKTRACE=full` 강제는 미설정
 
-### B3. 의존성 공급망  ⛔  **P0**
-- `cargo-deny.toml` 작성: 라이선스 허용 목록 + advisory
-- `LICENSES-THIRD-PARTY.md` 자동 생성 (cargo-about)
+### B3. 의존성 공급망  🟡  **P0**
+- ✅ `deny.toml` — advisories / licenses / bans / sources
+- ✅ CI에 `cargo-deny-action` + 주간 `cargo-audit`
+- ⛔ `LICENSES-THIRD-PARTY.md` 자동 생성 (cargo-about) 미착수
 
 ### B4. 보안 강화  🟡  **P1**
 - Windows에서 `secrets.json` ACL 미적용 추정 — 검증 + 필요 시 DPAPI
@@ -220,26 +234,35 @@
 - `good` / `bad` 마크, 자동 이진 탐색 진행
 - Tower/JetBrains 수준
 
-### E3. Cherry-pick 범위 / 다중 선택  ⛔  **P1**
-- `CommitAction::CherryPick(Oid)` → `CherryPick(Vec<Oid>)` or range
+### E3. Cherry-pick 범위 / 다중 선택  🟡  **P1**
+- ✅ `CommitAction::CherryPick(Vec<Oid>)` enum 리팩터
+- ✅ Dispatcher 순차 실행 + 부분성공 리포트 ("Picked 2/5 — resolve conflicts…")
+- ✅ Journal 엔트리는 실제 적용된 커밋만 기록
+- ⛔ Multi-select UI(Shift-click / range 선택) 미배선 — 콜사이트는 현재 단일원소 vec
 
 ### E4. Submodule 관리  ⛔  **P2**
 - `update --init`, `foreach`, status 뷰
 - 사이드바 섹션
 
-### E5. Worktree list/remove/lock  ⛔  **P1**
-- `features.md` 2.3은 `add` 중심 — list/remove까지
+### E5. Worktree list/remove/lock  🟢  **P1**
+- ✅ `Repo::list_worktrees` / `remove_worktree` / `lock_worktree` / `unlock_worktree`
+- ✅ `WorktreeInfo` + `--porcelain` 파서 (유닛테스트 2건)
+- ✅ Settings → Repository 섹션에 리스트 + 메인/잠금/정리대상 뱃지 + remove/force remove 버튼
+- ⛔ `add`(features.md 2.3)는 별도 작업 — worktree 생성 UI는 아직
 
-### E6. Remote CRUD  ⛔  **P1**
-- add/rename/remove/set-url 전부
-- Settings → Repository에서
+### E6. Remote CRUD  🟡  **P1**
+- ✅ add / remove / set-url — 이전 세션에 존재
+- ✅ `Repo::rename_remote` + Settings UI "Rename to" 인라인 행 (기본 원격 자동 마이그레이션)
+- ⛔ 원격별 `prune` 토글, `fetch --tags` 정책 등 세부 옵션 미추가
 
 ### E7. Blame 뷰어  ❓  **P1**
 - diff_view 통합 여부 확인 필요
 - 커밋 호핑 + 파일별 timeline
 
-### E8. Reflog HUD 접근성  🟡  **P2**
-- `reflog.rs` 있음 — reset 안전망이라 상시 접근 가능한 진입점
+### E8. Reflog HUD 접근성  🟢  **P2**
+- ✅ ⌘/Ctrl+Shift+R 글로벌 숏컷 — 워크스페이스 뷰 안에서만 활성
+- ✅ 탑바 ↺ 버튼 툴팁에 숏컷 표기
+- ⛔ HUD(하단 스트립)에는 상시 표시 안 함 — 숏컷 + 탑바로 충분 판단
 
 ### E9. Maintenance 메뉴  ⛔  **P2**
 - `fsck`, `gc`, `repack`
@@ -252,12 +275,13 @@
 - code review 워크플로
 
 ### E12. Job 시스템 확장  🟡  **P1**
-- `GitJobKind::Custom { label, command }` 추가
-- 동시성 충돌 감지 (push+pull 동시)
-- 재시도 정책 (exponential backoff)
-- `.git/index.lock` 감지 + 복구 UI
-- locale 강제 (`LC_ALL=C`)
-- 타임아웃 300초 고정 → 설정 가능 + activity 기반 연장
+- ✅ 타임아웃 설정화 (`MERGEFOX_GIT_TIMEOUT_SECS`, 기본 300s)
+- ✅ `.git/index.lock`·`HEAD.lock` 사전 감지 (신선/stale 구분 메시지, push·pull에 장착)
+- ✅ Locale 강제 (`LC_ALL=C.UTF-8`) — `GitCommand::run_raw_controlled`에 이미 있었음 (이전 세션)
+- ⛔ `GitJobKind::Custom { label, command }` 추가
+- ⛔ 동시성 충돌 감지 (push+pull 동시)
+- ⛔ 재시도 정책 (exponential backoff)
+- ⛔ Activity 기반 타임아웃 연장
 
 ---
 
@@ -278,12 +302,14 @@
 - 파일 스테이지/언스테이지 drag
 - stash → 브랜치: apply
 
-### F4. Pre-flight info 주입  ⛔  **P0**
-- Drop commit: "N개 descendant 리베이스, 충돌 확률, 파일 K개"
-- Hard reset: "파일 N개 소실, 백업 ref X"
-- Delete branch: unmerged 커밋 N개 경고
-- Force push: 덮어쓰는 커밋 수/범위
-- dispatcher에 `describe_effect() -> Effect` 추가
+### F4. Pre-flight info 주입  🟢  **P0**
+- ✅ `src/preflight.rs` — `PreflightInfo`, `Severity` (Info/Warning/Critical)
+- ✅ `hard_reset`: 드롭 커밋 수 + 더티 워킹트리 감지 + reflog 참고 라인
+- ✅ `delete_branch`: `--not` 기반 unreachable 커밋 수 (remote/local 분기)
+- ✅ `force_push`: 덮어쓰는 원격 커밋 수 + force-with-lease 권유 + 로컬 ahead 수
+- ✅ `drop_commit`: 재생 대상 descendant 수 + 백업 ref 안내
+- ✅ 모달에 Severity별 색상 글리프(⛔/⚠/ℹ) 렌더링
+- ⛔ Rebase / Revert / Amend(pushed) pre-flight은 아직 미장착
 
 ### F5. Dry-run / Preview  ⛔  **P1**
 - Push/Pull/Rebase/Reset 실행 전 결과 프리뷰
@@ -409,28 +435,29 @@
 
 ## 추천 진행 순서
 
-**Sprint 1 (P0 집중 · 릴리스 위생)**
-1. CI/CD 최소 파이프라인 (A1)
-2. `tracing` 도입 + 로그 파일 (B2)
-3. `Cargo.toml` 메타데이터 (A6)
-4. `cargo-deny` / `audit` (B3)
-5. Pre-flight info 주입 (F4)
-6. `reqwest` timeout + Windows ACL (B4)
+**Sprint 1 (P0 집중 · 릴리스 위생)** — 🟢 대부분 완료 (2026-04-17)
+1. ✅ CI/CD 최소 파이프라인 (A1)
+2. ✅ `tracing` 도입 + 로그 파일 (B2)
+3. ✅ `Cargo.toml` 메타데이터 (A6)
+4. ✅ `cargo-deny` / `audit` (B3)
+5. ✅ Pre-flight info 주입 (F4)
+6. ⛔ `reqwest` timeout + Windows ACL (B4) — 미착수
 
 **Sprint 2 (UX 기초 · 알파→베타)**
 7. 커맨드 팔레트 ⌘K (C1)
 8. 토스트 통합 + 빈 상태 카피 (C2, C3)
 9. About / Diagnostics 섹션 (D7)
 10. 자동 fetch + ahead/behind (G1)
-11. Amend/force-push 안전장치 (G4)
+11. Amend/force-push 안전장치 (G4) — **F4 pre-flight으로 부분 커버됨**
 12. CONTRIBUTING / SECURITY / ARCHITECTURE (I1/I2/I4)
 
-**Sprint 3 (제어성 확장)**
+**Sprint 3 (제어성 확장)** — 🟡 일부 완료
 13. Action framework 리팩터 + multi-select (F1, F2)
 14. Interactive rebase 확장 (E1)
-15. Cherry-pick 범위 (E3)
-16. Remote CRUD / Worktree list (E5, E6)
-17. Job 시스템 견고화 (E12)
+15. ✅ Cherry-pick 다중 (E3 부분) — UI 미배선
+16. ✅ Worktree list/remove (E5) · 🟡 Remote CRUD rename (E6)
+17. 🟡 Job 시스템 견고화 (E12) — timeout+lock 완료, 재시도/동시성 미착수
+18. ✅ E8 Reflog 숏컷 (⌘⇧R)
 
 **Sprint 4 (자율성 · MCP)**
 18. Dry-run API + 위험도 분류 (H1, H2)
