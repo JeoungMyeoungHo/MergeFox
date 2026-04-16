@@ -93,6 +93,13 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let valid_paths: std::collections::BTreeSet<PathBuf> =
         entries.iter().map(|e| e.path.clone()).collect();
     commit_modal.selection.retain(|p| valid_paths.contains(p));
+    if commit_modal
+        .selection_anchor
+        .as_ref()
+        .is_some_and(|p| !valid_paths.contains(p))
+    {
+        commit_modal.selection_anchor = None;
+    }
 
     egui::Window::new("Commit")
         .open(&mut open)
@@ -281,6 +288,15 @@ enum MoveIntent {
     /// Single-row toggle via arrow icon.
     StageOne(PathBuf),
     UnstageOne(PathBuf),
+    /// Discard the given unstaged paths. Tracked files restore from index;
+    /// untracked files are removed from disk.
+    Discard(Vec<DiscardPath>),
+}
+
+#[derive(Clone)]
+struct DiscardPath {
+    path: PathBuf,
+    untracked: bool,
 }
 
 /// Render the Unstaged or Staged panel with its own header (count + action
@@ -317,6 +333,12 @@ fn render_panel(
         .map(|e| e.path.clone())
         .collect();
     let selected_in_panel_count = selected_in_panel.len();
+    let discardable_in_panel: Vec<DiscardPath> = belongs.iter().map(|e| discard_path(e)).collect();
+    let selected_discardable: Vec<DiscardPath> = belongs
+        .iter()
+        .filter(|e| modal.selection.contains(&e.path))
+        .map(|e| discard_path(e))
+        .collect();
 
     // Header row: title + counts + bulk action buttons.
     ui.horizontal(|ui| {
@@ -357,6 +379,33 @@ fn render_panel(
                             .clicked()
                         {
                             *move_intent = Some(MoveIntent::Stage(selected_in_panel.clone()));
+                        }
+                    });
+                    ui.add_enabled_ui(!discardable_in_panel.is_empty(), |ui| {
+                        if ui
+                            .button(
+                                RichText::new("Discard all")
+                                    .color(Color32::from_rgb(232, 120, 120)),
+                            )
+                            .on_hover_text(
+                                "Discard every unstaged change. Tracked files restore from the index; untracked files are removed.",
+                            )
+                            .clicked()
+                        {
+                            *move_intent = Some(MoveIntent::Discard(discardable_in_panel.clone()));
+                        }
+                    });
+                    ui.add_enabled_ui(!selected_discardable.is_empty(), |ui| {
+                        let label = format!("Discard selected ({})", selected_discardable.len());
+                        if ui
+                            .button(
+                                RichText::new(label)
+                                    .color(Color32::from_rgb(232, 120, 120)),
+                            )
+                            .on_hover_text("Discard only the checked unstaged files")
+                            .clicked()
+                        {
+                            *move_intent = Some(MoveIntent::Discard(selected_discardable.clone()));
                         }
                     });
                 }
@@ -424,7 +473,7 @@ fn render_panel(
                 return;
             }
             for entry in &belongs {
-                render_row(ui, kind, entry, modal, move_intent);
+                render_row(ui, kind, &belongs, entry, modal, move_intent);
             }
         });
 }
@@ -433,6 +482,7 @@ fn render_panel(
 fn render_row(
     ui: &mut egui::Ui,
     kind: PanelKind,
+    panel_entries: &[&StatusEntry],
     entry: &StatusEntry,
     modal: &mut CommitModal,
     move_intent: &mut Option<MoveIntent>,
@@ -440,11 +490,7 @@ fn render_row(
     ui.horizontal(|ui| {
         let mut checked = modal.selection.contains(&entry.path);
         if ui.checkbox(&mut checked, "").changed() {
-            if checked {
-                modal.selection.insert(entry.path.clone());
-            } else {
-                modal.selection.remove(&entry.path);
-            }
+            apply_selection_click(ui, panel_entries, entry, modal);
         }
 
         let (color, glyph) = style_for(&entry.kind, entry.staged, entry.unstaged);
@@ -457,11 +503,7 @@ fn render_row(
             .add(egui::Label::new(path_text).sense(egui::Sense::click()))
             .clicked()
         {
-            if checked {
-                modal.selection.remove(&entry.path);
-            } else {
-                modal.selection.insert(entry.path.clone());
-            }
+            apply_selection_click(ui, panel_entries, entry, modal);
         }
 
         // Per-row move arrow on the right edge.
@@ -497,6 +539,67 @@ fn render_row(
     });
 }
 
+fn apply_selection_click(
+    ui: &egui::Ui,
+    panel_entries: &[&StatusEntry],
+    clicked: &StatusEntry,
+    modal: &mut CommitModal,
+) {
+    let modifiers = ui.input(|i| i.modifiers);
+    if modifiers.shift {
+        let mode = if modifiers.alt {
+            RangeSelectionMode::Deselect
+        } else {
+            RangeSelectionMode::Select
+        };
+        apply_range_selection(panel_entries, &clicked.path, modal, mode);
+    } else if modal.selection.contains(&clicked.path) {
+        modal.selection.remove(&clicked.path);
+    } else {
+        modal.selection.insert(clicked.path.clone());
+    }
+    modal.selection_anchor = Some(clicked.path.clone());
+}
+
+#[derive(Clone, Copy)]
+enum RangeSelectionMode {
+    Select,
+    Deselect,
+}
+
+fn apply_range_selection(
+    panel_entries: &[&StatusEntry],
+    clicked_path: &std::path::Path,
+    modal: &mut CommitModal,
+    mode: RangeSelectionMode,
+) {
+    let Some(clicked_idx) = panel_entries.iter().position(|e| e.path == clicked_path) else {
+        return;
+    };
+    let anchor_idx = modal
+        .selection_anchor
+        .as_ref()
+        .and_then(|anchor| panel_entries.iter().position(|e| &e.path == anchor))
+        .unwrap_or(clicked_idx);
+
+    let (start, end) = if anchor_idx <= clicked_idx {
+        (anchor_idx, clicked_idx)
+    } else {
+        (clicked_idx, anchor_idx)
+    };
+
+    for entry in &panel_entries[start..=end] {
+        match mode {
+            RangeSelectionMode::Select => {
+                modal.selection.insert(entry.path.clone());
+            }
+            RangeSelectionMode::Deselect => {
+                modal.selection.remove(&entry.path);
+            }
+        }
+    }
+}
+
 /// Execute a stage/unstage intent against the working copy. Errors surface
 /// on the commit modal so the user can retry.
 fn apply_move_intent(app: &mut MergeFoxApp, intent: MoveIntent) {
@@ -525,6 +628,19 @@ fn apply_move_intent(app: &mut MergeFoxApp, intent: MoveIntent) {
             let refs: Vec<&std::path::Path> = vec![p.as_path()];
             crate::git::ops::unstage_paths(&path, &refs)
         }
+        MoveIntent::Discard(paths) => {
+            let tracked: Vec<&std::path::Path> = paths
+                .iter()
+                .filter(|p| !p.untracked)
+                .map(|p| p.path.as_path())
+                .collect();
+            let untracked: Vec<&std::path::Path> = paths
+                .iter()
+                .filter(|p| p.untracked)
+                .map(|p| p.path.as_path())
+                .collect();
+            crate::git::ops::discard_paths(&path, &tracked, &untracked)
+        }
     };
     if let Err(e) = result {
         if let Some(m) = app.commit_modal.as_mut() {
@@ -536,6 +652,13 @@ fn apply_move_intent(app: &mut MergeFoxApp, intent: MoveIntent) {
     // Refresh the repo UI cache so the sidebar/main panel pick up the
     // new status on the next frame.
     app.refresh_repo_ui_cache();
+}
+
+fn discard_path(entry: &StatusEntry) -> DiscardPath {
+    DiscardPath {
+        path: entry.path.clone(),
+        untracked: matches!(entry.kind, EntryKind::Untracked),
+    }
 }
 
 // -------------------------- AI plumbing (unchanged) -------------------------
@@ -733,6 +856,7 @@ fn handle_commit_intent(app: &mut MergeFoxApp, intent: CommitIntent) {
             cm.last_error = None;
             cm.ai_error = None;
             cm.selection.clear();
+            cm.selection_anchor = None;
         }
     }
     if let Some(e) = err {
