@@ -234,10 +234,7 @@ fn branch_row(
                 ui.close_menu();
             }
             if ui
-                .add_enabled(
-                    branch.upstream.is_some(),
-                    egui::Button::new("Pull"),
-                )
+                .add_enabled(branch.upstream.is_some(), egui::Button::new("Pull"))
                 .on_hover_text("Fetch and integrate the tracked remote branch")
                 .clicked()
             {
@@ -278,8 +275,10 @@ fn stash_row(ui: &mut egui::Ui, stash: &StashEntry, action: &mut Option<CommitAc
     let short = short_sha(&stash.oid);
     let label = format!("stash@{{{}}}  {}", stash.index, shorten(&stash.message, 44));
     let resp = ui.selectable_label(false, label);
-    resp.clone()
-        .on_hover_text(format!("{short}\n{}\n\nDouble-click to pop. Right-click for more.", stash.message));
+    resp.clone().on_hover_text(format!(
+        "{short}\n{}\n\nDouble-click to pop. Right-click for more.",
+        stash.message
+    ));
 
     // Double-click = pop (apply + drop). Fastest path for "I want this back".
     if resp.double_clicked() {

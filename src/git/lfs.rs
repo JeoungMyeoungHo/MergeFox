@@ -50,8 +50,8 @@ pub fn scan(repo_path: &Path, min_size: u64) -> Result<LfsScanResult> {
 
     // `-l` adds the size column; `-r` recurses into trees.
     // Output per line: `<mode> <type> <sha> <size>\t<path>`
-    let out = super::cli::run(repo_path, ["ls-tree", "-r", "-l", "HEAD"])
-        .context("git ls-tree HEAD")?;
+    let out =
+        super::cli::run(repo_path, ["ls-tree", "-r", "-l", "HEAD"]).context("git ls-tree HEAD")?;
 
     // Open gix for LFS-pointer content inspection.
     let gix_repo = gix::discover(repo_path).ok();

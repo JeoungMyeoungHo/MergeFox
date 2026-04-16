@@ -265,9 +265,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             let g = &gv.graph;
             if g.truncated {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("⚠").color(egui::Color32::from_rgb(220, 170, 60)),
-                    );
+                    ui.label(egui::RichText::new("⚠").color(egui::Color32::from_rgb(220, 170, 60)));
                     ui.weak(format!(
                         "Showing {} most-recent commits. This repo's history is larger; \
                          older commits aren't in the graph yet.",
@@ -277,9 +275,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             }
             if g.max_lane > crate::git::graph::MAX_GRAPH_LANES {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("⚠").color(egui::Color32::from_rgb(220, 170, 60)),
-                    );
+                    ui.label(egui::RichText::new("⚠").color(egui::Color32::from_rgb(220, 170, 60)));
                     ui.weak(format!(
                         "{} concurrent branch lanes folded into {} visible columns \
                          (overflow rendered in the rightmost lane).",
@@ -424,8 +420,7 @@ pub(crate) fn spawn_diff_worker(
     let repo_path = ws.repo.path().to_path_buf();
     let ctx_clone = ctx.clone();
     std::thread::spawn(move || {
-        let result = crate::git::diff_for_commit(&repo_path, oid)
-            .map_err(|e| format!("{e:#}"));
+        let result = crate::git::diff_for_commit(&repo_path, oid).map_err(|e| format!("{e:#}"));
         let _ = tx.send(result);
         ctx_clone.request_repaint();
     });
@@ -774,11 +769,7 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
             match crate::git::ops::stash_pop(ws.repo.path(), index) {
                 Ok(()) => {
                     if let (Some(b), Ok(a)) = (before, journal::capture(ws.repo.path())) {
-                        out.journal_entry = Some((
-                            Operation::StashPop { stash_oid },
-                            b,
-                            a,
-                        ));
+                        out.journal_entry = Some((Operation::StashPop { stash_oid }, b, a));
                     }
                     out.hud = Some(format!("Popped stash@{{{index}}}"));
                     out.rebuild = Some(scope);
@@ -929,9 +920,7 @@ fn run_prompt(app: &mut MergeFoxApp, prompt: PendingPrompt) -> DispatchOutcome {
                     Some(push_url.as_str())
                 };
                 if name.is_empty() || fetch_url.is_empty() {
-                    out.error = Some(
-                        "Remote name and fetch URL are required".to_string(),
-                    );
+                    out.error = Some("Remote name and fetch URL are required".to_string());
                     return out;
                 }
                 if let Err(e) = ws.repo.add_remote(&name, &fetch_url, push_opt) {
@@ -944,13 +933,11 @@ fn run_prompt(app: &mut MergeFoxApp, prompt: PendingPrompt) -> DispatchOutcome {
             };
 
             // With the remote settled, wire the upstream.
-            let ref_path = effective_remote
-                .as_ref()
-                .map(|r| {
-                    let rb = remote_branch.trim();
-                    let rb = if rb.is_empty() { branch.as_str() } else { rb };
-                    format!("{r}/{rb}")
-                });
+            let ref_path = effective_remote.as_ref().map(|r| {
+                let rb = remote_branch.trim();
+                let rb = if rb.is_empty() { branch.as_str() } else { rb };
+                format!("{r}/{rb}")
+            });
             let value = ref_path.as_deref();
             match ws.repo.set_upstream(&branch, value) {
                 Ok(()) => {
@@ -1001,11 +988,7 @@ fn run_prompt(app: &mut MergeFoxApp, prompt: PendingPrompt) -> DispatchOutcome {
             let before = journal::capture(ws.repo.path()).ok();
             let result = match &stash_msg {
                 Some(m) => crate::git::ops::stash_push(ws.repo.path(), m).map(Some),
-                None => crate::git::cli::run(
-                    ws.repo.path(),
-                    ["stash", "push", "-u"],
-                )
-                .map(|_| None),
+                None => crate::git::cli::run(ws.repo.path(), ["stash", "push", "-u"]).map(|_| None),
             };
             match result {
                 Ok(_) => {

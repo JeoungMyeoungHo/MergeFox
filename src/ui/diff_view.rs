@@ -124,33 +124,39 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 render_commit_summary(ui, &diff);
                 ui.separator();
 
-                ui.label(RichText::new("Files").strong());
-                // Virtualize the file list. On Linux-kernel merge
-                // commits `diff.files` regularly exceeds 5 000 entries
-                // — without `show_rows` every selectable_label was laid
-                // out every frame, which burned ~hundreds of ms per
-                // paint and made the "click a commit" transition feel
-                // sticky even though the diff worker itself was async.
-                let total_files = diff.files.len();
-                ScrollArea::vertical()
-                    .id_salt("diff_files")
-                    .auto_shrink([false, false])
-                    .show_rows(ui, FILE_ROW_HEIGHT, total_files, |ui, range| {
-                        for i in range {
-                            let file = &diff.files[i];
-                            let selected = ws.selected_file_idx == Some(i);
-                            let label = file_row_label(file);
-                            let resp = ui.add_sized(
-                                [ui.available_width(), FILE_ROW_HEIGHT],
-                                egui::SelectableLabel::new(selected, label),
-                            );
-                            if resp.clicked() {
-                                ws.selected_file_idx = if selected { None } else { Some(i) };
-                                ws.selected_file_view = SelectedFileView::Diff;
-                                ws.set_image_cache(None);
-                            }
+                // File list header: count + flat/tree toggle.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Files ({})", diff.files.len())).strong());
+                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn_size = egui::vec2(26.0, 22.0);
+                        if ui
+                            .add_sized(
+                                btn_size,
+                                egui::SelectableLabel::new(ws.file_list_tree, "🌲"),
+                            )
+                            .on_hover_text("Tree view — group files by directory")
+                            .clicked()
+                        {
+                            ws.file_list_tree = true;
+                        }
+                        if ui
+                            .add_sized(
+                                btn_size,
+                                egui::SelectableLabel::new(!ws.file_list_tree, "≡"),
+                            )
+                            .on_hover_text("Flat list — files sorted by path")
+                            .clicked()
+                        {
+                            ws.file_list_tree = false;
                         }
                     });
+                });
+
+                if ws.file_list_tree {
+                    render_file_tree(ui, ws, &diff);
+                } else {
+                    render_file_flat(ui, ws, &diff);
+                }
             });
         });
 
@@ -261,6 +267,190 @@ fn render_commit_summary(ui: &mut egui::Ui, diff: &RepoDiff) {
     }
 }
 
+/// Flat file list — virtualized, left-aligned glyph + path, right-aligned stats.
+/// Full-width click target so selection highlight spans the whole row.
+fn render_file_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff) {
+    let total_files = diff.files.len();
+    ScrollArea::vertical()
+        .id_salt("diff_files_flat")
+        .auto_shrink([false, false])
+        .show_rows(ui, FILE_ROW_HEIGHT, total_files, |ui, range| {
+            let row_width = ui.available_width();
+            for i in range {
+                let file = &diff.files[i];
+                let selected = ws.selected_file_idx == Some(i);
+                let color = status_color(file.status);
+                // Allocate a full-width row for consistent click target + highlight.
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(row_width, FILE_ROW_HEIGHT),
+                    egui::Sense::click(),
+                );
+                // Selection / hover background.
+                if selected {
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        ui.visuals().selection.bg_fill.gamma_multiply(0.4),
+                    );
+                } else if resp.hovered() {
+                    ui.painter()
+                        .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+                }
+                // Left: glyph + path.
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                child.label(
+                    RichText::new(file.status.glyph())
+                        .color(color)
+                        .monospace()
+                        .strong(),
+                );
+                child.add_space(4.0);
+                child.add(
+                    egui::Label::new(RichText::new(file.display_path()).monospace())
+                        .truncate()
+                        .selectable(false),
+                );
+                // Right: stats.
+                let stats_text = file_stats_str(file);
+                let stats_galley = ui.painter().layout_no_wrap(
+                    stats_text,
+                    egui::FontId::monospace(11.0),
+                    ui.visuals().weak_text_color(),
+                );
+                let stats_x = rect.right() - stats_galley.size().x - 4.0;
+                let stats_y = rect.center().y - stats_galley.size().y * 0.5;
+                ui.painter().galley(
+                    egui::pos2(stats_x, stats_y),
+                    stats_galley,
+                    ui.visuals().weak_text_color(),
+                );
+                if resp.clicked() {
+                    ws.selected_file_idx = if selected { None } else { Some(i) };
+                    ws.selected_file_view = SelectedFileView::Diff;
+                    ws.set_image_cache(None);
+                }
+            }
+        });
+}
+
+/// Tree view — files grouped by directory with collapsible headers.
+fn render_file_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff) {
+    // Build a simple directory → file-indices map. We preserve the
+    // original index so clicking a tree leaf sets the correct
+    // `selected_file_idx` into `diff.files`.
+    let mut dirs: std::collections::BTreeMap<String, Vec<(usize, &FileDiff)>> =
+        std::collections::BTreeMap::new();
+    for (i, file) in diff.files.iter().enumerate() {
+        let path = file.display_path();
+        let (dir, _name) = match path.rfind('/') {
+            Some(pos) => (&path[..pos], &path[pos + 1..]),
+            None => (".", path.as_str()),
+        };
+        dirs.entry(dir.to_string()).or_default().push((i, file));
+    }
+
+    ScrollArea::vertical()
+        .id_salt("diff_files_tree")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (dir, files) in &dirs {
+                let dir_label = if dir == "." {
+                    "(root)".to_string()
+                } else {
+                    format!("📁 {dir}/")
+                };
+                egui::CollapsingHeader::new(
+                    RichText::new(format!("{dir_label}  ({})", files.len())).weak(),
+                )
+                .default_open(true)
+                .show(ui, |ui| {
+                    for &(i, file) in files {
+                        let selected = ws.selected_file_idx == Some(i);
+                        let display = file.display_path();
+                        let file_name = display.rsplit('/').next().unwrap_or(&display);
+                        let color = status_color(file.status);
+                        let row_w = ui.available_width();
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(row_w, FILE_ROW_HEIGHT),
+                            egui::Sense::click(),
+                        );
+                        if selected {
+                            ui.painter().rect_filled(
+                                rect,
+                                0.0,
+                                ui.visuals().selection.bg_fill.gamma_multiply(0.4),
+                            );
+                        } else if resp.hovered() {
+                            ui.painter()
+                                .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+                        }
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        child.label(
+                            RichText::new(file.status.glyph())
+                                .color(color)
+                                .monospace()
+                                .strong(),
+                        );
+                        child.add_space(4.0);
+                        child.add(
+                            egui::Label::new(RichText::new(file_name).monospace())
+                                .truncate()
+                                .selectable(false),
+                        );
+                        let stats = file_stats_str(file);
+                        let galley = ui.painter().layout_no_wrap(
+                            stats,
+                            egui::FontId::monospace(11.0),
+                            ui.visuals().weak_text_color(),
+                        );
+                        ui.painter().galley(
+                            egui::pos2(
+                                rect.right() - galley.size().x - 4.0,
+                                rect.center().y - galley.size().y * 0.5,
+                            ),
+                            galley,
+                            ui.visuals().weak_text_color(),
+                        );
+                        if resp.clicked() {
+                            ws.selected_file_idx = if selected { None } else { Some(i) };
+                            ws.selected_file_view = SelectedFileView::Diff;
+                            ws.set_image_cache(None);
+                        }
+                    }
+                });
+            }
+        });
+}
+
+/// Short stats string like "+12 −3" for a file.
+fn file_stats_str(file: &FileDiff) -> String {
+    match &file.kind {
+        FileKind::Text {
+            lines_added,
+            lines_removed,
+            truncated,
+            ..
+        } => {
+            let mut s = format!("+{lines_added} −{lines_removed}");
+            if *truncated {
+                s.push_str(" …");
+            }
+            s
+        }
+        FileKind::Image { ext, .. } => format!("[{ext}]"),
+        FileKind::Binary => "[bin]".into(),
+        FileKind::TooLarge => "[large]".into(),
+    }
+}
+
 fn file_row_label(file: &FileDiff) -> RichText {
     let glyph = file.status.glyph();
     let color = status_color(file.status);
@@ -357,8 +547,7 @@ fn render_file_detail(
             // hunk + every line every frame, which on thousand-line diffs
             // meant a full re-layout pass each paint.
             let mut rows: Vec<DiffRow> = Vec::with_capacity(
-                hunks.iter().map(|h| h.lines.len() + 1).sum::<usize>()
-                    + usize::from(*truncated),
+                hunks.iter().map(|h| h.lines.len() + 1).sum::<usize>() + usize::from(*truncated),
             );
             for hunk in hunks {
                 rows.push(DiffRow::HunkHeader(&hunk.header));

@@ -111,6 +111,12 @@ pub struct AccountId {
 }
 
 impl AccountId {
+    /// Stable human-readable slug for config persistence and UI display.
+    /// Format: `<provider>::<username>`, e.g. `github::alice`.
+    pub fn slug(&self) -> String {
+        format!("{}::{}", self.kind.slug(), self.username)
+    }
+
     /// Service name for the OS keyring entry — prefixed with our app name so
     /// it's easy to spot in Keychain.app / Credential Manager / Secret Service.
     pub fn keyring_service(&self) -> String {

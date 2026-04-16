@@ -144,9 +144,10 @@ fn run_job(
     progress: Arc<Mutex<JobProgress>>,
 ) -> Result<()> {
     match kind {
-        GitJobKind::Fetch { remote, credentials } => {
-            do_fetch(path, &remote, credentials.as_ref(), progress)
-        }
+        GitJobKind::Fetch {
+            remote,
+            credentials,
+        } => do_fetch(path, &remote, credentials.as_ref(), progress),
         GitJobKind::Push {
             remote,
             refspec,

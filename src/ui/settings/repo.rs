@@ -91,6 +91,59 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
         });
         ui.weak(labels.repo_settings_hint);
 
+        // --- per-repo account selection --------------------------------
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(labels.provider_account);
+            let accounts = &app.config.provider_accounts;
+            // Current selection slug lives on `modal`; we mirror it from
+            // RepoSettings on open and write back on change.
+            let before_account = modal.provider_account_slug.clone();
+            let display = modal
+                .provider_account_slug
+                .as_deref()
+                .and_then(|slug| {
+                    accounts
+                        .iter()
+                        .find(|a| a.id.slug() == slug)
+                        .map(|a| format!("{} ({})", a.display_name, a.id.kind.slug()))
+                })
+                .unwrap_or_else(|| labels.auto_account.to_string());
+            ComboBox::from_id_salt("settings_repo_account")
+                .selected_text(display)
+                .show_ui(ui, |ui| {
+                    // "Auto" = detect from remote URL host.
+                    if ui
+                        .selectable_label(
+                            modal.provider_account_slug.is_none(),
+                            labels.auto_account,
+                        )
+                        .clicked()
+                    {
+                        modal.provider_account_slug = None;
+                    }
+                    ui.separator();
+                    for acc in accounts {
+                        let slug = acc.id.slug();
+                        let selected =
+                            modal.provider_account_slug.as_deref() == Some(slug.as_str());
+                        let label = format!(
+                            "{}  ({}, {})",
+                            acc.display_name,
+                            acc.id.kind.slug(),
+                            acc.id.username
+                        );
+                        if ui.selectable_label(selected, label).clicked() {
+                            modal.provider_account_slug = Some(slug);
+                        }
+                    }
+                });
+            if modal.provider_account_slug != before_account {
+                intent = Some(Intent::SavePreferences);
+            }
+        });
+        ui.weak(labels.provider_account_hint);
+
         ui.add_space(12.0);
         ui.heading(labels.remote_urls);
         ui.separator();
@@ -217,6 +270,7 @@ fn save_preferences(app: &mut MergeFoxApp, labels: &Labels) {
         let settings = RepoSettings {
             default_remote: modal.default_remote.clone(),
             pull_strategy: modal.pull_strategy,
+            provider_account: modal.provider_account_slug.clone(),
         };
         (repo_path, settings)
     };
@@ -320,6 +374,9 @@ struct Labels {
     add_remote: &'static str,
     remote_name: &'static str,
     add_remote_button: &'static str,
+    provider_account: &'static str,
+    provider_account_hint: &'static str,
+    auto_account: &'static str,
     saved_prefs: &'static str,
     updated_remote: &'static str,
     deleted_remote: &'static str,
@@ -349,6 +406,9 @@ fn labels(lang: UiLanguage) -> Labels {
             add_remote: "원격 저장소 추가",
             remote_name: "원격 이름",
             add_remote_button: "추가",
+            provider_account: "Push/Pull 계정",
+            provider_account_hint: "이 저장소에서 push/pull/fetch 시 사용할 계정입니다. 여러 GitHub 계정이 있을 때 유용합니다.",
+            auto_account: "(원격 URL에서 자동 감지)",
             saved_prefs: "저장소 기본값을 저장했습니다",
             updated_remote: "원격 URL을 업데이트했습니다",
             deleted_remote: "원격을 삭제했습니다",
@@ -375,6 +435,9 @@ fn labels(lang: UiLanguage) -> Labels {
             add_remote: "Add Remote",
             remote_name: "Remote name",
             add_remote_button: "Add",
+            provider_account: "Push/Pull account",
+            provider_account_hint: "Which connected account to use for push/pull/fetch on this repo. Useful when you have multiple GitHub accounts (personal + work).",
+            auto_account: "(auto-detect from remote URL)",
             saved_prefs: "Saved repository defaults",
             updated_remote: "Updated remote URLs",
             deleted_remote: "Deleted remote",

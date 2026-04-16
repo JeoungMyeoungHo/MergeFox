@@ -5,14 +5,14 @@ mod ai;
 mod app;
 mod clone;
 mod config;
-mod gix_clone;
-mod secrets;
 mod forge;
 mod git;
 mod git_url;
+mod gix_clone;
 mod journal;
 mod mcp;
 mod providers;
+mod secrets;
 mod ui;
 
 use app::MergeFoxApp;

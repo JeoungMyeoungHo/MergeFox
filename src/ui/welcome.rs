@@ -781,10 +781,7 @@ fn start_clone_with_policy(app: &mut MergeFoxApp, url: String, dest: PathBuf) {
             let host = parsed.as_ref().map(|p| p.host.clone());
             let owner = parsed.as_ref().map(|p| p.owner.clone());
             let repo = parsed.as_ref().map(|p| p.repo.clone());
-            let can_probe = matches!(
-                host.as_deref(),
-                Some("github.com") | Some("gitlab.com")
-            );
+            let can_probe = matches!(host.as_deref(), Some("github.com") | Some("gitlab.com"));
             if can_probe {
                 // Double unwraps are safe because can_probe implies parsed.
                 state.clone_preflight = Some(clone::spawn_preflight(
@@ -833,8 +830,7 @@ fn apply_clone_decision(app: &mut MergeFoxApp, decision: CloneDecision) {
 /// result into either an immediate clone (below threshold / unknown
 /// policy) or a `CloneSizePrompt` (above threshold).
 fn drain_clone_preflight(app: &mut MergeFoxApp) {
-    let threshold_bytes =
-        (app.config.clone_defaults.prompt_threshold_mb as u64) * 1024 * 1024;
+    let threshold_bytes = (app.config.clone_defaults.prompt_threshold_mb as u64) * 1024 * 1024;
     let shallow_depth = app.config.clone_defaults.shallow_depth;
     let Some(state) = app.active_welcome_state_mut() else {
         return;

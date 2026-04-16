@@ -176,10 +176,12 @@ impl AiClient for OpenAICompatClient {
         req: CompletionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse>> + Send + 'a>> {
         Box::pin(async move {
-            let url = format!(
-                "{}/chat/completions",
-                self.endpoint.base_url.trim_end_matches('/')
-            );
+            let base = self.endpoint.base_url.trim_end_matches('/');
+            let url = if base.ends_with("/v1") || base.ends_with("/v1/") {
+                format!("{base}/chat/completions")
+            } else {
+                format!("{base}/v1/chat/completions")
+            };
 
             // Translate our Msg list to the wire shape. We also inline
             // the system prompt as the first element since OpenAI-compat

@@ -148,11 +148,13 @@ fn parse_status_z(data: &[u8]) -> Vec<StatusEntry> {
 /// Returns approximate staged-file count (from `git diff --cached`).
 pub fn stage_all(repo_path: &Path) -> Result<usize> {
     super::cli::run(repo_path, ["add", "-A"]).context("git add -A")?;
-    let out = super::cli::run(repo_path, ["diff", "--cached", "--name-only"])
-        .unwrap_or_else(|_| super::cli::CliOutput {
-            stdout: vec![],
-            stderr: vec![],
-            status: 0,
+    let out =
+        super::cli::run(repo_path, ["diff", "--cached", "--name-only"]).unwrap_or_else(|_| {
+            super::cli::CliOutput {
+                stdout: vec![],
+                stderr: vec![],
+                status: 0,
+            }
         });
     Ok(out.stdout_str().lines().count())
 }
@@ -232,8 +234,7 @@ fn head_oid(repo_path: &Path) -> Result<gix::ObjectId> {
 
 /// Create a stash entry including untracked files. Returns the stash OID.
 pub fn stash_push(repo_path: &Path, message: &str) -> Result<gix::ObjectId> {
-    super::cli::run(repo_path, ["stash", "push", "-u", "-m", message])
-        .context("git stash push")?;
+    super::cli::run(repo_path, ["stash", "push", "-u", "-m", message]).context("git stash push")?;
     let s = super::cli::run_line(repo_path, ["rev-parse", "stash@{0}"])
         .context("rev-parse stash@{0}")?;
     gix::ObjectId::from_hex(s.trim().as_bytes()).context("parse stash OID")
@@ -242,8 +243,7 @@ pub fn stash_push(repo_path: &Path, message: &str) -> Result<gix::ObjectId> {
 /// Pop (apply + drop) a stash by its 0-based index.
 pub fn stash_pop(repo_path: &Path, index: usize) -> Result<()> {
     let refspec = format!("stash@{{{index}}}");
-    super::cli::run(repo_path, ["stash", "pop", refspec.as_str()])
-        .context("git stash pop")?;
+    super::cli::run(repo_path, ["stash", "pop", refspec.as_str()]).context("git stash pop")?;
     Ok(())
 }
 
@@ -252,10 +252,7 @@ pub fn stash_pop(repo_path: &Path, index: usize) -> Result<()> {
 pub fn stash_list(repo_path: &Path) -> Result<Vec<StashEntry>> {
     let sep = '\x1f'; // ASCII unit-separator, safe in git format strings
     let fmt = format!("%gd{sep}%H{sep}%gs");
-    let out = super::cli::run(
-        repo_path,
-        ["stash", "list", &format!("--format={fmt}")],
-    )?;
+    let out = super::cli::run(repo_path, ["stash", "list", &format!("--format={fmt}")])?;
     let stdout = out.stdout_str();
     let mut entries = Vec::new();
     for line in stdout.lines() {

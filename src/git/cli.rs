@@ -283,11 +283,9 @@ impl GitCommand {
 
         // Log the command + outcome.
         let stderr_bytes = &output.stderr;
-        let stderr_head = String::from_utf8_lossy(
-            &stderr_bytes[..stderr_bytes.len().min(200)],
-        )
-        .trim()
-        .to_string();
+        let stderr_head = String::from_utf8_lossy(&stderr_bytes[..stderr_bytes.len().min(200)])
+            .trim()
+            .to_string();
         log_entry(GitLogEntry {
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)

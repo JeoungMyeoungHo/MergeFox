@@ -333,15 +333,17 @@ fn render_panel(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Per-panel "select all in this panel" toggle. Visible only
             // when there are rows to act on.
-            let all_selected = !belongs.is_empty()
-                && belongs.iter().all(|e| modal.selection.contains(&e.path));
+            let all_selected =
+                !belongs.is_empty() && belongs.iter().all(|e| modal.selection.contains(&e.path));
             match kind {
                 PanelKind::Unstaged => {
                     // Primary action: stage
                     ui.add_enabled_ui(count_for_header > 0, |ui| {
                         if ui
                             .button("⬇ Stage all")
-                            .on_hover_text("git add -A — stage every unstaged change, incl. untracked")
+                            .on_hover_text(
+                                "git add -A — stage every unstaged change, incl. untracked",
+                            )
                             .clicked()
                         {
                             *move_intent = Some(MoveIntent::StageAll);
@@ -369,15 +371,13 @@ fn render_panel(
                         }
                     });
                     ui.add_enabled_ui(selected_in_panel_count > 0, |ui| {
-                        let label =
-                            format!("⬆ Unstage selected ({selected_in_panel_count})");
+                        let label = format!("⬆ Unstage selected ({selected_in_panel_count})");
                         if ui
                             .button(label)
                             .on_hover_text("Unstage only the checked files")
                             .clicked()
                         {
-                            *move_intent =
-                                Some(MoveIntent::Unstage(selected_in_panel.clone()));
+                            *move_intent = Some(MoveIntent::Unstage(selected_in_panel.clone()));
                         }
                     });
                 }
@@ -508,9 +508,7 @@ fn apply_move_intent(app: &mut MergeFoxApp, intent: MoveIntent) {
 
     let result: anyhow::Result<()> = match intent {
         MoveIntent::StageAll => crate::git::ops::stage_all(&path).map(|_| ()),
-        MoveIntent::UnstageAll => {
-            crate::git::cli::run(&path, ["reset", "HEAD", "--"]).map(|_| ())
-        }
+        MoveIntent::UnstageAll => crate::git::cli::run(&path, ["reset", "HEAD", "--"]).map(|_| ()),
         MoveIntent::Stage(paths) => {
             let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
             crate::git::ops::stage_paths(&path, &refs)
@@ -666,8 +664,8 @@ fn handle_commit_intent(app: &mut MergeFoxApp, intent: CommitIntent) {
         let before = journal::capture(ws.repo.path()).ok();
 
         let outcome: Result<(String, Operation), anyhow::Error> = match intent {
-            CommitIntent::CommitStaged(msg) => crate::git::ops::commit(ws.repo.path(), &msg)
-                .map(|oid| {
+            CommitIntent::CommitStaged(msg) => {
+                crate::git::ops::commit(ws.repo.path(), &msg).map(|oid| {
                     (
                         format!("Committed {}", short(&oid)),
                         Operation::Commit {
@@ -675,7 +673,8 @@ fn handle_commit_intent(app: &mut MergeFoxApp, intent: CommitIntent) {
                             amended: false,
                         },
                     )
-                }),
+                })
+            }
             CommitIntent::StageAllAndCommit(msg) => crate::git::ops::stage_all(ws.repo.path())
                 .and_then(|_| crate::git::ops::commit(ws.repo.path(), &msg))
                 .map(|oid| {
@@ -687,8 +686,8 @@ fn handle_commit_intent(app: &mut MergeFoxApp, intent: CommitIntent) {
                         },
                     )
                 }),
-            CommitIntent::Amend(msg) => crate::git::ops::amend(ws.repo.path(), Some(&msg)).map(
-                |oid| {
+            CommitIntent::Amend(msg) => {
+                crate::git::ops::amend(ws.repo.path(), Some(&msg)).map(|oid| {
                     (
                         format!("Amended {}", short(&oid)),
                         Operation::Commit {
@@ -696,8 +695,8 @@ fn handle_commit_intent(app: &mut MergeFoxApp, intent: CommitIntent) {
                             amended: true,
                         },
                     )
-                },
-            ),
+                })
+            }
             CommitIntent::GenerateMessage | CommitIntent::None | CommitIntent::Cancel => {
                 unreachable!("these are handled earlier")
             }

@@ -139,7 +139,8 @@ impl ColumnLayout {
         };
         let date = if self.show_date {
             right_cursor -= self.date_width;
-            let r = Rect::from_min_size(Pos2::new(right_cursor, top), Vec2::new(self.date_width, h));
+            let r =
+                Rect::from_min_size(Pos2::new(right_cursor, top), Vec2::new(self.date_width, h));
             right_cursor -= COLUMN_GAP;
             r
         } else {
@@ -243,10 +244,7 @@ impl GraphView {
         // `MAX_GRAPH_LANES` to stop pathological barcode rendering,
         // but we only show up to `graph_width` (user-sized) of it and
         // let the user scroll horizontally for the rest.
-        let visible_max_lane = self
-            .graph
-            .max_lane
-            .min(crate::git::graph::MAX_GRAPH_LANES);
+        let visible_max_lane = self.graph.max_lane.min(crate::git::graph::MAX_GRAPH_LANES);
         let desired_graph_width = if prefs.show_graph {
             (visible_max_lane as f32 + 1.5) * lane_w
         } else {
@@ -408,26 +406,39 @@ impl GraphView {
         // actual row content. Each handle hosts an invisible
         // drag-sensitive strip centered on the boundary; the visible
         // 1 px line spans the full scroll viewport height.
-        let sample_row = Rect::from_min_size(
-            inner_rect.min,
-            Vec2::new(inner_rect.width(), ROW_HEIGHT),
-        );
+        let sample_row =
+            Rect::from_min_size(inner_rect.min, Vec2::new(inner_rect.width(), ROW_HEIGHT));
         let sample_cells = layout.compute(sample_row);
         let mut handles: Vec<(f32, HandleKind)> = Vec::new();
         if show_refs_column && prefs.show_refs {
-            handles.push((sample_cells.refs.right() + COLUMN_GAP * 0.5, HandleKind::Refs));
+            handles.push((
+                sample_cells.refs.right() + COLUMN_GAP * 0.5,
+                HandleKind::Refs,
+            ));
         }
         if prefs.show_graph {
-            handles.push((sample_cells.graph.right() + COLUMN_GAP * 0.5, HandleKind::Graph));
+            handles.push((
+                sample_cells.graph.right() + COLUMN_GAP * 0.5,
+                HandleKind::Graph,
+            ));
         }
         if prefs.show_author {
-            handles.push((sample_cells.author.left() - COLUMN_GAP * 0.5, HandleKind::AuthorLeft));
+            handles.push((
+                sample_cells.author.left() - COLUMN_GAP * 0.5,
+                HandleKind::AuthorLeft,
+            ));
         }
         if prefs.show_date {
-            handles.push((sample_cells.date.left() - COLUMN_GAP * 0.5, HandleKind::DateLeft));
+            handles.push((
+                sample_cells.date.left() - COLUMN_GAP * 0.5,
+                HandleKind::DateLeft,
+            ));
         }
         if prefs.show_sha {
-            handles.push((sample_cells.sha.left() - COLUMN_GAP * 0.5, HandleKind::ShaLeft));
+            handles.push((
+                sample_cells.sha.left() - COLUMN_GAP * 0.5,
+                HandleKind::ShaLeft,
+            ));
         }
         for (x, kind) in handles {
             let hit = Rect::from_min_max(
@@ -484,8 +495,7 @@ impl GraphView {
                     }
                     HandleKind::ShaLeft => {
                         let cur = prefs.sha_width.unwrap_or(sha_width);
-                        prefs.sha_width =
-                            Some((cur - delta).clamp(META_MIN_WIDTH, META_MAX_WIDTH));
+                        prefs.sha_width = Some((cur - delta).clamp(META_MIN_WIDTH, META_MAX_WIDTH));
                     }
                 }
             }
@@ -518,8 +528,7 @@ impl GraphView {
                 });
                 let delta = scroll_x + shift_wheel;
                 if delta != 0.0 {
-                    self.graph_scroll_x =
-                        (self.graph_scroll_x - delta).clamp(0.0, max_scroll_x);
+                    self.graph_scroll_x = (self.graph_scroll_x - delta).clamp(0.0, max_scroll_x);
                     ui.ctx().request_repaint();
                 }
             }
@@ -709,7 +718,9 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
     for rb in row.refs.iter().filter(|r| r.kind == RefKind::RemoteBranch) {
         let name = rb.short.as_ref();
         if ui
-            .button(egui::RichText::new(format!("Delete remote '{name}'")).color(Color32::LIGHT_RED))
+            .button(
+                egui::RichText::new(format!("Delete remote '{name}'")).color(Color32::LIGHT_RED),
+            )
             .clicked()
         {
             action = Some(CommitAction::DeleteBranchPrompt {
@@ -904,11 +915,15 @@ fn paint_refs_cell(ui: &mut Ui, rect: Rect, row: &GraphRow, is_head: bool, prefs
         return;
     }
 
+    // Clip the child UI to the cell rect so chips that exceed the
+    // column width are truncated rather than bleeding into the
+    // adjacent message / graph column.
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
+    child.set_clip_rect(rect);
 
     if is_head {
         let fg = Color32::from_rgb(255, 220, 120);
@@ -955,42 +970,76 @@ fn paint_refs_cell(ui: &mut Ui, rect: Rect, row: &GraphRow, is_head: bool, prefs
         }
         // Find a matching remote: `<anything>/<local_name>`.
         let local_name = label.short.as_ref();
-        let matching_remote = row
-            .refs
-            .iter()
-            .enumerate()
-            .find(|(j, r)| {
-                r.kind == RefKind::RemoteBranch
-                    && !consumed_remote[*j]
-                    && r.short
-                        .rsplit('/')
-                        .next()
-                        .map(|tail| tail == local_name)
-                        .unwrap_or(false)
-            });
+        let matching_remote = row.refs.iter().enumerate().find(|(j, r)| {
+            r.kind == RefKind::RemoteBranch
+                && !consumed_remote[*j]
+                && r.short
+                    .rsplit('/')
+                    .next()
+                    .map(|tail| tail == local_name)
+                    .unwrap_or(false)
+        });
 
         if let Some((j, remote_label)) = matching_remote {
             consumed_remote[j] = true;
-            // Remote prefix (e.g. "origin" from "origin/main").
-            let remote_prefix = remote_label
-                .short
-                .split('/')
-                .next()
-                .unwrap_or("remote");
-            let display = format!("{local_name} ↔ {remote_prefix}");
-            let galley = child
-                .painter()
-                .layout_no_wrap(display, FontId::monospace(11.0), Color32::WHITE);
+            let remote_prefix = remote_label.short.split('/').next().unwrap_or("remote");
+            let font = FontId::monospace(11.0);
             let pad = Vec2::new(6.0, 2.0);
-            let size = galley.size() + pad * 2.0;
-            let (chip_rect, _) = child.allocate_exact_size(size, Sense::hover());
-            // Gradient fill: left half = local green, right half = remote blue.
-            let mid_x = chip_rect.center().x;
-            let left = egui::Rect::from_min_max(chip_rect.min, egui::pos2(mid_x, chip_rect.max.y));
-            let right = egui::Rect::from_min_max(egui::pos2(mid_x, chip_rect.min.y), chip_rect.max);
-            child.painter().rect_filled(left, egui::Rounding { nw: 3.0, sw: 3.0, ne: 0.0, se: 0.0 }, LOCAL_BG);
-            child.painter().rect_filled(right, egui::Rounding { nw: 0.0, sw: 0.0, ne: 3.0, se: 3.0 }, REMOTE_BG);
-            child.painter().galley(chip_rect.min + pad, galley, Color32::WHITE);
+
+            // Measure each half's text independently so each arrow
+            // sits centered inside its own colour zone.
+            let left_text = format!("← {local_name}");
+            let right_text = format!("{remote_prefix} →");
+            let left_galley =
+                child
+                    .painter()
+                    .layout_no_wrap(left_text, font.clone(), Color32::WHITE);
+            let right_galley =
+                child
+                    .painter()
+                    .layout_no_wrap(right_text, font, Color32::WHITE);
+            let left_w = left_galley.size().x + pad.x * 2.0;
+            let right_w = right_galley.size().x + pad.x * 2.0;
+            let h = left_galley.size().y.max(right_galley.size().y) + pad.y * 2.0;
+            let total_w = left_w + right_w;
+            let (chip_rect, _) = child.allocate_exact_size(
+                Vec2::new(total_w, h),
+                Sense::hover(),
+            );
+            // Left zone: local green with left-rounded corners.
+            let left_rect = Rect::from_min_size(chip_rect.min, Vec2::new(left_w, h));
+            child.painter().rect_filled(
+                left_rect,
+                egui::Rounding { nw: 3.0, sw: 3.0, ne: 0.0, se: 0.0 },
+                LOCAL_BG,
+            );
+            // Center the left galley inside the left zone.
+            child.painter().galley(
+                egui::pos2(
+                    left_rect.center().x - left_galley.size().x * 0.5,
+                    left_rect.center().y - left_galley.size().y * 0.5,
+                ),
+                left_galley,
+                Color32::WHITE,
+            );
+            // Right zone: remote blue with right-rounded corners.
+            let right_rect = Rect::from_min_size(
+                egui::pos2(chip_rect.min.x + left_w, chip_rect.min.y),
+                Vec2::new(right_w, h),
+            );
+            child.painter().rect_filled(
+                right_rect,
+                egui::Rounding { nw: 0.0, sw: 0.0, ne: 3.0, se: 3.0 },
+                REMOTE_BG,
+            );
+            child.painter().galley(
+                egui::pos2(
+                    right_rect.center().x - right_galley.size().x * 0.5,
+                    right_rect.center().y - right_galley.size().y * 0.5,
+                ),
+                right_galley,
+                Color32::WHITE,
+            );
             child.add_space(4.0);
         } else {
             // Local-only branch (no matching remote).
@@ -1089,10 +1138,8 @@ fn paint_author_avatar(ui: &mut egui::Ui, row: &GraphRow) {
     const AVATAR_SIZE: f32 = 18.0;
     const GRID: usize = 5;
 
-    let (rect, _resp) = ui.allocate_exact_size(
-        Vec2::new(AVATAR_SIZE, AVATAR_SIZE),
-        egui::Sense::hover(),
-    );
+    let (rect, _resp) =
+        ui.allocate_exact_size(Vec2::new(AVATAR_SIZE, AVATAR_SIZE), egui::Sense::hover());
 
     let key: &str = if !row.author_email.is_empty() {
         row.author_email.as_ref()
@@ -1138,10 +1185,7 @@ fn paint_author_avatar(ui: &mut egui::Ui, row: &GraphRow) {
             // Fill left cell and its mirror on the right.
             let left = rect.left() + cell * col as f32;
             let top = rect.top() + cell * row_i as f32;
-            let cell_rect = Rect::from_min_size(
-                egui::pos2(left, top),
-                Vec2::new(cell, cell),
-            );
+            let cell_rect = Rect::from_min_size(egui::pos2(left, top), Vec2::new(cell, cell));
             painter.rect_filled(cell_rect, egui::Rounding::ZERO, fg);
 
             // Mirror — skip the centre column (col 2) because mirroring
@@ -1149,10 +1193,8 @@ fn paint_author_avatar(ui: &mut egui::Ui, row: &GraphRow) {
             if col < 2 {
                 let mirror_col = GRID - 1 - col;
                 let mleft = rect.left() + cell * mirror_col as f32;
-                let mirror_rect = Rect::from_min_size(
-                    egui::pos2(mleft, top),
-                    Vec2::new(cell, cell),
-                );
+                let mirror_rect =
+                    Rect::from_min_size(egui::pos2(mleft, top), Vec2::new(cell, cell));
                 painter.rect_filled(mirror_rect, egui::Rounding::ZERO, fg);
             }
         }

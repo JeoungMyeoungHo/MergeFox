@@ -83,28 +83,27 @@ pub fn ensure_language_fonts(ctx: &egui::Context, language: UiLanguage) {
             .insert(0, UI_CHROME_FAMILY.to_string());
     }
 
-    // Tier B — only attempt the system CJK load when the active locale
-    // actually needs it. egui's per-glyph fallback would still pull from
-    // Tier B if it were installed, but loading 53 MB just to render an
-    // English-only Welcome screen is wasteful.
-    if requires_cjk_font(language.resolved()) {
-        if let Some((name, font_data)) = load_cjk_font() {
-            fonts.font_data.insert(name.clone(), font_data);
-            // After Tier A, before egui's defaults — covers any glyph
-            // missing from the chrome subset (i.e. arbitrary repo text).
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .push(name.clone());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push(name);
-        } else {
-            eprintln!("mergefox: no CJK system font found; falling back to egui defaults");
-        }
+    // Tier B — ALWAYS load a system CJK font as fallback, regardless
+    // of UI language. Even when the chrome is English, repo content
+    // (commit messages, branch names, file paths, author names) can
+    // contain any script. Without a CJK fallback, switching the UI to
+    // English caused Korean/Japanese/Chinese text to render as tofu □.
+    //
+    // The CJK file (~16–53 MB) is loaded at most once per process
+    // (OnceLock). The first call that hits this path pays the read;
+    // subsequent calls reuse the cached bytes.
+    if let Some((name, font_data)) = load_cjk_font() {
+        fonts.font_data.insert(name.clone(), font_data);
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push(name.clone());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push(name);
     }
 
     ctx.set_fonts(fonts);

@@ -5,11 +5,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-
 use crate::clone::CloneHandle;
 use crate::config::{Config, PullStrategyPref, RepoSettings, ThemeSettings, UiLanguage};
 use crate::forge::{ForgeCreateIssueResult, ForgeCreatePrResult, ForgeRefreshResult, ForgeState};
-use crate::git::{BranchInfo, GitJob, GitJobKind, GraphScope, Repo, RepoDiff, StashEntry, StatusEntry};
+use crate::git::{
+    BranchInfo, GitJob, GitJobKind, GraphScope, Repo, RepoDiff, StashEntry, StatusEntry,
+};
 use crate::journal::{self, Journal, JournalEntry, OpSource, Operation, RepoSnapshot};
 use crate::providers;
 use crate::ui;
@@ -129,6 +130,8 @@ pub struct SettingsModal {
     /// Older `last_error` / `notice` split led to states where both could be
     /// set at once after a refresh failure.
     pub feedback: Option<ui::settings::Feedback>,
+    /// Per-repo provider account slug. `None` = auto-detect.
+    pub provider_account_slug: Option<String>,
     // --- Git identity ---
     /// Lazy-loaded from `git config user.name` on first render.
     pub identity_name: String,
@@ -266,6 +269,9 @@ pub struct WorkspaceState {
     pub selected_file_idx: Option<usize>,
     /// Whether the center pane shows the patch or the raw file snapshot.
     pub selected_file_view: SelectedFileView,
+    /// `true` = show commit files grouped by directory (tree view).
+    /// `false` = flat list sorted by path (default).
+    pub file_list_tree: bool,
     /// Lazily-loaded bytes for the currently selected image diff only.
     ///
     /// **Do not assign to this field directly** — use
@@ -729,17 +735,13 @@ impl MergeFoxApp {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let mut preserved_tabs: Option<WorkspaceTabs> = None;
         if let View::Workspace(tabs) = &mut self.view {
-            if let Some(idx) = tabs
-                .tabs
-                .iter()
-                .position(|t| {
-                    t.repo
-                        .path()
-                        .canonicalize()
-                        .unwrap_or_else(|_| t.repo.path().to_path_buf())
-                        == canonical
-                })
-            {
+            if let Some(idx) = tabs.tabs.iter().position(|t| {
+                t.repo
+                    .path()
+                    .canonicalize()
+                    .unwrap_or_else(|_| t.repo.path().to_path_buf())
+                    == canonical
+            }) {
                 tabs.active = idx;
                 tabs.launcher_active = false;
                 return;
@@ -909,6 +911,7 @@ impl MergeFoxApp {
             current_diff: None,
             selected_file_idx: None,
             selected_file_view: SelectedFileView::Diff,
+            file_list_tree: false,
             selected_image_cache: None,
             snapshot_cache: None,
             pending_image_evictions: Vec::new(),
@@ -1388,9 +1391,7 @@ impl MergeFoxApp {
                     ws.repo.list_remotes().ok().unwrap_or_default(),
                 )
             }
-            View::Welcome(_) | View::OpeningRepo(_) => {
-                (None, RepoSettings::default(), Vec::new())
-            }
+            View::Welcome(_) | View::OpeningRepo(_) => (None, RepoSettings::default(), Vec::new()),
         };
 
         self.settings_modal = Some(SettingsModal {
@@ -1411,6 +1412,7 @@ impl MergeFoxApp {
             new_remote_name: String::new(),
             new_fetch_url: String::new(),
             new_push_url: String::new(),
+            provider_account_slug: repo_settings.provider_account,
             integrations: ui::settings::integrations::IntegrationsDraft::from_config(&self.config),
             ai: ui::settings::ai::AiDraft::from_config(&self.config, &self.secret_store),
             feedback: None,
@@ -1926,8 +1928,7 @@ impl MergeFoxApp {
         let repo_path = ws.repo.path().to_path_buf();
         let ctx_clone = self.egui_ctx.clone();
         std::thread::spawn(move || {
-            let result = crate::git::diff_for_commit(&repo_path, oid)
-                .map_err(|e| format!("{e:#}"));
+            let result = crate::git::diff_for_commit(&repo_path, oid).map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
             ctx_clone.request_repaint();
         });
@@ -2640,18 +2641,31 @@ impl MergeFoxApp {
         // 2. Ask git for the URL. This is a tiny synchronous subprocess,
         //    but we only do it on the user's explicit push/pull/fetch
         //    click (not per frame), so the cost is fine.
-        let url =
-            crate::git::cli::run_line(&repo_path, ["remote", "get-url", remote]).ok()?;
+        let url = crate::git::cli::run_line(&repo_path, ["remote", "get-url", remote]).ok()?;
 
         // 3. Parse the host. SSH / file / relative URLs → None.
         let host = remote_host(&url)?;
 
-        // 4. Find a connected account whose provider kind matches this host.
-        let account = self
-            .config
-            .provider_accounts
-            .iter()
-            .find(|acc| provider_matches_host(&acc.id.kind, &host))?;
+        // 4. Find the right account. Priority:
+        //    a) Per-repo explicit selection (Settings → Repository → Account)
+        //    b) First connected account whose provider kind matches the host
+        let repo_settings = self.config.repo_settings_for(&repo_path);
+        let account = if let Some(slug) = &repo_settings.provider_account {
+            // Explicit per-repo override — find by slug.
+            self.config
+                .provider_accounts
+                .iter()
+                .find(|acc| acc.id.slug() == *slug)
+        } else {
+            None
+        }
+        .or_else(|| {
+            // Auto-detect by host — picks the first matching account.
+            self.config
+                .provider_accounts
+                .iter()
+                .find(|acc| provider_matches_host(&acc.id.kind, &host))
+        })?;
 
         // 5. Pull the token from the secret store (OS keychain or the
         //    file fallback).
@@ -2768,8 +2782,12 @@ impl MergeFoxApp {
             return;
         };
         // Collect outcomes first to keep borrows tidy.
-        let mut completed: Vec<(usize, gix::ObjectId, std::time::Duration, std::result::Result<crate::git::RepoDiff, String>)> =
-            Vec::new();
+        let mut completed: Vec<(
+            usize,
+            gix::ObjectId,
+            std::time::Duration,
+            std::result::Result<crate::git::RepoDiff, String>,
+        )> = Vec::new();
         for (idx, tab) in tabs.tabs.iter_mut().enumerate() {
             let Some(task) = tab.diff_task.as_ref() else {
                 continue;
@@ -2814,8 +2832,7 @@ impl MergeFoxApp {
                         if tab.selected_commit == Some(oid) {
                             if let Some(idx) = tab.selected_file_idx {
                                 if idx >= diff_arc.files.len() {
-                                    tab.selected_file_idx =
-                                        diff_arc.files.len().checked_sub(1);
+                                    tab.selected_file_idx = diff_arc.files.len().checked_sub(1);
                                 }
                             }
                             tab.current_diff = Some(diff_arc);
@@ -2849,11 +2866,7 @@ impl MergeFoxApp {
                         tab.current_diff = Some(cached);
                     }
                 } else if tab.selected_commit == Some(next_oid) {
-                    crate::ui::main_panel::spawn_diff_worker(
-                        tab,
-                        next_oid,
-                        &self.egui_ctx,
-                    );
+                    crate::ui::main_panel::spawn_diff_worker(tab, next_oid, &self.egui_ctx);
                 }
             }
         }
@@ -3207,7 +3220,11 @@ impl eframe::App for MergeFoxApp {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
             let last = LAST_FRAME_NANOS.swap(now, Ordering::Relaxed);
-            let gap_ms = if last == 0 { 0 } else { (now - last) / 1_000_000 };
+            let gap_ms = if last == 0 {
+                0
+            } else {
+                (now - last) / 1_000_000
+            };
             eprintln!("[frame start] gap_since_last={}ms", gap_ms);
         }
         ui::theme::apply(ctx, &self.config.theme);
@@ -3283,10 +3300,7 @@ impl eframe::App for MergeFoxApp {
             // We poll fast (every 16 ms ≈ 60 Hz) while a task is pending
             // so the user sees the diff appear as soon as the worker
             // finishes. Once the task clears, the app goes back to idle.
-            if ws.diff_task.is_some()
-                || ws.graph_task.is_some()
-                || ws.nav_task.is_some()
-            {
+            if ws.diff_task.is_some() || ws.graph_task.is_some() || ws.nav_task.is_some() {
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
         }
@@ -3441,7 +3455,9 @@ fn provider_matches_host(kind: &crate::providers::ProviderKind, host: &str) -> b
         ProviderKind::GitHub => host == "github.com",
         ProviderKind::GitLab => host == "gitlab.com",
         ProviderKind::Bitbucket => host == "bitbucket.org",
-        ProviderKind::AzureDevOps => host.ends_with("dev.azure.com") || host.ends_with("visualstudio.com"),
+        ProviderKind::AzureDevOps => {
+            host.ends_with("dev.azure.com") || host.ends_with("visualstudio.com")
+        }
         ProviderKind::Codeberg => host == "codeberg.org",
         ProviderKind::Gitea { instance } => {
             // `instance` is scheme+host, e.g. https://git.example.com
