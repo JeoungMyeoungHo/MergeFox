@@ -1,0 +1,165 @@
+name: Release
+
+# Kicks off on tag pushes that look like `v*` (e.g. v0.1.0, v1.0.0-rc1).
+# Builds for macOS (arm64 + x86_64), Windows x64, Linux x64, then drafts
+# a GitHub Release with the artifacts attached.
+#
+# NOTE: Code signing + notarization are wired as *optional* steps that
+# only run when the corresponding secrets are configured. See RELEASE.md
+# for the full list of secrets.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0-alpha.2)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive_ext: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive_ext: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_ext: zip
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_ext: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libasound2-dev libfontconfig1-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # ---------------- macOS signing + notarization (optional) ----------------
+      - name: Import signing certificate (macOS)
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_CERT != ''
+        env:
+          APPLE_SIGNING_CERT: ${{ secrets.APPLE_SIGNING_CERT }}
+          APPLE_SIGNING_CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
+        run: |
+          echo "$APPLE_SIGNING_CERT" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "ci" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "ci" build.keychain
+          security import /tmp/cert.p12 -k build.keychain \
+            -P "$APPLE_SIGNING_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "ci" build.keychain
+          rm /tmp/cert.p12
+
+      - name: Codesign (macOS)
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --force --deep --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            target/${{ matrix.target }}/release/mergefox
+
+      - name: Notarize (macOS)
+        if: runner.os == 'macOS' && env.APPLE_NOTARIZE_USER != ''
+        env:
+          APPLE_NOTARIZE_USER: ${{ secrets.APPLE_NOTARIZE_USER }}
+          APPLE_NOTARIZE_PASSWORD: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cd target/${{ matrix.target }}/release
+          zip -r mergefox-notarize.zip mergefox
+          xcrun notarytool submit mergefox-notarize.zip \
+            --apple-id "$APPLE_NOTARIZE_USER" \
+            --password "$APPLE_NOTARIZE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          rm mergefox-notarize.zip
+
+      # ---------------- Windows signing (optional) ----------------
+      - name: Codesign (Windows)
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING_CERT != ''
+        env:
+          WINDOWS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT }}
+          WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT))
+          & "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22000.0/x64/signtool.exe" `
+            sign /f cert.pfx /p $env:WINDOWS_SIGNING_CERT_PASSWORD `
+            /tr http://timestamp.digicert.com /td sha256 /fd sha256 `
+            "target/${{ matrix.target }}/release/mergefox.exe"
+          Remove-Item cert.pfx
+
+      # ---------------- Package ----------------
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf ../../../mergefox-${{ matrix.target }}.tar.gz mergefox
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/mergefox.exe `
+            -DestinationPath mergefox-${{ matrix.target }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mergefox-${{ matrix.target }}
+          path: mergefox-${{ matrix.target }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  release:
+    name: Draft GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+          generate_release_notes: true
+          files: artifacts/**/*

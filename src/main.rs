@@ -10,7 +10,9 @@ mod git;
 mod git_url;
 mod gix_clone;
 mod journal;
+mod logging;
 mod mcp;
+mod preflight;
 mod providers;
 mod secrets;
 mod ui;
@@ -23,10 +25,15 @@ fn main() -> eframe::Result<()> {
     // global caches to tune here — gix owns its own object store knobs
     // per-`Repository`, and the system git is tuned via ~/.gitconfig.
 
+    // Logging must come first so early renderer / init failures are
+    // captured. The guard flushes the file appender on drop; keep it
+    // alive for the full `main` scope.
+    let _log_guard = logging::init();
+
     let preferred = preferred_renderer();
     run(preferred).or_else(|err| {
         if matches!(preferred, eframe::Renderer::Glow) {
-            eprintln!("mergefox: glow init failed ({err}); retrying with wgpu");
+            tracing::warn!(error = %err, "glow init failed; retrying with wgpu");
             run(eframe::Renderer::Wgpu)
         } else {
             Err(err)

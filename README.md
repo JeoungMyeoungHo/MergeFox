@@ -64,7 +64,8 @@ safer history rewriting, and built-in recovery tools.
 This is the **first alpha** (`v0.1.0-alpha.1`). Core workflows are stable
 enough for daily Git work; peripheral UI and some network flows are still
 moving fast. See [RELEASE_NOTES.md](./RELEASE_NOTES.md) for the full
-list, and [TODO.md](./TODO.md) for what's on deck next.
+list, [TODO/features.md](./TODO/features.md) for feature gaps, and
+[TODO/production.md](./TODO/production.md) for production-readiness work.
 
 Known limitations in alpha:
 - No blame view yet

@@ -132,7 +132,7 @@ fn do_clone_dispatched(
     // gix failed. Log and fall back to the `git` CLI — but re-classify
     // the destination because gix may have written a partial skeleton
     // before erroring out.
-    eprintln!("mergefox: gix clone failed ({gix_err}); falling back to git CLI");
+    tracing::warn!(error = %gix_err, "gix clone failed; falling back to git CLI");
     if dest.exists() {
         match classify_destination(dest)
             .with_context(|| format!("re-inspect {} after gix failure", dest.display()))?

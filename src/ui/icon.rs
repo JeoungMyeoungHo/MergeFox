@@ -18,7 +18,7 @@ pub fn app_icon() -> egui::IconData {
     match decode() {
         Ok(icon) => icon,
         Err(e) => {
-            eprintln!("mergefox: app icon decode failed ({e}); using placeholder");
+            tracing::warn!(error = %e, "app icon decode failed; using placeholder");
             egui::IconData {
                 rgba: vec![0, 0, 0, 0],
                 width: 1,
