@@ -657,7 +657,7 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
         ui.close_menu();
     }
     if ui.button("Cherry-pick commit").clicked() {
-        action = Some(CommitAction::CherryPick(row.oid));
+        action = Some(CommitAction::CherryPick(vec![row.oid]));
         ui.close_menu();
     }
 

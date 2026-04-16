@@ -14,6 +14,8 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let forge_ready = ws.forge.repo.is_some();
     let forge_loading = ws.forge.loading;
     let has_active_job = ws.active_job.is_some();
+    let git_available = app.git_capability.is_available();
+    let git_capability_summary = app.git_capability.summary();
 
     // 진행률 데이터 추출 - 프로그레스바 표시용
     let active_job_progress = ws.active_job.as_ref().map(|j| {
@@ -49,11 +51,16 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         .as_ref()
         .map(|c| (c.ahead, c.behind))
         .unwrap_or((0, 0));
+    let tracking_error = ws
+        .repo_ui_cache
+        .as_ref()
+        .and_then(|c| c.tracking_error.clone());
 
     let mut go_home = false;
     let mut start_fetch: Option<String> = None;
     let mut start_push: Option<(String, bool)> = None; // (branch, force)
     let mut start_pull: Option<(String, String, crate::git::PullStrategy)> = None;
+    let mut cancel_active_job = false;
     let mut open_reflog = false;
     let mut open_settings = false;
     let mut open_pr = false;
@@ -133,8 +140,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             // ---- Fetch / Push / Pull buttons with dropdown options ----
             ui.separator();
             let git_btn_size = egui::vec2(64.0, 22.0);
-            let dropdown_size = egui::vec2(16.0, 22.0);
-            ui.add_enabled_ui(!has_active_job, |ui| {
+            ui.add_enabled_ui(!has_active_job && git_available, |ui| {
                 // ── Fetch ──
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -250,6 +256,18 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     });
                 });
             });
+            if !git_available {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 180, 90),
+                    "Degraded mode: install system git to enable fetch/pull/push, commit, stash, and rebase.",
+                )
+                .on_hover_text(git_capability_summary.clone());
+            } else if let Some(err) = tracking_error.as_ref() {
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(230, 180, 90), "Tracking unavailable")
+                    .on_hover_text(err);
+            }
 
             // ---- Forge buttons ----
             ui.separator();
@@ -281,7 +299,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             });
             if ui
                 .button(format!("↺ {}", labels.reflog))
-                .on_hover_text(labels.reflog_hint)
+                .on_hover_text(format!("{} (⌘⇧R)", labels.reflog_hint))
                 .clicked()
             {
                 open_reflog = true;
@@ -310,6 +328,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         .show_percentage()
                         .animate(true),
                 );
+                if ui.small_button("Cancel").clicked() {
+                    cancel_active_job = true;
+                }
             }
             if let Some((label, elapsed, fraction)) = nav_task_progress {
                 ui.separator();
@@ -333,6 +354,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     if go_home {
         app.go_home();
     }
+    if cancel_active_job {
+        app.cancel_active_job();
+    }
     if let Some(remote) = start_fetch {
         if remote == "--all" {
             // Fetch all remotes — kick one job per remote. Only the
@@ -348,10 +372,23 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     }
     if let Some((branch, force)) = start_push {
         if force {
-            // Force push goes through confirmation dialog first.
+            // Force push goes through confirmation dialog first, with a
+            // pre-flight summary of how many commits on the remote are
+            // about to be overwritten (the exact thing force push
+            // silently destroys when someone else pushed while you were
+            // working).
+            let preflight = match &app.view {
+                crate::app::View::Workspace(tabs) => Some(crate::preflight::force_push(
+                    tabs.current().repo.path(),
+                    &default_remote,
+                    &branch,
+                )),
+                _ => None,
+            };
             app.pending_prompt = Some(crate::ui::prompt::force_push_confirm(
                 default_remote.clone(),
                 branch,
+                preflight,
             ));
         } else {
             app.start_push(&default_remote, &branch, false);

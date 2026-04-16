@@ -168,6 +168,28 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
                             .desired_width(f32::INFINITY)
                             .hint_text(labels.push_url_placeholder),
                     );
+                    // Rename row — kept separate from URL edits because
+                    // `git remote rename` also rewrites upstream tracking
+                    // config, which is not what users expect from "Save
+                    // URLs".
+                    ui.horizontal(|ui| {
+                        ui.label(labels.rename_to);
+                        ui.add(
+                            TextEdit::singleline(&mut remote.rename_to)
+                                .desired_width(160.0)
+                                .hint_text(&remote.name),
+                        );
+                        let new_name = remote.rename_to.trim().to_string();
+                        let ok = !new_name.is_empty() && new_name != remote.name;
+                        ui.add_enabled_ui(ok, |ui| {
+                            if ui.button(labels.rename_remote).clicked() {
+                                intent = Some(Intent::RenameRemote {
+                                    old_name: remote.name.clone(),
+                                    new_name,
+                                });
+                            }
+                        });
+                    });
                     ui.horizontal(|ui| {
                         if ui.button(labels.save_remote).clicked() {
                             intent = Some(Intent::SaveRemote {
@@ -218,6 +240,75 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
                 push_url: modal.new_push_url.clone(),
             });
         }
+
+        // --- worktrees --------------------------------------------------
+        //
+        // Lazy-load on first render of this settings section: the list is
+        // read-only state so we can just re-query on each open rather
+        // than cache-invalidate it through the full ws cache pipeline.
+        ui.add_space(16.0);
+        ui.heading(labels.worktrees);
+        ui.separator();
+        if modal.worktrees.is_none() {
+            intent = intent.or(Some(Intent::RefreshWorktrees));
+        }
+        match &modal.worktrees {
+            Some(list) if list.is_empty() => {
+                ui.weak(labels.no_worktrees);
+            }
+            Some(list) => {
+                for wt in list {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(wt.path.display().to_string()).strong());
+                            if wt.is_main {
+                                ui.label(RichText::new(labels.main_badge).weak());
+                            }
+                            if wt.is_locked {
+                                ui.label(RichText::new(labels.locked_badge).weak());
+                            }
+                            if wt.is_prunable {
+                                ui.colored_label(
+                                    Color32::from_rgb(240, 180, 96),
+                                    labels.prunable_badge,
+                                );
+                            }
+                        });
+                        if let Some(branch) = &wt.branch {
+                            ui.weak(format!("branch: {branch}"));
+                        } else if wt.is_detached {
+                            ui.weak("detached HEAD");
+                        }
+                        if !wt.is_main {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button(
+                                        RichText::new(labels.remove_worktree)
+                                            .color(Color32::LIGHT_RED),
+                                    )
+                                    .clicked()
+                                {
+                                    intent = Some(Intent::RemoveWorktree {
+                                        path: wt.path.clone(),
+                                        force: false,
+                                    });
+                                }
+                                if ui.button(labels.remove_worktree_force).clicked() {
+                                    intent = Some(Intent::RemoveWorktree {
+                                        path: wt.path.clone(),
+                                        force: true,
+                                    });
+                                }
+                            });
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+            }
+            None => {
+                ui.weak(labels.loading);
+            }
+        }
     }
 
     if let Some(intent) = intent {
@@ -240,6 +331,15 @@ enum Intent {
         fetch_url: String,
         push_url: String,
     },
+    RenameRemote {
+        old_name: String,
+        new_name: String,
+    },
+    RefreshWorktrees,
+    RemoveWorktree {
+        path: std::path::PathBuf,
+        force: bool,
+    },
 }
 
 fn handle_intent(app: &mut MergeFoxApp, intent: Intent, labels: &Labels) {
@@ -256,7 +356,66 @@ fn handle_intent(app: &mut MergeFoxApp, intent: Intent, labels: &Labels) {
             fetch_url,
             push_url,
         } => add_remote(app, &name, &fetch_url, &push_url, labels),
+        Intent::RenameRemote { old_name, new_name } => {
+            rename_remote(app, &old_name, &new_name, labels)
+        }
+        Intent::RefreshWorktrees => refresh_worktrees(app),
+        Intent::RemoveWorktree { path, force } => remove_worktree(app, &path, force, labels),
     }
+}
+
+fn refresh_worktrees(app: &mut MergeFoxApp) {
+    let result = with_settings_repo(app, |repo| repo.list_worktrees());
+    if let Some(modal) = app.settings_modal.as_mut() {
+        match result {
+            Ok(list) => modal.worktrees = Some(list),
+            Err(_) => modal.worktrees = Some(Vec::new()),
+        }
+    }
+}
+
+fn remove_worktree(app: &mut MergeFoxApp, path: &std::path::Path, force: bool, labels: &Labels) {
+    let path = path.to_path_buf();
+    let result = with_settings_repo(app, |repo| repo.remove_worktree(&path, force));
+    match result {
+        Ok(()) => {
+            if let Some(modal) = app.settings_modal.as_mut() {
+                modal.feedback = Some(Feedback::ok(labels.removed_worktree.to_string()));
+                modal.worktrees = None; // force reload
+            }
+            app.hud = Some(crate::app::Hud::new(labels.removed_worktree, 1600));
+        }
+        Err(err) => {
+            if let Some(modal) = app.settings_modal.as_mut() {
+                modal.feedback = Some(Feedback::err(format!("{err:#}")));
+            }
+        }
+    }
+}
+
+fn rename_remote(app: &mut MergeFoxApp, old_name: &str, new_name: &str, labels: &Labels) {
+    let result = with_settings_repo(app, |repo| {
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            bail!("new remote name cannot be empty");
+        }
+        if trimmed.contains(char::is_whitespace) {
+            bail!("remote names cannot contain whitespace");
+        }
+        repo.rename_remote(old_name, trimmed)
+    });
+    // If the default-remote pointed at the old name, migrate it so the
+    // rename doesn't silently break push/pull for this repo.
+    if result.is_ok() {
+        if let Some(modal) = app.settings_modal.as_mut() {
+            if modal.default_remote.as_deref() == Some(old_name) {
+                modal.default_remote = Some(new_name.trim().to_string());
+            }
+            // Persist the provider_account / default_remote change.
+        }
+        save_preferences(app, labels);
+    }
+    finish_repo_update(app, result, labels.renamed_remote);
 }
 
 fn save_preferences(app: &mut MergeFoxApp, labels: &Labels) {
@@ -381,6 +540,18 @@ struct Labels {
     updated_remote: &'static str,
     deleted_remote: &'static str,
     added_remote: &'static str,
+    rename_to: &'static str,
+    rename_remote: &'static str,
+    renamed_remote: &'static str,
+    worktrees: &'static str,
+    no_worktrees: &'static str,
+    main_badge: &'static str,
+    locked_badge: &'static str,
+    prunable_badge: &'static str,
+    remove_worktree: &'static str,
+    remove_worktree_force: &'static str,
+    removed_worktree: &'static str,
+    loading: &'static str,
 }
 
 fn labels(lang: UiLanguage) -> Labels {
@@ -413,6 +584,18 @@ fn labels(lang: UiLanguage) -> Labels {
             updated_remote: "원격 URL을 업데이트했습니다",
             deleted_remote: "원격을 삭제했습니다",
             added_remote: "원격을 추가했습니다",
+            rename_to: "새 이름",
+            rename_remote: "이름 변경",
+            renamed_remote: "원격 이름을 변경했습니다",
+            worktrees: "워크트리",
+            no_worktrees: "연결된 워크트리가 없습니다.",
+            main_badge: "메인",
+            locked_badge: "잠금",
+            prunable_badge: "정리 대상",
+            remove_worktree: "삭제",
+            remove_worktree_force: "강제 삭제",
+            removed_worktree: "워크트리를 삭제했습니다",
+            loading: "불러오는 중…",
         },
         _ => Labels {
             heading: "Repository Settings",
@@ -442,6 +625,18 @@ fn labels(lang: UiLanguage) -> Labels {
             updated_remote: "Updated remote URLs",
             deleted_remote: "Deleted remote",
             added_remote: "Added remote",
+            rename_to: "Rename to",
+            rename_remote: "Rename",
+            renamed_remote: "Renamed remote",
+            worktrees: "Worktrees",
+            no_worktrees: "No linked worktrees.",
+            main_badge: "main",
+            locked_badge: "locked",
+            prunable_badge: "prunable",
+            remove_worktree: "Remove",
+            remove_worktree_force: "Force remove",
+            removed_worktree: "Removed worktree",
+            loading: "Loading…",
         },
     }
 }

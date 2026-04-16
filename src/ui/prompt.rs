@@ -73,9 +73,15 @@ pub enum PendingPrompt {
         submitted: bool,
     },
     /// Confirmation-only (no text input). `confirmed` flips true on OK.
+    ///
+    /// `preflight` carries the pre-computed impact summary (commits lost,
+    /// refs overwritten, etc.) that the dispatcher assembled when it saw
+    /// the action come in. We compute it up front rather than lazily in
+    /// the modal so the modal never blocks on git subprocesses.
     Confirm {
         kind: ConfirmKind,
         confirmed: bool,
+        preflight: Option<crate::preflight::PreflightInfo>,
     },
 }
 
@@ -440,8 +446,18 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         }
                     });
                 }
-                PendingPrompt::Confirm { kind, .. } => {
+                PendingPrompt::Confirm {
+                    kind, preflight, ..
+                } => {
                     ui.label(kind.body());
+                    if let Some(preflight) = preflight.as_ref() {
+                        if !preflight.is_empty() {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            render_preflight(ui, preflight);
+                        }
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
@@ -510,6 +526,24 @@ fn prompt_title(p: &PendingPrompt) -> &'static str {
         PendingPrompt::AmendMessage { .. } => "Amend commit message",
         PendingPrompt::StashPush { .. } => "Create stash",
         PendingPrompt::Confirm { kind, .. } => kind.title(),
+    }
+}
+
+/// Render the pre-flight lines below the confirmation body. Each line
+/// gets a severity-colored glyph so "this deletes 3 commits" reads as a
+/// stop sign, not a footnote.
+fn render_preflight(ui: &mut egui::Ui, info: &crate::preflight::PreflightInfo) {
+    use crate::preflight::Severity;
+    for line in &info.lines {
+        let (glyph, color) = match line.severity {
+            Severity::Critical => ("⛔", egui::Color32::from_rgb(235, 108, 108)),
+            Severity::Warning => ("⚠", egui::Color32::from_rgb(240, 180, 96)),
+            Severity::Info => ("ℹ", egui::Color32::from_rgb(148, 170, 210)),
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(color, glyph);
+            ui.label(&line.text);
+        });
     }
 }
 
@@ -615,25 +649,39 @@ pub fn amend_message_prompt(
     }
 }
 
-pub fn delete_branch_confirm(name: String, is_remote: bool) -> PendingPrompt {
+pub fn delete_branch_confirm(
+    name: String,
+    is_remote: bool,
+    preflight: Option<crate::preflight::PreflightInfo>,
+) -> PendingPrompt {
     PendingPrompt::Confirm {
         kind: ConfirmKind::DeleteBranch { name, is_remote },
         confirmed: false,
+        preflight,
     }
 }
 
-pub fn hard_reset_confirm(branch: String, target: Oid) -> PendingPrompt {
+pub fn hard_reset_confirm(
+    branch: String,
+    target: Oid,
+    preflight: Option<crate::preflight::PreflightInfo>,
+) -> PendingPrompt {
     PendingPrompt::Confirm {
         kind: ConfirmKind::HardReset { branch, target },
         confirmed: false,
+        preflight,
     }
 }
 
 #[allow(dead_code)]
-pub fn drop_commit_confirm(oid: Oid) -> PendingPrompt {
+pub fn drop_commit_confirm(
+    oid: Oid,
+    preflight: Option<crate::preflight::PreflightInfo>,
+) -> PendingPrompt {
     PendingPrompt::Confirm {
         kind: ConfirmKind::DropCommit { oid },
         confirmed: false,
+        preflight,
     }
 }
 
@@ -648,13 +696,20 @@ pub fn drop_stash_confirm(index: usize, message: String) -> PendingPrompt {
     PendingPrompt::Confirm {
         kind: ConfirmKind::DropStash { index, message },
         confirmed: false,
+        preflight: None,
     }
 }
 
-pub fn force_push_confirm(remote: String, branch: String) -> PendingPrompt {
+#[allow(dead_code)]
+pub fn force_push_confirm(
+    remote: String,
+    branch: String,
+    preflight: Option<crate::preflight::PreflightInfo>,
+) -> PendingPrompt {
     PendingPrompt::Confirm {
         kind: ConfirmKind::ForcePush { remote, branch },
         confirmed: false,
+        preflight,
     }
 }
 

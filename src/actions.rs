@@ -33,7 +33,12 @@ pub enum CommitAction {
     },
 
     // --- branch ops ---
-    CherryPick(Oid),
+    /// Cherry-pick one or more commits onto the current branch, in the
+    /// order given. Multi-commit cherry-pick runs the single-commit path
+    /// in a loop so journaling / conflict surface stays unchanged per
+    /// commit — if any pick fails, the loop stops and we surface the
+    /// partial state (N of M picked) to the user.
+    CherryPick(Vec<Oid>),
     Revert(Oid),
     Reset {
         branch: String,
@@ -108,7 +113,13 @@ impl CommitAction {
                     short(at)
                 )
             }
-            Self::CherryPick(o) => format!("cherry-pick {}", short(o)),
+            Self::CherryPick(ids) => {
+                if ids.len() == 1 {
+                    format!("cherry-pick {}", short(&ids[0]))
+                } else {
+                    format!("cherry-pick {} commits", ids.len())
+                }
+            }
             Self::Revert(o) => format!("revert {}", short(o)),
             Self::Reset {
                 branch,
