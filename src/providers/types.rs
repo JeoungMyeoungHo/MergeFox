@@ -88,6 +88,42 @@ pub struct RemoteRepoSummary {
     pub web_url: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteRepoOwnerKind {
+    User,
+    Organization,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRepoOwner {
+    pub login: String,
+    pub display_name: String,
+    pub kind: RemoteRepoOwnerKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRepositoryDraft {
+    pub owner: String,
+    pub owner_kind: RemoteRepoOwnerKind,
+    pub name: String,
+    pub description: Option<String>,
+    pub private: bool,
+    pub auto_init: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedRepositoryRef {
+    pub owner: String,
+    pub repo: String,
+    pub description: Option<String>,
+    pub default_branch: Option<String>,
+    pub private: bool,
+    pub clone_https: String,
+    pub clone_ssh: String,
+    pub web_url: String,
+}
+
 /// How the user authenticates with this account.
 ///
 /// A single provider account can exist multiple times with different methods —

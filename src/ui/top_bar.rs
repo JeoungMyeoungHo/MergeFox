@@ -1,6 +1,6 @@
 //! Top bar — only shown while a workspace is open.
 
-use crate::app::{MergeFoxApp, View};
+use crate::app::{default_remote_name, tracked_upstream_for_branch, MergeFoxApp, View};
 use crate::config::UiLanguage;
 
 pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
@@ -53,7 +53,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let mut go_home = false;
     let mut start_fetch: Option<String> = None;
     let mut start_push: Option<(String, bool)> = None; // (branch, force)
-    let mut start_pull: Option<(String, crate::git::PullStrategy)> = None;
+    let mut start_pull: Option<(String, String, crate::git::PullStrategy)> = None;
     let mut open_reflog = false;
     let mut open_settings = false;
     let mut open_pr = false;
@@ -61,19 +61,17 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let mut refresh_forge = false;
     let labels = top_bar_labels(app.config.ui_language);
 
-    let repo_settings = app.config.repo_settings_for(ws.repo.path());
     let cached_remotes: Vec<String> = ws
         .repo_ui_cache
         .as_ref()
         .map(|c| c.remotes.clone())
         .unwrap_or_default();
-    let default_remote = repo_settings
-        .default_remote
-        .clone()
-        .filter(|preferred| cached_remotes.iter().any(|name| name == preferred))
-        .or_else(|| cached_remotes.first().cloned())
-        .unwrap_or_else(|| "origin".to_string());
-    let has_upstream = upstream_info.is_some();
+    let repo_settings = app.config.repo_settings_for(ws.repo.path());
+    let default_remote = default_remote_name(ws, &app.config);
+    let head_upstream = head
+        .as_deref()
+        .and_then(|head_name| tracked_upstream_for_branch(ws, head_name));
+    let has_upstream = head_upstream.is_some();
 
     egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
@@ -177,23 +175,39 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         })
                         .clicked()
                     {
-                        if let Some(h) = head.as_ref() {
-                            start_pull = Some((h.clone(), repo_settings.pull_strategy.to_git()));
+                        if let Some((remote, branch)) = head_upstream.as_ref() {
+                            start_pull = Some((
+                                remote.clone(),
+                                branch.clone(),
+                                repo_settings.pull_strategy.to_git(),
+                            ));
                         }
                     }
                     ui.add_enabled_ui(has_upstream, |ui| {
                         ui.menu_button(egui::RichText::new("⏷").size(10.0), |ui| {
-                            if let Some(h) = head.as_ref() {
+                            if let Some((remote, branch)) = head_upstream.as_ref() {
                                 if ui.button("Pull (merge)").clicked() {
-                                    start_pull = Some((h.clone(), crate::git::PullStrategy::Merge));
+                                    start_pull = Some((
+                                        remote.clone(),
+                                        branch.clone(),
+                                        crate::git::PullStrategy::Merge,
+                                    ));
                                     ui.close_menu();
                                 }
                                 if ui.button("Pull (rebase)").clicked() {
-                                    start_pull = Some((h.clone(), crate::git::PullStrategy::Rebase));
+                                    start_pull = Some((
+                                        remote.clone(),
+                                        branch.clone(),
+                                        crate::git::PullStrategy::Rebase,
+                                    ));
                                     ui.close_menu();
                                 }
                                 if ui.button("Pull (fast-forward only)").clicked() {
-                                    start_pull = Some((h.clone(), crate::git::PullStrategy::FastForwardOnly));
+                                    start_pull = Some((
+                                        remote.clone(),
+                                        branch.clone(),
+                                        crate::git::PullStrategy::FastForwardOnly,
+                                    ));
                                     ui.close_menu();
                                 }
                             }
@@ -343,8 +357,8 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             app.start_push(&default_remote, &branch, false);
         }
     }
-    if let Some((branch, strategy)) = start_pull {
-        app.start_pull(&default_remote, &branch, strategy);
+    if let Some((remote, branch, strategy)) = start_pull {
+        app.start_pull(&remote, &branch, strategy);
     }
     if open_pr {
         app.open_pull_request_modal();

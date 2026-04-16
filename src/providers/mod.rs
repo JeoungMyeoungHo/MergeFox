@@ -104,6 +104,27 @@ pub trait Provider: Send + Sync {
         })
     }
 
+    /// List repository owners that this account can publish under.
+    ///
+    /// Usually includes the authenticated user plus organizations.
+    fn list_repository_owners<'a>(
+        &'a self,
+        _client: &'a Client,
+        _token: &'a SecretString,
+    ) -> BoxFuture<'a, ProviderResult<Vec<RemoteRepoOwner>>> {
+        Box::pin(async move { Err(ProviderError::NotImplemented("list_repository_owners")) })
+    }
+
+    /// Create a hosted repository on behalf of the connected account.
+    fn create_repository<'a>(
+        &'a self,
+        _client: &'a Client,
+        _token: &'a SecretString,
+        _req: &'a CreateRepositoryDraft,
+    ) -> BoxFuture<'a, ProviderResult<CreatedRepositoryRef>> {
+        Box::pin(async move { Err(ProviderError::NotImplemented("create_repository")) })
+    }
+
     fn create_pull_request<'a>(
         &'a self,
         _client: &'a Client,

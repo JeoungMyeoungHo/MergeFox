@@ -1,5 +1,7 @@
 use crate::actions::{CommitAction, ResetMode};
-use crate::app::{MergeFoxApp, SelectedFileView, View};
+use crate::app::{
+    default_remote_name, tracked_upstream_for_branch, MergeFoxApp, SelectedFileView, View,
+};
 use crate::config::Config;
 use crate::git::GraphScope;
 use crate::journal::{self, Operation};
@@ -659,22 +661,58 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
                 .as_ref()
                 .map(|c| c.remotes.clone())
                 .unwrap_or_default();
-            out.prompt = Some(prompt::set_upstream_prompt(branch, remotes));
+            let current_upstream = ws
+                .repo_ui_cache
+                .as_ref()
+                .and_then(|c| {
+                    c.branches
+                        .iter()
+                        .find(|b| !b.is_remote && b.name == branch)
+                        .and_then(|b| b.upstream.clone())
+                });
+            let remote_branches = ws
+                .repo_ui_cache
+                .as_ref()
+                .map(|c| {
+                    c.branches
+                        .iter()
+                        .filter(|b| b.is_remote)
+                        .map(|b| b.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            out.prompt = Some(prompt::set_upstream_prompt(
+                branch,
+                remotes,
+                current_upstream,
+                remote_branches,
+            ));
         }
         CommitAction::AmendMessagePrompt => {
-            // Read HEAD commit message via git CLI.
-            let current = crate::git::cli::run_line(ws.repo.path(), ["log", "-1", "--format=%B"])
+            let current_author = match crate::git::ops::head_commit_author(ws.repo.path()) {
+                Ok(author) => author,
+                Err(_) => {
+                    out.error = Some("no commits to amend yet".to_string());
+                    return out;
+                }
+            };
+            let current = crate::git::cli::run(ws.repo.path(), ["log", "-1", "--format=%B"])
+                .map(|out| out.stdout_str().trim_end_matches('\n').to_string())
                 .unwrap_or_default();
-            out.prompt = Some(prompt::amend_message_prompt(current));
+            out.prompt = Some(prompt::amend_message_prompt(
+                current,
+                Some(current_author),
+            ));
         }
 
         // ---- background network ops ----
         CommitAction::Pull { branch } => {
-            // `default_remote` is the last use of `ws`; NLL releases the
-            // workspace borrow right after, so `app.start_pull` below works.
-            let remote = default_remote(ws, &app.config);
             let strategy = repo_prefs.pull_strategy.to_git();
-            app.start_pull(&remote, &branch, strategy);
+            if let Some((remote, upstream_branch)) = tracked_upstream_for_branch(ws, &branch) {
+                app.start_pull(&remote, &upstream_branch, strategy);
+            } else {
+                out.error = Some(format!("no upstream configured for `{branch}`"));
+            }
             return out;
         }
         CommitAction::Push { branch, force } => {
@@ -893,13 +931,32 @@ fn run_prompt(app: &mut MergeFoxApp, prompt: PendingPrompt) -> DispatchOutcome {
                 Err(e) => out.error = Some(format!("set upstream: {e:#}")),
             }
         }
-        PendingPrompt::AmendMessage { message, .. } => {
+        PendingPrompt::AmendMessage {
+            message,
+            current_author,
+            author_override,
+            author_name,
+            author_email,
+            ..
+        } => {
             let message = message.trim().to_string();
             if message.is_empty() {
                 return out;
             }
+            let author = if author_override {
+                match crate::git::ops::CommitAuthor::normalized(&author_name, &author_email) {
+                    Ok(author) if current_author.as_ref() == Some(&author) => None,
+                    Ok(author) => Some(author),
+                    Err(e) => {
+                        out.error = Some(format!("amend author: {e:#}"));
+                        return out;
+                    }
+                }
+            } else {
+                None
+            };
             let before = journal::capture(ws.repo.path()).ok();
-            match crate::git::ops::amend(ws.repo.path(), Some(&message)) {
+            match crate::git::ops::amend(ws.repo.path(), Some(&message), author.as_ref()) {
                 Ok(_) => {
                     if let (Some(b), Ok(a)) = (before, journal::capture(ws.repo.path())) {
                         out.journal_entry = Some((
@@ -1038,27 +1095,7 @@ fn run_prompt(app: &mut MergeFoxApp, prompt: PendingPrompt) -> DispatchOutcome {
 }
 
 fn default_remote(ws: &crate::app::WorkspaceState, config: &Config) -> String {
-    let settings = config.repo_settings_for(ws.repo.path());
-    // Pull remote list from the cached snapshot. `repo.remotes()` is
-    // relatively cheap on its own but this function is called from
-    // op-dispatch paths that already allocate + clone; staying
-    // cache-consistent with the top bar avoids the occasional mismatch
-    // where the sidebar and top-bar disagreed for one frame after an
-    // `add remote` op.
-    let remotes: Vec<String> = ws
-        .repo_ui_cache
-        .as_ref()
-        .map(|c| c.remotes.clone())
-        .unwrap_or_default();
-    if let Some(preferred) = settings.default_remote {
-        if remotes.iter().any(|name| *name == preferred) {
-            return preferred;
-        }
-    }
-    remotes
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| "origin".to_string())
+    default_remote_name(ws, config)
 }
 
 fn short_sha(oid: &gix::ObjectId) -> String {

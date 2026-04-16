@@ -10,6 +10,7 @@ pub mod hud;
 pub mod icon;
 pub mod main_panel;
 pub mod panic_recovery;
+pub mod publish_remote;
 pub mod prompt;
 pub mod rebase;
 pub mod reflog;
