@@ -19,7 +19,7 @@
 //!   |  [Cancel]                  [Amend last]  [Commit staged ▸]  |
 //!   +--------------------------------------------------------------+
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use egui::{Color32, RichText};
 
@@ -90,6 +90,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     // e.g. just got committed in another pane) so the selection counter
     // stays honest.
     let commit_modal = app.commit_modal.get_or_insert_with(CommitModal::default);
+    sync_amend_author_state(commit_modal, ws.repo.path());
     let valid_paths: std::collections::BTreeSet<PathBuf> =
         entries.iter().map(|e| e.path.clone()).collect();
     commit_modal.selection.retain(|p| valid_paths.contains(p));
@@ -160,6 +161,32 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             }
 
             ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            ui.label(RichText::new("Amend author").strong());
+            if commit_modal.amend_head_available {
+                ui.weak(format!(
+                    "Current HEAD author: {} <{}>",
+                    commit_modal.amend_head_author_name, commit_modal.amend_head_author_email
+                ));
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut commit_modal.amend_author_override,
+                    "Change author when amending",
+                );
+                if commit_modal.amend_author_override {
+                    ui.add_space(4.0);
+                    ui.label("Author name:");
+                    ui.text_edit_singleline(&mut commit_modal.amend_author_name);
+                    ui.label("Author email:");
+                    ui.text_edit_singleline(&mut commit_modal.amend_author_email);
+                }
+            } else {
+                ui.weak("No existing HEAD commit yet. Create the first commit before using Amend.");
+            }
+
+            ui.add_space(6.0);
 
             if let Some(err) = &commit_modal.last_error {
                 ui.colored_label(Color32::LIGHT_RED, err);
@@ -197,14 +224,30 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let msg_ok = !commit_modal.message.trim().is_empty();
                     let any_staged = staged_count > 0;
+                    let amend_author_ok = !commit_modal.amend_author_override
+                        || (!commit_modal.amend_author_name.trim().is_empty()
+                            && !commit_modal.amend_author_email.trim().is_empty());
+                    let can_amend = msg_ok && commit_modal.amend_head_available && amend_author_ok;
 
-                    ui.add_enabled_ui(msg_ok, |ui| {
+                    ui.add_enabled_ui(can_amend, |ui| {
                         if ui
                             .button("Amend last")
-                            .on_hover_text("Re-commit HEAD with the current staged tree + new message")
+                            .on_hover_text(
+                                "Re-commit HEAD with the current staged tree, message, and optional author change",
+                            )
                             .clicked()
                         {
-                            result = CommitIntent::Amend(commit_modal.message.clone());
+                            match amend_author_override(commit_modal) {
+                                Ok(author) => {
+                                    result = CommitIntent::Amend {
+                                        message: commit_modal.message.clone(),
+                                        author,
+                                    };
+                                }
+                                Err(err) => {
+                                    commit_modal.last_error = Some(err);
+                                }
+                            }
                         }
                     });
 
@@ -249,9 +292,15 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
     if !open {
         app.commit_modal_open = false;
+        if let Some(commit_modal) = app.commit_modal.as_mut() {
+            reset_amend_author_state(commit_modal);
+        }
     }
     if matches!(result, CommitIntent::Cancel) {
         app.commit_modal_open = false;
+        if let Some(commit_modal) = app.commit_modal.as_mut() {
+            reset_amend_author_state(commit_modal);
+        }
     }
 
     // Apply per-file move actions (stage / unstage) BEFORE handling
@@ -765,7 +814,10 @@ enum CommitIntent {
     CommitStaged(String),
     /// Convenience: stage every change, then commit.
     StageAllAndCommit(String),
-    Amend(String),
+    Amend {
+        message: String,
+        author: Option<crate::git::ops::CommitAuthor>,
+    },
     GenerateMessage,
 }
 
@@ -809,12 +861,12 @@ fn handle_commit_intent(app: &mut MergeFoxApp, intent: CommitIntent) {
                         },
                     )
                 }),
-            CommitIntent::Amend(msg) => {
-                crate::git::ops::amend(ws.repo.path(), Some(&msg)).map(|oid| {
+            CommitIntent::Amend { message, author } => {
+                crate::git::ops::amend(ws.repo.path(), Some(&message), author.as_ref()).map(|oid| {
                     (
                         format!("Amended {}", short(&oid)),
                         Operation::Commit {
-                            message: msg,
+                            message,
                             amended: true,
                         },
                     )
@@ -857,12 +909,58 @@ fn handle_commit_intent(app: &mut MergeFoxApp, intent: CommitIntent) {
             cm.ai_error = None;
             cm.selection.clear();
             cm.selection_anchor = None;
+            reset_amend_author_state(cm);
         }
     }
     if let Some(e) = err {
         if let Some(cm) = app.commit_modal.as_mut() {
             cm.last_error = Some(e);
         }
+    }
+}
+
+fn sync_amend_author_state(modal: &mut CommitModal, repo_path: &Path) {
+    if modal.amend_author_repo_path.as_deref() == Some(repo_path) {
+        return;
+    }
+    reset_amend_author_state(modal);
+    modal.amend_author_repo_path = Some(repo_path.to_path_buf());
+    if let Ok(author) = crate::git::ops::head_commit_author(repo_path) {
+        modal.amend_head_available = true;
+        modal.amend_head_author_name = author.name.clone();
+        modal.amend_head_author_email = author.email.clone();
+        modal.amend_author_name = author.name;
+        modal.amend_author_email = author.email;
+    }
+}
+
+fn reset_amend_author_state(modal: &mut CommitModal) {
+    modal.amend_author_repo_path = None;
+    modal.amend_head_available = false;
+    modal.amend_head_author_name.clear();
+    modal.amend_head_author_email.clear();
+    modal.amend_author_override = false;
+    modal.amend_author_name.clear();
+    modal.amend_author_email.clear();
+}
+
+fn amend_author_override(
+    modal: &CommitModal,
+) -> Result<Option<crate::git::ops::CommitAuthor>, String> {
+    if !modal.amend_author_override {
+        return Ok(None);
+    }
+    let author = crate::git::ops::CommitAuthor::normalized(
+        &modal.amend_author_name,
+        &modal.amend_author_email,
+    )
+    .map_err(|e| format!("amend author: {e:#}"))?;
+    let unchanged = modal.amend_head_author_name.trim() == author.name
+        && modal.amend_head_author_email.trim() == author.email;
+    if unchanged {
+        Ok(None)
+    } else {
+        Ok(Some(author))
     }
 }
 

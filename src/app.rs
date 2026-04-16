@@ -58,6 +58,8 @@ pub struct MergeFoxApp {
     pub settings_open: bool,
     /// Persistent in-window edits for the settings modal.
     pub settings_modal: Option<SettingsModal>,
+    /// Publish flow for "create hosted repo from this local checkout".
+    pub publish_remote_modal: Option<PublishRemoteModal>,
     /// Running "Test endpoint" probe from the AI settings section. Polled
     /// every frame while Settings is open; the handle is consumed once.
     pub ai_test_task:
@@ -108,6 +110,17 @@ pub struct CommitModal {
     /// Last clicked path used as the range-selection anchor for
     /// Shift-click in the commit dialog.
     pub selection_anchor: Option<std::path::PathBuf>,
+    /// Repo this amend-author snapshot was loaded from.
+    pub amend_author_repo_path: Option<std::path::PathBuf>,
+    /// Whether the active repo has a HEAD commit we can amend.
+    pub amend_head_available: bool,
+    /// Current HEAD author shown as the amend baseline.
+    pub amend_head_author_name: String,
+    pub amend_head_author_email: String,
+    /// Optional author override applied only to `git commit --amend`.
+    pub amend_author_override: bool,
+    pub amend_author_name: String,
+    pub amend_author_email: String,
 }
 
 pub struct SettingsModal {
@@ -143,6 +156,29 @@ pub struct SettingsModal {
     pub identity_global: bool,
     /// True once the initial read from git config has happened.
     pub identity_loaded: bool,
+}
+
+pub struct PublishRemoteModal {
+    pub repo_path: PathBuf,
+    pub branch: String,
+    pub selected_account: Option<providers::AccountId>,
+    pub owners: Vec<providers::RemoteRepoOwner>,
+    pub owners_task: Option<
+        providers::runtime::ProviderTask<
+            providers::ProviderResult<Vec<providers::RemoteRepoOwner>>,
+        >,
+    >,
+    pub create_task: Option<
+        providers::runtime::ProviderTask<
+            providers::ProviderResult<providers::CreatedRepositoryRef>,
+        >,
+    >,
+    pub selected_owner: Option<String>,
+    pub remote_name: String,
+    pub repository_name: String,
+    pub description: String,
+    pub private: bool,
+    pub last_error: Option<String>,
 }
 
 pub struct RemoteDraft {
@@ -241,6 +277,46 @@ pub struct CloneSizePrompt {
     pub shallow_depth: u32,
 }
 
+pub struct CreateRemoteRepoState {
+    pub open: bool,
+    pub owners: Vec<providers::RemoteRepoOwner>,
+    pub owners_task: Option<
+        providers::runtime::ProviderTask<
+            providers::ProviderResult<Vec<providers::RemoteRepoOwner>>,
+        >,
+    >,
+    pub create_task: Option<
+        providers::runtime::ProviderTask<
+            providers::ProviderResult<providers::CreatedRepositoryRef>,
+        >,
+    >,
+    pub selected_owner: Option<String>,
+    pub name: String,
+    pub description: String,
+    pub private: bool,
+    pub auto_init: bool,
+    pub last_error: Option<String>,
+    pub last_created: Option<providers::CreatedRepositoryRef>,
+}
+
+impl Default for CreateRemoteRepoState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            owners: Vec::new(),
+            owners_task: None,
+            create_task: None,
+            selected_owner: None,
+            name: String::new(),
+            description: String::new(),
+            private: true,
+            auto_init: false,
+            last_error: None,
+            last_created: None,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct RemoteRepoBrowserState {
     pub selected_account: Option<providers::AccountId>,
@@ -252,6 +328,7 @@ pub struct RemoteRepoBrowserState {
     >,
     pub last_error: Option<String>,
     pub loaded_once: bool,
+    pub create_repo: CreateRemoteRepoState,
 }
 
 pub struct WorkspaceState {
@@ -358,6 +435,9 @@ pub struct WorkspaceState {
     /// "Computing diff…" panel appeared. We now refresh this cache
     /// only on repo mutation (ops, rebuild_graph, tab open).
     pub repo_ui_cache: Option<RepoUiCache>,
+    /// Last time we polled `git status` for out-of-band working tree
+    /// changes (edits from another editor / generator / terminal).
+    pub last_working_tree_poll: Instant,
     /// Whether the working tree changes section is expanded in the main panel.
     /// When expanded, file list is shown inline above the graph.
     pub working_tree_expanded: bool,
@@ -385,6 +465,8 @@ pub struct RepoUiCache {
     /// How many commits HEAD is behind its upstream.
     pub behind: usize,
 }
+
+const WORKING_TREE_POLL_INTERVAL: Duration = Duration::from_millis(700);
 
 pub struct GraphTask {
     /// Scope this task is computing. Compared against `ws.graph_scope`
@@ -691,6 +773,7 @@ impl MergeFoxApp {
             reflog_open: false,
             settings_open: false,
             settings_modal: None,
+            publish_remote_modal: None,
             ai_test_task: None,
             provider_oauth_start_task: None,
             provider_oauth_poll_task: None,
@@ -944,6 +1027,7 @@ impl MergeFoxApp {
             diff_cache: DiffCache::default(),
             graph_task: None,
             repo_ui_cache: None,
+            last_working_tree_poll: Instant::now(),
             working_tree_expanded: false,
             selected_working_file: None,
             working_file_diff: None,
@@ -1138,6 +1222,7 @@ impl MergeFoxApp {
             .list_remotes()
             .unwrap_or_default()
             .into_iter()
+            .filter(|remote| remote.fetch_url.is_some() || remote.push_url.is_some())
             .map(|r| r.name)
             .collect::<Vec<_>>();
         // ahead/behind: `git rev-list --count --left-right HEAD...@{upstream}`
@@ -1170,6 +1255,51 @@ impl MergeFoxApp {
             ahead,
             behind,
         });
+        ws.last_working_tree_poll = Instant::now();
+    }
+
+    /// Poll `git status` on a low-frequency timer so out-of-band edits
+    /// (editor save, codegen, terminal commands) update the cached
+    /// working-tree counters without requiring a manual refresh.
+    fn poll_working_tree_changes(&mut self) {
+        let View::Workspace(tabs) = &mut self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+
+        let ws = tabs.current_mut();
+        if ws.last_working_tree_poll.elapsed() < WORKING_TREE_POLL_INTERVAL {
+            return;
+        }
+        ws.last_working_tree_poll = Instant::now();
+
+        let Ok(working) = crate::git::ops::status_entries(ws.repo.path()) else {
+            return;
+        };
+        let Some(cache) = ws.repo_ui_cache.as_mut() else {
+            return;
+        };
+        if cache.working.as_ref() == Some(&working) {
+            return;
+        }
+
+        cache.working = Some(working.clone());
+
+        if let Some(selected_path) = ws.selected_working_file.clone() {
+            let still_present = working.iter().any(|entry| entry.path == selected_path);
+            if still_present {
+                // Force diff/image recomputation for the next paint so
+                // the detail pane reflects the updated file contents.
+                ws.working_file_diff = None;
+                ws.set_image_cache(None);
+            } else {
+                ws.selected_working_file = None;
+                ws.working_file_diff = None;
+                ws.set_image_cache(None);
+            }
+        }
     }
 
     pub fn go_home(&mut self) {
@@ -1273,9 +1403,11 @@ impl MergeFoxApp {
     }
 
     pub fn remote_repo_refresh_in_progress(&self) -> bool {
-        self.background_welcome_state()
-            .and_then(|state| state.remote_repos.task.as_ref())
-            .is_some()
+        self.background_welcome_state().is_some_and(|state| {
+            state.remote_repos.task.is_some()
+                || state.remote_repos.create_repo.owners_task.is_some()
+                || state.remote_repos.create_repo.create_task.is_some()
+        })
     }
 
     pub fn poll_clone_jobs(&mut self) {
@@ -1324,6 +1456,144 @@ impl MergeFoxApp {
             .collect()
     }
 
+    pub fn open_publish_remote_modal(&mut self, branch: Option<String>) {
+        let (repo_path, branch, repository_name, preferred_account) = {
+            let View::Workspace(tabs) = &self.view else {
+                return;
+            };
+            if tabs.launcher_active {
+                return;
+            }
+            let ws = tabs.current();
+            let branch = match branch.or_else(|| ws.repo.head_name()) {
+                Some(branch) => branch,
+                None => {
+                    self.last_error =
+                        Some("check out a local branch before publishing".to_string());
+                    return;
+                }
+            };
+            let repo_path = ws.repo.path().to_path_buf();
+            let repository_name = repo_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| "repository".to_string());
+            let preferred_account = self.config.repo_settings_for(ws.repo.path()).provider_account;
+            (repo_path, branch, repository_name, preferred_account)
+        };
+
+        let connected_accounts = self.repo_browser_accounts();
+        let selected_account = preferred_account
+            .as_deref()
+            .and_then(|slug| {
+                connected_accounts
+                    .iter()
+                    .find(|account| account.id.slug() == slug)
+                    .map(|account| account.id.clone())
+            })
+            .or_else(|| connected_accounts.first().map(|account| account.id.clone()));
+
+        self.publish_remote_modal = Some(PublishRemoteModal {
+            repo_path,
+            branch,
+            selected_account: selected_account.clone(),
+            owners: Vec::new(),
+            owners_task: None,
+            create_task: None,
+            selected_owner: None,
+            remote_name: "origin".to_string(),
+            repository_name,
+            description: String::new(),
+            private: true,
+            last_error: None,
+        });
+
+        if let Some(account_id) = selected_account {
+            if let Some(account) = connected_accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .cloned()
+            {
+                self.load_publish_remote_owners(&account);
+            }
+        }
+    }
+
+    pub fn load_publish_remote_owners(&mut self, account: &providers::ProviderAccount) {
+        let token = match providers::pat::load_pat(&account.id) {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                if let Some(modal) = self.publish_remote_modal.as_mut() {
+                    modal.owners_task = None;
+                    modal.owners.clear();
+                    modal.last_error =
+                        Some("account token is missing from the OS keychain".to_string());
+                }
+                return;
+            }
+            Err(err) => {
+                if let Some(modal) = self.publish_remote_modal.as_mut() {
+                    modal.owners_task = None;
+                    modal.owners.clear();
+                    modal.last_error = Some(format!("keyring: {err:#}"));
+                }
+                return;
+            }
+        };
+
+        let kind = account.id.kind.clone();
+        let client = providers::default_http_client();
+        let task = providers::runtime::ProviderTask::spawn(async move {
+            let provider = providers::build(&kind).await;
+            provider.list_repository_owners(&client, &token).await
+        });
+
+        if let Some(modal) = self.publish_remote_modal.as_mut() {
+            modal.selected_account = Some(account.id.clone());
+            modal.owners_task = Some(task);
+            modal.last_error = None;
+        }
+    }
+
+    pub fn create_publish_remote(
+        &mut self,
+        account: &providers::ProviderAccount,
+        draft: providers::CreateRepositoryDraft,
+    ) {
+        let token = match providers::pat::load_pat(&account.id) {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                if let Some(modal) = self.publish_remote_modal.as_mut() {
+                    modal.create_task = None;
+                    modal.last_error =
+                        Some("account token is missing from the OS keychain".to_string());
+                }
+                return;
+            }
+            Err(err) => {
+                if let Some(modal) = self.publish_remote_modal.as_mut() {
+                    modal.create_task = None;
+                    modal.last_error = Some(format!("keyring: {err:#}"));
+                }
+                return;
+            }
+        };
+
+        let kind = account.id.kind.clone();
+        let client = providers::default_http_client();
+        let task = providers::runtime::ProviderTask::spawn(async move {
+            let provider = providers::build(&kind).await;
+            provider.create_repository(&client, &token, &draft).await
+        });
+
+        if let Some(modal) = self.publish_remote_modal.as_mut() {
+            modal.selected_account = Some(account.id.clone());
+            modal.create_task = Some(task);
+            modal.last_error = None;
+        }
+    }
+
     pub fn refresh_remote_repositories(&mut self, account: &providers::ProviderAccount) {
         let token = match providers::pat::load_pat(&account.id) {
             Ok(Some(token)) => token,
@@ -1364,7 +1634,91 @@ impl MergeFoxApp {
         }
     }
 
+    pub fn load_remote_repo_owners(&mut self, account: &providers::ProviderAccount) {
+        let token = match providers::pat::load_pat(&account.id) {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                if let Some(state) = self.background_welcome_state_mut() {
+                    state.remote_repos.create_repo.owners_task = None;
+                    state.remote_repos.create_repo.owners.clear();
+                    state.remote_repos.create_repo.last_error =
+                        Some("account token is missing from the OS keychain".to_string());
+                }
+                return;
+            }
+            Err(err) => {
+                if let Some(state) = self.background_welcome_state_mut() {
+                    state.remote_repos.create_repo.owners_task = None;
+                    state.remote_repos.create_repo.owners.clear();
+                    state.remote_repos.create_repo.last_error =
+                        Some(format!("keyring: {err:#}"));
+                }
+                return;
+            }
+        };
+
+        let kind = account.id.kind.clone();
+        let client = providers::default_http_client();
+        let task = providers::runtime::ProviderTask::spawn(async move {
+            let provider = providers::build(&kind).await;
+            provider.list_repository_owners(&client, &token).await
+        });
+
+        if let Some(state) = self.background_welcome_state_mut() {
+            state.remote_repos.selected_account = Some(account.id.clone());
+            state.remote_repos.create_repo.owners_task = Some(task);
+            state.remote_repos.create_repo.last_error = None;
+            state.remote_repos.create_repo.last_created = None;
+        }
+    }
+
+    pub fn create_remote_repository(
+        &mut self,
+        account: &providers::ProviderAccount,
+        draft: providers::CreateRepositoryDraft,
+    ) {
+        let token = match providers::pat::load_pat(&account.id) {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                if let Some(state) = self.background_welcome_state_mut() {
+                    state.remote_repos.create_repo.create_task = None;
+                    state.remote_repos.create_repo.last_error =
+                        Some("account token is missing from the OS keychain".to_string());
+                }
+                return;
+            }
+            Err(err) => {
+                if let Some(state) = self.background_welcome_state_mut() {
+                    state.remote_repos.create_repo.create_task = None;
+                    state.remote_repos.create_repo.last_error =
+                        Some(format!("keyring: {err:#}"));
+                }
+                return;
+            }
+        };
+
+        let kind = account.id.kind.clone();
+        let client = providers::default_http_client();
+        let task = providers::runtime::ProviderTask::spawn(async move {
+            let provider = providers::build(&kind).await;
+            provider.create_repository(&client, &token, &draft).await
+        });
+
+        if let Some(state) = self.background_welcome_state_mut() {
+            state.remote_repos.selected_account = Some(account.id.clone());
+            state.remote_repos.create_repo.create_task = Some(task);
+            state.remote_repos.create_repo.last_error = None;
+            state.remote_repos.create_repo.last_created = None;
+        }
+    }
+
     pub fn poll_remote_repo_jobs(&mut self) {
+        self.poll_remote_repo_list_task();
+        self.poll_remote_repo_owner_task();
+        self.poll_remote_repo_create_task();
+    }
+
+    fn poll_remote_repo_list_task(&mut self) {
         let result = {
             let Some(state) = self.background_welcome_state_mut() else {
                 return;
@@ -1394,6 +1748,254 @@ impl MergeFoxApp {
                 Err(err) => {
                     state.remote_repos.repos.clear();
                     state.remote_repos.last_error = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    fn poll_remote_repo_owner_task(&mut self) {
+        let result = {
+            let Some(state) = self.background_welcome_state_mut() else {
+                return;
+            };
+            let result = state
+                .remote_repos
+                .create_repo
+                .owners_task
+                .as_mut()
+                .and_then(|task| task.poll());
+            if result.is_some() {
+                state.remote_repos.create_repo.owners_task = None;
+            }
+            result
+        };
+
+        let Some(result) = result else {
+            return;
+        };
+
+        if let Some(state) = self.background_welcome_state_mut() {
+            match result {
+                Ok(owners) => {
+                    let selected = state.remote_repos.create_repo.selected_owner.clone();
+                    state.remote_repos.create_repo.owners = owners;
+                    let selected_still_exists = selected.as_ref().is_some_and(|login| {
+                        state
+                            .remote_repos
+                            .create_repo
+                            .owners
+                            .iter()
+                            .any(|owner| owner.login == *login)
+                    });
+                    if !selected_still_exists {
+                        state.remote_repos.create_repo.selected_owner = state
+                            .remote_repos
+                            .create_repo
+                            .owners
+                            .first()
+                            .map(|owner| owner.login.clone());
+                    }
+                    state.remote_repos.create_repo.last_error = None;
+                }
+                Err(err) => {
+                    state.remote_repos.create_repo.owners.clear();
+                    state.remote_repos.create_repo.last_error = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    fn poll_remote_repo_create_task(&mut self) {
+        let result = {
+            let Some(state) = self.background_welcome_state_mut() else {
+                return;
+            };
+            let result = state
+                .remote_repos
+                .create_repo
+                .create_task
+                .as_mut()
+                .and_then(|task| task.poll());
+            if result.is_some() {
+                state.remote_repos.create_repo.create_task = None;
+            }
+            result
+        };
+
+        let Some(result) = result else {
+            return;
+        };
+
+        let mut refresh_account = None;
+        match result {
+            Ok(created) => {
+                if let Some(state) = self.background_welcome_state_mut() {
+                    state.remote_repos.loaded_once = true;
+                    if !state
+                        .remote_repos
+                        .repos
+                        .iter()
+                        .any(|repo| repo.owner == created.owner && repo.repo == created.repo)
+                    {
+                        state.remote_repos.repos.insert(
+                            0,
+                            providers::RemoteRepoSummary {
+                                owner: created.owner.clone(),
+                                repo: created.repo.clone(),
+                                description: created.description.clone(),
+                                default_branch: created.default_branch.clone(),
+                                private: created.private,
+                                clone_https: created.clone_https.clone(),
+                                clone_ssh: created.clone_ssh.clone(),
+                                web_url: created.web_url.clone(),
+                            },
+                        );
+                    }
+                    state.remote_repos.create_repo.name.clear();
+                    state.remote_repos.create_repo.description.clear();
+                    state.remote_repos.create_repo.selected_owner = Some(created.owner.clone());
+                    state.remote_repos.create_repo.last_error = None;
+                    state.remote_repos.create_repo.last_created = Some(created.clone());
+                    refresh_account = state.remote_repos.selected_account.clone();
+                }
+                self.hud = Some(Hud::new(
+                    format!("Created {}/{}", created.owner, created.repo),
+                    1800,
+                ));
+            }
+            Err(err) => {
+                if let Some(state) = self.background_welcome_state_mut() {
+                    state.remote_repos.create_repo.last_error = Some(err.to_string());
+                }
+                return;
+            }
+        }
+
+        let account = refresh_account.and_then(|account_id| {
+            self.config
+                .provider_accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .cloned()
+        });
+        if let Some(account) = account {
+            self.refresh_remote_repositories(&account);
+        }
+    }
+
+    fn poll_publish_remote_modal_tasks(&mut self) {
+        self.poll_publish_remote_owner_task();
+        self.poll_publish_remote_create_task();
+    }
+
+    fn poll_publish_remote_owner_task(&mut self) {
+        let result = {
+            let Some(modal) = self.publish_remote_modal.as_mut() else {
+                return;
+            };
+            let result = modal.owners_task.as_mut().and_then(|task| task.poll());
+            if result.is_some() {
+                modal.owners_task = None;
+            }
+            result
+        };
+
+        let Some(result) = result else {
+            return;
+        };
+
+        if let Some(modal) = self.publish_remote_modal.as_mut() {
+            match result {
+                Ok(owners) => {
+                    let selected = modal.selected_owner.clone();
+                    modal.owners = owners;
+                    let selected_still_exists = selected.as_ref().is_some_and(|login| {
+                        modal.owners.iter().any(|owner| owner.login == *login)
+                    });
+                    if !selected_still_exists {
+                        modal.selected_owner =
+                            modal.owners.first().map(|owner| owner.login.clone());
+                    }
+                    modal.last_error = None;
+                }
+                Err(err) => {
+                    modal.owners.clear();
+                    modal.last_error = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    fn poll_publish_remote_create_task(&mut self) {
+        let (result, repo_path, branch, remote_name, account_slug) = {
+            let Some(modal) = self.publish_remote_modal.as_mut() else {
+                return;
+            };
+            let result = modal.create_task.as_mut().and_then(|task| task.poll());
+            if result.is_some() {
+                modal.create_task = None;
+            }
+            (
+                result,
+                modal.repo_path.clone(),
+                modal.branch.clone(),
+                modal.remote_name.trim().to_string(),
+                modal.selected_account.as_ref().map(|account| account.slug()),
+            )
+        };
+
+        let Some(result) = result else {
+            return;
+        };
+
+        match result {
+            Ok(created) => {
+                let remote_result = (|| -> anyhow::Result<()> {
+                    let Some(ws) = self.workspace_by_path_mut(&repo_path) else {
+                        anyhow::bail!("repository is no longer open");
+                    };
+                    let remote_exists = ws
+                        .repo
+                        .list_remotes()
+                        .ok()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|remote| remote.name == remote_name);
+                    if remote_exists {
+                        ws.repo
+                            .update_remote_urls(&remote_name, &created.clone_https, None)?;
+                    } else {
+                        ws.repo
+                            .add_remote(&remote_name, &created.clone_https, None)?;
+                    }
+                    Ok(())
+                })();
+
+                if let Err(err) = remote_result {
+                    if let Some(modal) = self.publish_remote_modal.as_mut() {
+                        modal.last_error = Some(format!(
+                            "remote repo was created, but adding local remote failed: {err:#}"
+                        ));
+                    }
+                    return;
+                }
+
+                let mut settings = self.config.repo_settings_for(&repo_path);
+                settings.default_remote = Some(remote_name.clone());
+                settings.provider_account = account_slug;
+                self.config.set_repo_settings(&repo_path, settings);
+                let _ = self.config.save();
+
+                self.publish_remote_modal = None;
+                self.start_push_for_repo_path(&repo_path, &remote_name, &branch, false, true);
+                self.hud = Some(Hud::new(
+                    format!("Created {}/{} — publishing {branch}", created.owner, created.repo),
+                    2200,
+                ));
+            }
+            Err(err) => {
+                if let Some(modal) = self.publish_remote_modal.as_mut() {
+                    modal.last_error = Some(err.to_string());
                 }
             }
         }
@@ -2608,12 +3210,45 @@ impl MergeFoxApp {
     }
 
     pub fn start_push(&mut self, remote: &str, branch: &str, force: bool) {
+        self.start_push_with_options(remote, branch, force, false);
+    }
+
+    pub fn start_push_for_repo_path(
+        &mut self,
+        repo_path: &Path,
+        remote: &str,
+        branch: &str,
+        force: bool,
+        set_upstream: bool,
+    ) {
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let credentials = self.resolve_https_credentials_for_repo_path(repo_path, remote);
+        self.start_job_for_repo_path(
+            repo_path,
+            GitJobKind::Push {
+                remote: remote.to_string(),
+                refspec,
+                force,
+                set_upstream,
+                credentials,
+            },
+        );
+    }
+
+    fn start_push_with_options(
+        &mut self,
+        remote: &str,
+        branch: &str,
+        force: bool,
+        set_upstream: bool,
+    ) {
         let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
         let credentials = self.resolve_https_credentials(remote);
         self.start_job(GitJobKind::Push {
             remote: remote.to_string(),
             refspec,
             force,
+            set_upstream,
             credentials,
         });
     }
@@ -2655,18 +3290,31 @@ impl MergeFoxApp {
             }
             _ => return None,
         };
+        self.resolve_https_credentials_for_repo_path(&repo_path, remote)
+    }
 
+    fn resolve_https_credentials_for_repo_path(
+        &self,
+        repo_path: &Path,
+        remote: &str,
+    ) -> Option<crate::git::jobs::HttpsCredentials> {
         // 2. Ask git for the URL. This is a tiny synchronous subprocess,
         //    but we only do it on the user's explicit push/pull/fetch
         //    click (not per frame), so the cost is fine.
-        let url = crate::git::cli::run_line(&repo_path, ["remote", "get-url", remote]).ok()?;
+        let url = crate::git::cli::run_line(repo_path, ["remote", "get-url", remote]).ok()?;
 
         // 3. Parse the host. SSH / file / relative URLs → None.
         let host = remote_host(&url)?;
+        let remote_owner = crate::git_url::parse(&url).map(|parsed| parsed.owner);
 
         // 4. Find the right account. Priority:
         //    a) Per-repo explicit selection (Settings → Repository → Account)
-        //    b) First connected account whose provider kind matches the host
+        //    b) A single connected account whose provider kind matches the host
+        //    c) For multi-account hosts, one whose username matches the remote owner
+        //
+        //    If multiple host matches remain ambiguous, fall back to the
+        //    user's normal git credential flow instead of injecting a
+        //    potentially wrong token for the wrong account.
         let repo_settings = self.config.repo_settings_for(&repo_path);
         let account = if let Some(slug) = &repo_settings.provider_account {
             // Explicit per-repo override — find by slug.
@@ -2675,15 +3323,12 @@ impl MergeFoxApp {
                 .iter()
                 .find(|acc| acc.id.slug() == *slug)
         } else {
-            None
-        }
-        .or_else(|| {
-            // Auto-detect by host — picks the first matching account.
-            self.config
-                .provider_accounts
-                .iter()
-                .find(|acc| provider_matches_host(&acc.id.kind, &host))
-        })?;
+            select_auto_provider_account(
+                &self.config.provider_accounts,
+                &host,
+                remote_owner.as_deref(),
+            )
+        }?;
 
         // 5. Pull the token from the secret store (OS keychain or the
         //    file fallback).
@@ -2708,10 +3353,18 @@ impl MergeFoxApp {
     }
 
     fn start_job(&mut self, kind: GitJobKind) {
-        let View::Workspace(tabs) = &mut self.view else {
+        let repo_path = match &self.view {
+            View::Workspace(tabs) if !tabs.launcher_active => tabs.current().repo.path().to_path_buf(),
+            _ => return,
+        };
+        self.start_job_for_repo_path(&repo_path, kind);
+    }
+
+    fn start_job_for_repo_path(&mut self, repo_path: &Path, kind: GitJobKind) {
+        let Some(ws) = self.workspace_by_path_mut(repo_path) else {
+            self.last_error = Some(format!("repository not open: {}", repo_path.display()));
             return;
         };
-        let ws = tabs.current_mut();
         if ws.active_job.is_some() {
             self.last_error = Some("another git job is already running".into());
             return;
@@ -3250,6 +3903,7 @@ impl eframe::App for MergeFoxApp {
         self.poll_opening_repo();
         self.poll_clone_jobs();
         self.poll_remote_repo_jobs();
+        self.poll_publish_remote_modal_tasks();
         self.poll_active_job();
         self.poll_forge_tasks();
         self.poll_lfs_scan();
@@ -3257,6 +3911,7 @@ impl eframe::App for MergeFoxApp {
         self.poll_diff_tasks();
         self.poll_graph_tasks();
         self.drain_image_evictions(ctx);
+        self.poll_working_tree_changes();
 
         match &mut self.view {
             View::Welcome(_) => ui::welcome::show(ctx, self),
@@ -3282,6 +3937,7 @@ impl eframe::App for MergeFoxApp {
         ui::activity_log::show(ctx, self);
         ui::reflog::show(ctx, self);
         ui::settings::show(ctx, self);
+        ui::publish_remote::show(ctx, self);
         ui::forge::show(ctx, self);
         ui::rebase::show(ctx, self);
         ui::conflicts::show(ctx, self);
@@ -3298,6 +3954,11 @@ impl eframe::App for MergeFoxApp {
         if self.remote_repo_refresh_in_progress() {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
+        if self.publish_remote_modal.as_ref().is_some_and(|modal| {
+            modal.owners_task.is_some() || modal.create_task.is_some()
+        }) {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
         if self.forge_refresh_task.is_some()
             || self.forge_create_pr_task.is_some()
             || self.forge_create_issue_task.is_some()
@@ -3306,6 +3967,7 @@ impl eframe::App for MergeFoxApp {
         }
         if let View::Workspace(tabs) = &self.view {
             let ws = tabs.current();
+            ctx.request_repaint_after(WORKING_TREE_POLL_INTERVAL);
             if ws.active_job.is_some() {
                 ctx.request_repaint_after(Duration::from_millis(120));
             }
@@ -3511,5 +4173,187 @@ fn provider_matches_host(kind: &crate::providers::ProviderKind, host: &str) -> b
                 .unwrap_or(false)
         }
         ProviderKind::Generic { host: h } => h.to_ascii_lowercase() == host,
+    }
+}
+
+pub fn default_remote_name(ws: &WorkspaceState, config: &Config) -> String {
+    let settings = config.repo_settings_for(ws.repo.path());
+    let remotes: Vec<String> = ws
+        .repo_ui_cache
+        .as_ref()
+        .map(|c| c.remotes.clone())
+        .unwrap_or_default();
+    let upstream_remote = head_upstream(ws).map(|(remote, _branch)| remote);
+    select_default_remote_name(
+        settings.default_remote.as_deref(),
+        upstream_remote.as_deref(),
+        &remotes,
+    )
+    .unwrap_or_else(|| "origin".to_string())
+}
+
+pub fn tracked_upstream_for_branch(
+    ws: &WorkspaceState,
+    branch_name: &str,
+) -> Option<(String, String)> {
+    ws.repo_ui_cache
+        .as_ref()?
+        .branches
+        .iter()
+        .find(|branch| !branch.is_remote && branch.name == branch_name)
+        .and_then(|branch| branch.upstream.as_deref())
+        .and_then(parse_upstream_ref)
+}
+
+fn head_upstream(ws: &WorkspaceState) -> Option<(String, String)> {
+    ws.repo_ui_cache
+        .as_ref()?
+        .branches
+        .iter()
+        .find(|branch| branch.is_head && !branch.is_remote)
+        .and_then(|branch| parse_upstream_ref(branch.upstream.as_deref()?))
+}
+
+pub fn parse_upstream_ref(upstream: &str) -> Option<(String, String)> {
+    let (remote, branch) = upstream.split_once('/')?;
+    if remote.is_empty() || branch.is_empty() {
+        None
+    } else {
+        Some((remote.to_string(), branch.to_string()))
+    }
+}
+
+fn upstream_remote_name(upstream: &str) -> Option<&str> {
+    let (remote, _branch) = upstream.split_once('/')?;
+    if remote.is_empty() {
+        None
+    } else {
+        Some(remote)
+    }
+}
+
+fn select_default_remote_name(
+    preferred_remote: Option<&str>,
+    upstream_remote: Option<&str>,
+    remotes: &[String],
+) -> Option<String> {
+    preferred_remote
+        .filter(|preferred| remotes.iter().any(|name| name == preferred))
+        .map(str::to_string)
+        .or_else(|| {
+            upstream_remote
+                .filter(|upstream| remotes.iter().any(|name| name == upstream))
+                .map(str::to_string)
+        })
+        .or_else(|| remotes.first().cloned())
+}
+
+fn select_auto_provider_account<'a>(
+    accounts: &'a [crate::providers::ProviderAccount],
+    host: &str,
+    remote_owner: Option<&str>,
+) -> Option<&'a crate::providers::ProviderAccount> {
+    let mut host_matches = accounts
+        .iter()
+        .filter(|acc| provider_matches_host(&acc.id.kind, host));
+    let first = host_matches.next()?;
+    let second = host_matches.next();
+    if second.is_none() {
+        return Some(first);
+    }
+
+    let remote_owner = remote_owner?;
+    accounts
+        .iter()
+        .filter(|acc| provider_matches_host(&acc.id.kind, host))
+        .find(|acc| acc.id.username.eq_ignore_ascii_case(remote_owner))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        provider_matches_host, remote_host, select_auto_provider_account,
+        select_default_remote_name, upstream_remote_name,
+    };
+    use crate::providers::{AccountId, AuthMethod, ProviderAccount, ProviderKind};
+
+    fn github_account(username: &str) -> ProviderAccount {
+        ProviderAccount {
+            id: AccountId {
+                kind: ProviderKind::GitHub,
+                username: username.to_string(),
+            },
+            display_name: username.to_string(),
+            avatar_url: None,
+            method: AuthMethod::OAuth,
+            created_unix: 0,
+        }
+    }
+
+    #[test]
+    fn remote_host_parses_https_host() {
+        assert_eq!(
+            remote_host("https://github.com/openai/example.git").as_deref(),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn provider_matches_github_host() {
+        assert!(provider_matches_host(&ProviderKind::GitHub, "github.com"));
+        assert!(!provider_matches_host(&ProviderKind::GitHub, "gitlab.com"));
+    }
+
+    #[test]
+    fn auto_provider_selects_single_host_match() {
+        let accounts = vec![github_account("alice")];
+        let selected = select_auto_provider_account(&accounts, "github.com", None)
+            .map(|acc| acc.id.username.as_str());
+        assert_eq!(selected, Some("alice"));
+    }
+
+    #[test]
+    fn auto_provider_prefers_remote_owner_when_multiple_accounts_exist() {
+        let accounts = vec![github_account("alice"), github_account("bob")];
+        let selected = select_auto_provider_account(&accounts, "github.com", Some("bob"))
+            .map(|acc| acc.id.username.as_str());
+        assert_eq!(selected, Some("bob"));
+    }
+
+    #[test]
+    fn auto_provider_returns_none_when_multiple_accounts_are_ambiguous() {
+        let accounts = vec![github_account("alice"), github_account("bob")];
+        assert!(select_auto_provider_account(&accounts, "github.com", Some("org-name")).is_none());
+        assert!(select_auto_provider_account(&accounts, "github.com", None).is_none());
+    }
+
+    #[test]
+    fn upstream_remote_name_extracts_remote() {
+        assert_eq!(upstream_remote_name("tradeosx/main"), Some("tradeosx"));
+        assert_eq!(upstream_remote_name("origin/feature/foo"), Some("origin"));
+        assert_eq!(upstream_remote_name("main"), None);
+    }
+
+    #[test]
+    fn default_remote_prefers_explicit_setting_when_usable() {
+        let remotes = vec!["tradeosx".to_string(), "backup".to_string()];
+        let selected =
+            select_default_remote_name(Some("backup"), Some("tradeosx"), &remotes);
+        assert_eq!(selected.as_deref(), Some("backup"));
+    }
+
+    #[test]
+    fn default_remote_falls_back_to_upstream_before_first_remote() {
+        let remotes = vec!["backup".to_string(), "tradeosx".to_string()];
+        let selected = select_default_remote_name(None, Some("tradeosx"), &remotes);
+        assert_eq!(selected.as_deref(), Some("tradeosx"));
+    }
+
+    #[test]
+    fn default_remote_ignores_missing_preference_and_uses_first_available() {
+        let remotes = vec!["tradeosx".to_string()];
+        let selected =
+            select_default_remote_name(Some("origin"), Some("origin"), &remotes);
+        assert_eq!(selected.as_deref(), Some("tradeosx"));
     }
 }

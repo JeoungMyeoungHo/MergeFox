@@ -6,7 +6,10 @@ use crate::app::{CloneSizePrompt, MergeFoxApp};
 use crate::clone::{self, Stage};
 use crate::config::{CloneSizePolicy, UiLanguage};
 use crate::git_url;
-use crate::providers::{self, AccountId, ProviderAccount, RemoteRepoSummary};
+use crate::providers::{
+    self, AccountId, CreateRepositoryDraft, ProviderAccount, RemoteRepoOwner,
+    RemoteRepoOwnerKind, RemoteRepoSummary,
+};
 
 /// What the user asked us to do while drawing this frame. We defer
 /// execution until after the UI closure so we're not mutating `app`
@@ -27,6 +30,8 @@ struct Intent {
     clone_decision: Option<CloneDecision>,
     open_settings: bool,
     refresh_remote_repos: Option<AccountId>,
+    load_remote_repo_owners: Option<AccountId>,
+    create_remote_repo: Option<(AccountId, CreateRepositoryDraft)>,
 }
 
 #[derive(Debug)]
@@ -70,6 +75,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             state.remote_repos.repos.clear();
             state.remote_repos.last_error = None;
             state.remote_repos.loaded_once = false;
+            state.remote_repos.create_repo = crate::app::CreateRemoteRepoState::default();
         }
         if state.remote_repos.task.is_none() && !state.remote_repos.loaded_once {
             if let Some(account_id) = state.remote_repos.selected_account.clone() {
@@ -195,6 +201,24 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             .cloned()
         {
             app.refresh_remote_repositories(&account);
+        }
+    }
+    if let Some(account_id) = intent.load_remote_repo_owners {
+        if let Some(account) = connected_accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .cloned()
+        {
+            app.load_remote_repo_owners(&account);
+        }
+    }
+    if let Some((account_id, draft)) = intent.create_remote_repo {
+        if let Some(account) = connected_accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .cloned()
+        {
+            app.create_remote_repository(&account, draft);
         }
     }
     if let Some(path) = intent.open_path {
@@ -326,38 +350,44 @@ fn render_connected_repos(
         .as_ref()
         .and_then(|selected| accounts.iter().find(|account| account.id == *selected))
         .or_else(|| accounts.first());
+    let create_busy = state.remote_repos.create_repo.owners_task.is_some()
+        || state.remote_repos.create_repo.create_task.is_some();
 
     ui.horizontal(|ui| {
         let selected_label = selected_account
             .map(account_label)
             .unwrap_or_else(|| labels.choose_account.to_string());
-        egui::ComboBox::from_id_salt("welcome_repo_browser_account")
-            .selected_text(selected_label)
-            .width(250.0)
-            .show_ui(ui, |ui| {
-                for account in accounts {
-                    let selected = state
-                        .remote_repos
-                        .selected_account
-                        .as_ref()
-                        .map(|id| id == &account.id)
-                        .unwrap_or(false);
-                    if ui
-                        .selectable_label(selected, account_label(account))
-                        .clicked()
-                    {
-                        state.remote_repos.selected_account = Some(account.id.clone());
-                        state.remote_repos.repos.clear();
-                        state.remote_repos.last_error = None;
-                        state.remote_repos.loaded_once = false;
-                        intent.refresh_remote_repos = Some(account.id.clone());
+        ui.add_enabled_ui(!create_busy, |ui| {
+            egui::ComboBox::from_id_salt("welcome_repo_browser_account")
+                .selected_text(selected_label)
+                .width(250.0)
+                .show_ui(ui, |ui| {
+                    for account in accounts {
+                        let selected = state
+                            .remote_repos
+                            .selected_account
+                            .as_ref()
+                            .map(|id| id == &account.id)
+                            .unwrap_or(false);
+                        if ui
+                            .selectable_label(selected, account_label(account))
+                            .clicked()
+                        {
+                            state.remote_repos.selected_account = Some(account.id.clone());
+                            state.remote_repos.repos.clear();
+                            state.remote_repos.last_error = None;
+                            state.remote_repos.loaded_once = false;
+                            state.remote_repos.create_repo =
+                                crate::app::CreateRemoteRepoState::default();
+                            intent.refresh_remote_repos = Some(account.id.clone());
+                        }
                     }
-                }
-            });
+                });
+        });
 
         let refresh_clicked = ui
             .add_enabled(
-                state.remote_repos.task.is_none() && selected_account.is_some(),
+                state.remote_repos.task.is_none() && selected_account.is_some() && !create_busy,
                 egui::Button::new(labels.refresh_remote_repos),
             )
             .clicked();
@@ -367,7 +397,30 @@ fn render_connected_repos(
             }
         }
 
-        if state.remote_repos.task.is_some() {
+        let create_button = if state.remote_repos.create_repo.open {
+            labels.hide_remote_repo_creator
+        } else {
+            labels.create_remote_repo
+        };
+        if ui
+            .add_enabled(selected_account.is_some(), egui::Button::new(create_button))
+            .clicked()
+        {
+            let now_open = !state.remote_repos.create_repo.open;
+            state.remote_repos.create_repo.open = now_open;
+            state.remote_repos.create_repo.last_error = None;
+            state.remote_repos.create_repo.last_created = None;
+            if now_open
+                && state.remote_repos.create_repo.owners.is_empty()
+                && state.remote_repos.create_repo.owners_task.is_none()
+            {
+                if let Some(account) = selected_account {
+                    intent.load_remote_repo_owners = Some(account.id.clone());
+                }
+            }
+        }
+
+        if state.remote_repos.task.is_some() || create_busy {
             ui.spinner();
         }
     });
@@ -376,6 +429,18 @@ fn render_connected_repos(
     ui.small(labels.connected_repos_hint);
     ui.small(labels.clone_protocol_hint);
     ui.add_space(6.0);
+
+    if state.remote_repos.create_repo.open {
+        render_remote_repo_creator(
+            ui,
+            &mut state.remote_repos.create_repo,
+            selected_account,
+            default_parent,
+            intent,
+            labels,
+        );
+        ui.add_space(8.0);
+    }
 
     if let Some(err) = &state.remote_repos.last_error {
         ui.colored_label(egui::Color32::LIGHT_RED, err);
@@ -435,12 +500,169 @@ fn render_connected_repos(
         });
 }
 
+fn render_remote_repo_creator(
+    ui: &mut egui::Ui,
+    create_state: &mut crate::app::CreateRemoteRepoState,
+    selected_account: Option<&ProviderAccount>,
+    default_parent: &PathBuf,
+    intent: &mut Intent,
+    labels: &Labels,
+) {
+    ui.group(|ui| {
+        ui.label(egui::RichText::new(labels.create_remote_repo_title).strong());
+        ui.small(labels.create_remote_repo_hint);
+        ui.add_space(6.0);
+
+        if let Some(created) = &create_state.last_created {
+            ui.colored_label(
+                egui::Color32::from_rgb(140, 210, 160),
+                format!(
+                    "{} {}/{}",
+                    labels.created_remote_repo,
+                    created.owner,
+                    created.repo
+                ),
+            );
+            ui.horizontal(|ui| {
+                if ui.small_button(labels.open_remote).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(&created.web_url));
+                }
+                if ui.small_button(labels.clone_action).clicked() {
+                    intent.start_clone = Some((
+                        if created.private {
+                            created.clone_ssh.clone()
+                        } else {
+                            created.clone_https.clone()
+                        },
+                        default_parent.join(&created.repo),
+                    ));
+                }
+            });
+            ui.add_space(6.0);
+        }
+
+        if let Some(err) = &create_state.last_error {
+            ui.colored_label(egui::Color32::LIGHT_RED, err);
+            ui.add_space(6.0);
+        }
+
+        if create_state.owners_task.is_some() && create_state.owners.is_empty() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(labels.loading_remote_repo_owners);
+            });
+            return;
+        }
+
+        if create_state.owners.is_empty() {
+            ui.weak(labels.no_remote_repo_owners);
+            return;
+        }
+
+        if create_state
+            .selected_owner
+            .as_ref()
+            .is_none_or(|login| !create_state.owners.iter().any(|owner| owner.login == *login))
+        {
+            create_state.selected_owner = create_state
+                .owners
+                .first()
+                .map(|owner| owner.login.clone());
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(labels.remote_repo_owner);
+            let owner_text = create_state
+                .selected_owner
+                .as_deref()
+                .and_then(|login| create_state.owners.iter().find(|owner| owner.login == login))
+                .map(remote_repo_owner_label)
+                .unwrap_or_else(|| labels.choose_account.to_string());
+            egui::ComboBox::from_id_salt("welcome_create_remote_repo_owner")
+                .selected_text(owner_text)
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for owner in &create_state.owners {
+                        let selected = create_state.selected_owner.as_ref() == Some(&owner.login);
+                        if ui
+                            .selectable_label(selected, remote_repo_owner_label(owner))
+                            .clicked()
+                        {
+                            create_state.selected_owner = Some(owner.login.clone());
+                        }
+                    }
+                });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label(labels.remote_repo_name);
+            ui.text_edit_singleline(&mut create_state.name);
+        });
+        ui.horizontal(|ui| {
+            ui.label(labels.remote_repo_description);
+            ui.text_edit_singleline(&mut create_state.description);
+        });
+        ui.checkbox(&mut create_state.private, labels.remote_repo_private);
+        ui.checkbox(&mut create_state.auto_init, labels.remote_repo_auto_init);
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button(labels.hide_remote_repo_creator).clicked() {
+                create_state.open = false;
+            }
+            let can_create =
+                selected_account.is_some()
+                    && create_state.selected_owner.is_some()
+                    && !create_state.name.trim().is_empty();
+            ui.add_enabled_ui(can_create && create_state.create_task.is_none(), |ui| {
+                if ui.button(labels.create_remote_repo_submit).clicked() {
+                    let Some(account) = selected_account else {
+                        return;
+                    };
+                    let Some(owner) = create_state.selected_owner.as_ref().and_then(|login| {
+                        create_state
+                            .owners
+                            .iter()
+                            .find(|owner| owner.login == *login)
+                    }) else {
+                        return;
+                    };
+                    intent.create_remote_repo = Some((
+                        account.id.clone(),
+                        CreateRepositoryDraft {
+                            owner: owner.login.clone(),
+                            owner_kind: owner.kind,
+                            name: create_state.name.trim().to_string(),
+                            description: (!create_state.description.trim().is_empty())
+                                .then(|| create_state.description.trim().to_string()),
+                            private: create_state.private,
+                            auto_init: create_state.auto_init,
+                        },
+                    ));
+                }
+            });
+        });
+    });
+}
+
 fn account_label(account: &ProviderAccount) -> String {
     format!(
         "{} ({})",
         account.display_name,
         provider_host_label(&account.id.kind)
     )
+}
+
+fn remote_repo_owner_label(owner: &RemoteRepoOwner) -> String {
+    let kind = match owner.kind {
+        RemoteRepoOwnerKind::User => "account",
+        RemoteRepoOwnerKind::Organization => "org",
+    };
+    if owner.display_name == owner.login {
+        format!("{} ({kind})", owner.login)
+    } else {
+        format!("{} ({}, {kind})", owner.display_name, owner.login)
+    }
 }
 
 fn provider_host_label(kind: &providers::ProviderKind) -> String {
@@ -487,6 +709,19 @@ struct Labels {
     clone_protocol_hint: &'static str,
     choose_account: &'static str,
     refresh_remote_repos: &'static str,
+    create_remote_repo: &'static str,
+    hide_remote_repo_creator: &'static str,
+    create_remote_repo_title: &'static str,
+    create_remote_repo_hint: &'static str,
+    loading_remote_repo_owners: &'static str,
+    no_remote_repo_owners: &'static str,
+    remote_repo_owner: &'static str,
+    remote_repo_name: &'static str,
+    remote_repo_description: &'static str,
+    remote_repo_private: &'static str,
+    remote_repo_auto_init: &'static str,
+    create_remote_repo_submit: &'static str,
+    created_remote_repo: &'static str,
     loading_connected_repos: &'static str,
     no_connected_repos: &'static str,
     repo_private: &'static str,
@@ -528,6 +763,20 @@ fn labels(language: UiLanguage) -> Labels {
             clone_protocol_hint: "클론은 공개 저장소는 HTTPS, 비공개 저장소는 SSH URL을 기본으로 사용합니다.",
             choose_account: "계정 선택",
             refresh_remote_repos: "새로고침",
+            create_remote_repo: "원격 저장소 만들기",
+            hide_remote_repo_creator: "닫기",
+            create_remote_repo_title: "연결된 계정/조직에 새 저장소 만들기",
+            create_remote_repo_hint:
+                "선택한 계정의 개인 계정이나 조직 아래에 새 원격 저장소를 만듭니다.",
+            loading_remote_repo_owners: "계정과 조직 목록을 불러오는 중…",
+            no_remote_repo_owners: "이 계정으로 생성 가능한 대상이 없습니다.",
+            remote_repo_owner: "소유자:",
+            remote_repo_name: "저장소 이름:",
+            remote_repo_description: "설명:",
+            remote_repo_private: "비공개 저장소",
+            remote_repo_auto_init: "README로 초기화",
+            create_remote_repo_submit: "저장소 생성",
+            created_remote_repo: "생성됨:",
             loading_connected_repos: "원격 저장소 목록을 불러오는 중…",
             no_connected_repos: "이 계정으로 볼 수 있는 저장소가 없습니다.",
             repo_private: "private",
@@ -561,6 +810,20 @@ fn labels(language: UiLanguage) -> Labels {
             clone_protocol_hint: "クローンは公開リポジトリでは HTTPS、非公開リポジトリでは SSH URL を既定で使います。",
             choose_account: "アカウントを選択",
             refresh_remote_repos: "再読み込み",
+            create_remote_repo: "Create remote repo",
+            hide_remote_repo_creator: "Close",
+            create_remote_repo_title: "Create a new remote repository",
+            create_remote_repo_hint:
+                "Create a repository under this account or one of its organizations.",
+            loading_remote_repo_owners: "Loading accounts and organizations…",
+            no_remote_repo_owners: "No repository owners are available for this account.",
+            remote_repo_owner: "Owner:",
+            remote_repo_name: "Repository name:",
+            remote_repo_description: "Description:",
+            remote_repo_private: "Private repository",
+            remote_repo_auto_init: "Initialize with README",
+            create_remote_repo_submit: "Create repository",
+            created_remote_repo: "Created:",
             loading_connected_repos: "リモートリポジトリを読み込み中…",
             no_connected_repos: "このアカウントで閲覧できるリポジトリはありません。",
             repo_private: "private",
@@ -593,6 +856,20 @@ fn labels(language: UiLanguage) -> Labels {
             clone_protocol_hint: "默认对公开仓库使用 HTTPS，对私有仓库使用 SSH URL。",
             choose_account: "选择账号",
             refresh_remote_repos: "刷新",
+            create_remote_repo: "Create remote repo",
+            hide_remote_repo_creator: "Close",
+            create_remote_repo_title: "Create a new remote repository",
+            create_remote_repo_hint:
+                "Create a repository under this account or one of its organizations.",
+            loading_remote_repo_owners: "Loading accounts and organizations…",
+            no_remote_repo_owners: "No repository owners are available for this account.",
+            remote_repo_owner: "Owner:",
+            remote_repo_name: "Repository name:",
+            remote_repo_description: "Description:",
+            remote_repo_private: "Private repository",
+            remote_repo_auto_init: "Initialize with README",
+            create_remote_repo_submit: "Create repository",
+            created_remote_repo: "Created:",
             loading_connected_repos: "正在加载远程仓库…",
             no_connected_repos: "该账号下没有可见仓库。",
             repo_private: "private",
@@ -625,6 +902,20 @@ fn labels(language: UiLanguage) -> Labels {
             clone_protocol_hint: "Le clonage utilise HTTPS pour les dépôts publics et SSH par défaut pour les dépôts privés.",
             choose_account: "Choisir un compte",
             refresh_remote_repos: "Actualiser",
+            create_remote_repo: "Create remote repo",
+            hide_remote_repo_creator: "Close",
+            create_remote_repo_title: "Create a new remote repository",
+            create_remote_repo_hint:
+                "Create a repository under this account or one of its organizations.",
+            loading_remote_repo_owners: "Loading accounts and organizations…",
+            no_remote_repo_owners: "No repository owners are available for this account.",
+            remote_repo_owner: "Owner:",
+            remote_repo_name: "Repository name:",
+            remote_repo_description: "Description:",
+            remote_repo_private: "Private repository",
+            remote_repo_auto_init: "Initialize with README",
+            create_remote_repo_submit: "Create repository",
+            created_remote_repo: "Created:",
             loading_connected_repos: "Chargement des dépôts distants…",
             no_connected_repos: "Aucun dépôt visible pour ce compte.",
             repo_private: "private",
@@ -657,6 +948,20 @@ fn labels(language: UiLanguage) -> Labels {
             clone_protocol_hint: "El clon usa HTTPS para repos públicos y SSH por defecto para repos privados.",
             choose_account: "Elegir cuenta",
             refresh_remote_repos: "Actualizar",
+            create_remote_repo: "Create remote repo",
+            hide_remote_repo_creator: "Close",
+            create_remote_repo_title: "Create a new remote repository",
+            create_remote_repo_hint:
+                "Create a repository under this account or one of its organizations.",
+            loading_remote_repo_owners: "Loading accounts and organizations…",
+            no_remote_repo_owners: "No repository owners are available for this account.",
+            remote_repo_owner: "Owner:",
+            remote_repo_name: "Repository name:",
+            remote_repo_description: "Description:",
+            remote_repo_private: "Private repository",
+            remote_repo_auto_init: "Initialize with README",
+            create_remote_repo_submit: "Create repository",
+            created_remote_repo: "Created:",
             loading_connected_repos: "Cargando repos remotos…",
             no_connected_repos: "No hay repos visibles para esta cuenta.",
             repo_private: "private",
@@ -690,6 +995,20 @@ fn labels(language: UiLanguage) -> Labels {
             clone_protocol_hint: "Clone uses HTTPS for public repositories and SSH for private repositories by default.",
             choose_account: "Choose account",
             refresh_remote_repos: "Refresh",
+            create_remote_repo: "Create remote repo",
+            hide_remote_repo_creator: "Close",
+            create_remote_repo_title: "Create a new remote repository",
+            create_remote_repo_hint:
+                "Create a repository under this account or one of its organizations.",
+            loading_remote_repo_owners: "Loading accounts and organizations…",
+            no_remote_repo_owners: "No repository owners are available for this account.",
+            remote_repo_owner: "Owner:",
+            remote_repo_name: "Repository name:",
+            remote_repo_description: "Description:",
+            remote_repo_private: "Private repository",
+            remote_repo_auto_init: "Initialize with README",
+            create_remote_repo_submit: "Create repository",
+            created_remote_repo: "Created:",
             loading_connected_repos: "Loading remote repositories…",
             no_connected_repos: "No repositories are visible for this account.",
             repo_private: "private",
