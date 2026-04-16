@@ -1,0 +1,133 @@
+[package]
+name = "mergefox"
+version = "0.1.0-alpha.1"
+edition = "2021"
+description = "mergeFox — lightweight cross-platform Git GUI focused on branch management, undo/redo, and remote integrations"
+license = "Apache-2.0"
+repository = "https://github.com/yourname/mergefox"
+readme = "README.md"
+
+[[bin]]
+name = "mergefox"
+path = "src/main.rs"
+
+[dependencies]
+# GUI — we keep both backends compiled in, but default to `glow` at
+# runtime because its idle memory footprint is much lower than `wgpu`.
+# `wgpu` stays available as a fallback via `MERGEFOX_RENDERER=wgpu`.
+eframe = { version = "0.29", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wgpu",
+    "persistence",
+] }
+egui = "0.29"
+# `image` handles in-memory image diffs (`bytes://...`). Author avatars are
+# drawn locally as GitHub-style identicons, so we don't need the `http`
+# loader (which would pull in ureq, rustls, webpki, …) just for Gravatar —
+# and the local approach keeps author emails off third-party servers.
+egui_extras = { version = "0.29", features = ["image"] }
+
+# Gitoxide — pure-Rust git implementation used for the read path and the
+# clone / fetch fast-paths. Write / network ops shell out to the system
+# `git` binary via `src/git/cli.rs` so hooks, credential helpers, signing
+# keys, and mergetools behave identically to running `git` in a terminal.
+#
+# Feature choice:
+#   * `blocking-http-transport-reqwest-rust-tls` — reuses our existing
+#     reqwest + rustls stack. No libcurl, no OpenSSL linked twice.
+#   * `blocking-network-client` — enables the synchronous fetch/clone
+#     API that slots into our background-thread job model.
+#   * `max-performance-safe` — enables parallel packfile index/resolve
+#     (the whole reason we're here) without any `unsafe` feature knobs.
+gix = { version = "0.81", default-features = false, features = [
+    "blocking-network-client",
+    "blocking-http-transport-reqwest-rust-tls",
+    "max-performance-safe",
+    "sha1",
+    # `worktree-mutation` enables `PrepareCheckout::main_worktree` — without
+    # it we'd clone the `.git` dir but can't actually populate the working
+    # tree.
+    "worktree-mutation",
+    # Needed to surface operation progress (receive / resolve / checkout)
+    # through prodash trees that our polling thread walks to update the
+    # UI's `CloneProgress`.
+    "progress-tree",
+] }
+
+# Errors
+anyhow = "1"
+thiserror = "1"
+
+# Serde + persistence
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# OS integration
+rfd = "0.14"
+dirs = "5"
+# Proper locale detection — env vars (LANG/LC_ALL) are empty in macOS
+# .app bundles, so we need the platform-native API (NSLocale / GetUserDefaultLocaleName).
+sys-locale = "0.3"
+# `keyring` was removed — it caused macOS to spawn a swarm of
+# "AutoFill (mergefox)" XPC helpers (~15 MB × 15 processes ≈ 225 MB
+# attributed to our bundle ID) on every credential access, with no
+# functional benefit since our own in-memory cache already collapsed
+# lookups to one-per-session. Credentials now live in the internal
+# `SecretStore` (file at `~/.../mergefox/secrets.json`, chmod 0600).
+
+# HTTP + async (for Provider REST clients and OAuth)
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "gzip",
+] }
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+] }
+url = "2"
+
+# SSH key generation / parsing (pure-Rust)
+ssh-key = { version = "0.6", features = ["ed25519", "rsa", "p256"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Sensitive string wrapper — zero on drop
+secrecy = "0.8"
+gix-traverse = "0.55.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+# Compile-time font subsetter — reads every `.rs` source file, collects all
+# string literals, and produces a slimmed-down Pretendard subset containing
+# only the glyphs that can actually appear in mergeFox's UI chrome. The
+# result is `include_bytes!`'d into the binary as the always-loaded
+# Tier-A font (~50–150 KB). System CJK fonts remain as Tier-B fallback for
+# arbitrary repo content.
+[build-dependencies]
+walkdir = "2"
+syn = { version = "2", default-features = false, features = [
+    "parsing",
+    "full",
+    "visit",
+] }
+proc-macro2 = "1"
+ttf-parser = { version = "0.21", default-features = false, features = [
+    "opentype-layout",
+    "apple-layout",
+    "variable-fonts",
+] }
+subsetter = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
