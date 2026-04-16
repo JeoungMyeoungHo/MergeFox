@@ -1,0 +1,23 @@
+# Build-only image for Linux release binaries.
+# Native macOS builds should use the host toolchain — this is for CI and
+# producing Linux artifacts.
+FROM rust:1.77-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+        cmake \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY Cargo.toml ./
+COPY src ./src
+
+RUN cargo build --release
+
+# Slim runtime image (optional — GUI won't actually run here, but useful
+# to ship the binary artifact to a release step).
+FROM debian:bookworm-slim AS runtime
+COPY --from=builder /src/target/release/mergefox /usr/local/bin/mergefox
+CMD ["/usr/local/bin/mergefox"]
