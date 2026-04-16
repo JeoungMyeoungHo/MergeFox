@@ -281,8 +281,23 @@ fn collect_refs(
     for r in platform.all()?.flatten() {
         let full = r.name().as_bstr().to_string();
         let short = String::from_utf8_lossy(r.name().shorten()).into_owned();
+        let is_local_branch = full.starts_with("refs/heads/");
         let is_remote = full.starts_with("refs/remotes/");
         let is_tag = full.starts_with("refs/tags/");
+
+        // Skip refs that aren't one of the three kinds the graph knows
+        // how to render. Examples:
+        //   * `refs/stash`                      — the stash reflog head
+        //   * `refs/notes/*`                    — git-notes storage
+        //   * `refs/mergefox/autostash-*`       — our own undo safety net
+        //   * `refs/original/*`                 — leftovers from `filter-branch`
+        //   * `refs/pull/*`, `refs/keep-around/*` — server-side housekeeping
+        // Before this filter they all fell through to `RefKind::LocalBranch`,
+        // which populated the commit context menu with bogus "Delete
+        // 'refs/stash'" entries — clicking those produced git errors.
+        if !is_local_branch && !is_remote && !is_tag {
+            continue;
+        }
 
         // For *walk tips* we respect the scope filter (CurrentBranch /
         // AllLocal / AllRefs). But for *ref labels* we always include
