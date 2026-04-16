@@ -5,12 +5,78 @@
 //! transparently — the same way they do in a terminal.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+
+/// Default per-job timeout. 300 s catches runaway jobs (network hang with
+/// no SIGPIPE, auth loop) while comfortably covering Linux-kernel-scale
+/// clones over a slow link. Overridable at runtime via
+/// `MERGEFOX_GIT_TIMEOUT_SECS` — useful for CI / low-bandwidth users.
+const GIT_JOB_TIMEOUT_DEFAULT_SECS: u64 = 300;
+
+fn git_job_timeout() -> Duration {
+    std::env::var("MERGEFOX_GIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(GIT_JOB_TIMEOUT_DEFAULT_SECS))
+}
+
+/// `.git/index.lock` / `.git/HEAD.lock` detection.
+///
+/// When another git process (VS Code, terminal, pre-commit hook) is
+/// mid-commit, the lock file exists and our own push / commit / rebase
+/// will fail with a confusing "another git process seems to be running"
+/// error. Checking up front gives us an actionable message AND lets us
+/// distinguish "user is busy" from "lock is stale" (mtime-based).
+///
+/// Returns `Ok(())` when clear, or a descriptive error when locked.
+fn check_repo_not_locked(repo_path: &std::path::Path) -> Result<()> {
+    let git_dir = if repo_path.join(".git").is_dir() {
+        repo_path.join(".git")
+    } else {
+        // Already a bare repo or submodule — `.git` is a file, not a dir.
+        repo_path.to_path_buf()
+    };
+    for lock_name in ["index.lock", "HEAD.lock"] {
+        let lock = git_dir.join(lock_name);
+        if !lock.exists() {
+            continue;
+        }
+        let age = lock
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok());
+        match age {
+            // Lock is fresh — another git process is actively working. We
+            // shouldn't touch it.
+            Some(a) if a < Duration::from_secs(30) => {
+                bail!(
+                    "another git process is running ({} is {}s old). Try again in a moment.",
+                    lock.display(),
+                    a.as_secs()
+                );
+            }
+            // Lock is stale — almost certainly left behind by a crashed
+            // process. Still refuse automatically, but tell the user how
+            // to recover so they don't have to google it.
+            _ => {
+                bail!(
+                    "stale lock file detected: {}\n\nThis usually means a previous git process crashed.\nRun `rm '{}'` from a terminal to clear it.",
+                    lock.display(),
+                    lock.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub enum GitJobKind {
@@ -77,6 +143,7 @@ pub struct GitJob {
     pub kind: GitJobKind,
     pub started_at: Instant,
     pub progress: Arc<Mutex<JobProgress>>,
+    cancel_requested: Arc<AtomicBool>,
     rx: Receiver<Result<(), String>>,
 }
 
@@ -87,12 +154,14 @@ impl GitJob {
             stage: "starting".into(),
             ..JobProgress::default()
         }));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
 
         let kind_t = kind.clone();
         let progress_t = progress.clone();
+        let cancel_t = cancel_requested.clone();
         thread::spawn(move || {
-            let result = run_job(&repo_path, kind_t, progress_t).map_err(|e| format!("{e:#}"));
+            let result = run_job(&repo_path, kind_t, progress_t, cancel_t).map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
 
@@ -100,6 +169,7 @@ impl GitJob {
             kind,
             started_at: Instant::now(),
             progress,
+            cancel_requested,
             rx,
         }
     }
@@ -110,6 +180,13 @@ impl GitJob {
 
     pub fn snapshot(&self) -> JobProgress {
         self.progress.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancel_requested.store(true, Ordering::Relaxed);
+        if let Ok(mut progress) = self.progress.lock() {
+            progress.stage = "cancelling".into();
+        }
     }
 
     pub fn label(&self) -> String {
@@ -143,12 +220,19 @@ fn run_job(
     path: &std::path::Path,
     kind: GitJobKind,
     progress: Arc<Mutex<JobProgress>>,
+    cancel_requested: Arc<AtomicBool>,
 ) -> Result<()> {
     match kind {
         GitJobKind::Fetch {
             remote,
             credentials,
-        } => do_fetch(path, &remote, credentials.as_ref(), progress),
+        } => do_fetch(
+            path,
+            &remote,
+            credentials.as_ref(),
+            progress,
+            cancel_requested.as_ref(),
+        ),
         GitJobKind::Push {
             remote,
             refspec,
@@ -163,6 +247,7 @@ fn run_job(
             set_upstream,
             credentials.as_ref(),
             progress,
+            cancel_requested.as_ref(),
         ),
         GitJobKind::Pull {
             remote,
@@ -176,6 +261,7 @@ fn run_job(
             strategy,
             credentials.as_ref(),
             progress,
+            cancel_requested.as_ref(),
         ),
     }
 }
@@ -227,11 +313,12 @@ fn do_fetch(
     remote_name: &str,
     credentials: Option<&HttpsCredentials>,
     progress: Arc<Mutex<JobProgress>>,
+    cancel_requested: &AtomicBool,
 ) -> Result<()> {
     mark(&progress, "fetching");
     build_cmd_with_creds(path, credentials)
         .args(["fetch", "--prune", remote_name])
-        .run()?;
+        .run_with_control(Some(cancel_requested), Some(git_job_timeout()))?;
     mark(&progress, "done");
     Ok(())
 }
@@ -244,7 +331,12 @@ fn do_push(
     set_upstream: bool,
     credentials: Option<&HttpsCredentials>,
     progress: Arc<Mutex<JobProgress>>,
+    cancel_requested: &AtomicBool,
 ) -> Result<()> {
+    // Push itself doesn't touch the index, but set-upstream follows up
+    // with a fetch and users reasonably expect "push failing cleanly"
+    // when another git process is mid-commit in the same repo.
+    check_repo_not_locked(path)?;
     mark(&progress, "pushing");
     let final_refspec = if force && !refspec.starts_with('+') {
         format!("+{refspec}")
@@ -256,7 +348,8 @@ fn do_push(
     if set_upstream {
         cmd = cmd.arg("-u");
     }
-    cmd.args([remote_name, &final_refspec]).run()?;
+    cmd.args([remote_name, &final_refspec])
+        .run_with_control(Some(cancel_requested), Some(git_job_timeout()))?;
     if set_upstream {
         mark(&progress, "refreshing");
         let branch = refspec
@@ -267,7 +360,7 @@ fn do_push(
         if !branch.is_empty() {
             build_cmd_with_creds(path, credentials)
                 .args(["fetch", remote_name, branch])
-                .run()?;
+                .run_with_control(Some(cancel_requested), Some(git_job_timeout()))?;
         }
     }
     mark(&progress, "done");
@@ -281,12 +374,16 @@ fn do_pull(
     strategy: PullStrategy,
     credentials: Option<&HttpsCredentials>,
     progress: Arc<Mutex<JobProgress>>,
+    cancel_requested: &AtomicBool,
 ) -> Result<()> {
+    // Merge / rebase mutate the index and working tree — fail fast with
+    // a clear message if another git process is already using them.
+    check_repo_not_locked(path)?;
     mark(&progress, "fetching");
     // First fetch so we have the latest remote state.
     build_cmd_with_creds(path, credentials)
         .args(["fetch", remote_name])
-        .run()?;
+        .run_with_control(Some(cancel_requested), Some(git_job_timeout()))?;
 
     mark(&progress, "applying");
     let remote_ref = format!("{remote_name}/{branch}");
@@ -298,7 +395,9 @@ fn do_pull(
         PullStrategy::Merge => vec!["merge", "--no-ff", &remote_ref],
         PullStrategy::Rebase => vec!["rebase", &remote_ref],
     };
-    super::cli::run(path, &args)?;
+    super::cli::GitCommand::new(path)
+        .args(args)
+        .run_with_control(Some(cancel_requested), Some(git_job_timeout()))?;
     mark(&progress, "done");
     Ok(())
 }

@@ -352,6 +352,7 @@ pub(super) fn refresh_modal_remotes(app: &mut MergeFoxApp) -> anyhow::Result<()>
             name: remote.name,
             fetch_url: remote.fetch_url.unwrap_or_default(),
             push_url: remote.push_url.unwrap_or_default(),
+            rename_to: String::new(),
         })
         .collect();
     Ok(())

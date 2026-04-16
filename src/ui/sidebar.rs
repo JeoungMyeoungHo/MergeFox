@@ -6,7 +6,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let sidebar_fill = crate::ui::theme::sidebar_fill(&app.config.theme);
     let language = app.config.ui_language;
 
-    let (branch_error, local, remote, configured_remotes, stashes, current_branch, head_branch, forge, lfs) = {
+    let (branch_error, stash_error, local, remote, configured_remotes, stashes, current_branch, head_branch, forge, lfs) = {
         let View::Workspace(tabs) = &mut app.view else {
             return;
         };
@@ -18,13 +18,14 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         // moderately large repo, which showed up as click latency).
         // `MergeFoxApp::refresh_repo_ui_cache` keeps this fresh after
         // every op / tab switch.
-        let (branch_error, branches, stashes) = match &ws.repo_ui_cache {
+        let (branch_error, stash_error, branches, stashes) = match &ws.repo_ui_cache {
             Some(cache) => (
                 cache.branch_error.clone(),
+                cache.stash_error.clone(),
                 cache.branches.clone(),
                 cache.stashes.clone(),
             ),
-            None => (None, Vec::new(), None),
+            None => (None, None, Vec::new(), None),
         };
         let configured_remotes = ws
             .repo_ui_cache
@@ -49,6 +50,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
         (
             branch_error,
+            stash_error,
             local,
             remote,
             configured_remotes,
@@ -141,6 +143,11 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                             ui.weak(format!("({count})"));
                         });
                         ui.add_space(2.0);
+
+                        if let Some(err) = &stash_error {
+                            ui.colored_label(egui::Color32::from_rgb(230, 180, 90), err);
+                            ui.add_space(4.0);
+                        }
 
                         if let Some(stashes) = &stashes {
                             if stashes.is_empty() {

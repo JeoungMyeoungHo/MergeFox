@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 
@@ -9,7 +9,8 @@ use crate::clone::CloneHandle;
 use crate::config::{Config, PullStrategyPref, RepoSettings, ThemeSettings, UiLanguage};
 use crate::forge::{ForgeCreateIssueResult, ForgeCreatePrResult, ForgeRefreshResult, ForgeState};
 use crate::git::{
-    BranchInfo, GitJob, GitJobKind, GraphScope, Repo, RepoDiff, StashEntry, StatusEntry,
+    BranchInfo, GitCapability, GitJob, GitJobKind, GraphScope, Repo, RepoDiff, StashEntry,
+    StatusEntry,
 };
 use crate::journal::{self, Journal, JournalEntry, OpSource, Operation, RepoSnapshot};
 use crate::providers;
@@ -33,6 +34,7 @@ pub struct MergeFoxApp {
     /// (vs. every Settings open / commit-modal / API call under the
     /// naive `keyring::Entry` path).
     pub secret_store: Arc<crate::secrets::SecretStore>,
+    pub git_capability: GitCapability,
     pub last_error: Option<String>,
     pub hud: Option<Hud>,
     /// Installed lazily because most repos never open an image diff.
@@ -156,6 +158,10 @@ pub struct SettingsModal {
     pub identity_global: bool,
     /// True once the initial read from git config has happened.
     pub identity_loaded: bool,
+    /// Lazy-loaded worktree list — `None` until first render triggers
+    /// a refresh, then `Some(list)` (possibly empty if only the main
+    /// worktree exists).
+    pub worktrees: Option<Vec<crate::git::WorktreeInfo>>,
 }
 
 pub struct PublishRemoteModal {
@@ -185,6 +191,11 @@ pub struct RemoteDraft {
     pub name: String,
     pub fetch_url: String,
     pub push_url: String,
+    /// Live input buffer for the "Rename remote" inline row. We keep the
+    /// old name in `name` (that's what `git remote rename` needs as the
+    /// source), and the proposed new name here. Empty or equal to `name`
+    /// means "no rename requested".
+    pub rename_to: String,
 }
 
 pub enum View {
@@ -438,6 +449,12 @@ pub struct WorkspaceState {
     /// Last time we polled `git status` for out-of-band working tree
     /// changes (edits from another editor / generator / terminal).
     pub last_working_tree_poll: Instant,
+    /// Last time we checked HEAD/refs/index for out-of-band repo changes
+    /// from another git client.
+    pub last_repo_external_poll: Instant,
+    /// Snapshot of HEAD/ref/index markers used to detect external repo
+    /// changes without spawning git every frame.
+    pub repo_external_snapshot: Option<RepoExternalSnapshot>,
     /// Whether the working tree changes section is expanded in the main panel.
     /// When expanded, file list is shown inline above the graph.
     pub working_tree_expanded: bool,
@@ -457,16 +474,33 @@ pub struct RepoUiCache {
     pub branches: Vec<BranchInfo>,
     pub branch_error: Option<String>,
     pub stashes: Option<Vec<StashEntry>>,
+    pub stash_error: Option<String>,
     pub working: Option<Vec<StatusEntry>>,
+    pub working_error: Option<String>,
     pub remotes: Vec<String>,
     /// How many commits HEAD is ahead of its upstream tracking ref.
     /// 0 when there's no upstream.
     pub ahead: usize,
     /// How many commits HEAD is behind its upstream.
     pub behind: usize,
+    /// Non-fatal tracking computation failure (for example git missing).
+    pub tracking_error: Option<String>,
 }
 
 const WORKING_TREE_POLL_INTERVAL: Duration = Duration::from_millis(700);
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepoExternalSnapshot {
+    pub head_name: Option<String>,
+    pub head_oid: Option<gix::ObjectId>,
+    pub head_file_mtime_ns: Option<u128>,
+    pub packed_refs_mtime_ns: Option<u128>,
+    pub refs_heads_mtime_ns: Option<u128>,
+    pub refs_remotes_mtime_ns: Option<u128>,
+    pub fetch_head_mtime_ns: Option<u128>,
+    pub stash_log_mtime_ns: Option<u128>,
+    pub index_mtime_ns: Option<u128>,
+}
 
 pub struct GraphTask {
     /// Scope this task is computing. Compared against `ws.graph_scope`
@@ -760,6 +794,7 @@ impl MergeFoxApp {
             config,
             egui_ctx: cc.egui_ctx.clone(),
             secret_store,
+            git_capability: crate::git::probe_git_capability(),
             last_error: None,
             hud: None,
             image_loaders_installed: false,
@@ -782,6 +817,37 @@ impl MergeFoxApp {
             forge_create_pr_task: None,
             forge_create_issue_task: None,
         }
+    }
+
+    pub fn refresh_git_capability(&mut self) {
+        self.git_capability = crate::git::probe_git_capability();
+    }
+
+    pub fn git_missing_message(&self, action: &str) -> String {
+        format!(
+            "{action} needs the system git CLI, but `git` is not available. {}",
+            self.git_capability.install_guidance()
+        )
+    }
+
+    pub fn ensure_git_cli_for(&mut self, action: &str) -> bool {
+        if !self.git_capability.is_available() {
+            self.refresh_git_capability();
+        }
+        if self.git_capability.is_available() {
+            true
+        } else {
+            self.last_error = Some(self.git_missing_message(action));
+            false
+        }
+    }
+
+    pub fn set_git_error(&mut self, action: &str, err: impl std::fmt::Display) {
+        let diagnostic = crate::git::classify_git_error(err.to_string());
+        if matches!(diagnostic.kind, crate::git::GitErrorKind::MissingBinary) {
+            self.refresh_git_capability();
+        }
+        self.last_error = Some(diagnostic.user_message(action));
     }
 
     pub fn ensure_image_loaders(&mut self, ctx: &egui::Context) {
@@ -813,8 +879,11 @@ impl MergeFoxApp {
             self.last_error = Some(format!("create {}: {e:#}", path.display()));
             return;
         }
+        if !self.ensure_git_cli_for("Initializing a repository") {
+            return;
+        }
         if let Err(e) = crate::git::cli::run(path, ["init"]) {
-            self.last_error = Some(format!("git init {}: {e:#}", path.display()));
+            self.set_git_error("Initializing a repository", e);
             return;
         }
         self.open_repo(path);
@@ -1028,6 +1097,8 @@ impl MergeFoxApp {
             graph_task: None,
             repo_ui_cache: None,
             last_working_tree_poll: Instant::now(),
+            last_repo_external_poll: Instant::now(),
+            repo_external_snapshot: None,
             working_tree_expanded: false,
             selected_working_file: None,
             working_file_diff: None,
@@ -1215,8 +1286,30 @@ impl MergeFoxApp {
             Ok(branches) => (None, branches),
             Err(err) => (Some(format!("error: {err}")), Vec::new()),
         };
-        let stashes = crate::git::ops::stash_list(ws.repo.path()).ok();
-        let working = crate::git::ops::status_entries(ws.repo.path()).ok();
+        let head_has_upstream = branches
+            .iter()
+            .find(|branch| branch.is_head && !branch.is_remote)
+            .and_then(|branch| branch.upstream.as_ref())
+            .is_some();
+        let (stash_error, stashes) = match crate::git::ops::stash_list(ws.repo.path()) {
+            Ok(entries) => (None, Some(entries)),
+            Err(err) => (
+                Some(crate::git::classify_git_error(format!("{err:#}")).user_message(
+                    "Reading stash list",
+                )),
+                None,
+            ),
+        };
+        let (working_error, working) = match crate::git::ops::status_entries(ws.repo.path()) {
+            Ok(entries) => (None, Some(entries)),
+            Err(err) => (
+                Some(
+                    crate::git::classify_git_error(format!("{err:#}"))
+                        .user_message("Reading working tree status"),
+                ),
+                None,
+            ),
+        };
         let remotes = ws
             .repo
             .list_remotes()
@@ -1228,77 +1321,135 @@ impl MergeFoxApp {
         // ahead/behind: `git rev-list --count --left-right HEAD...@{upstream}`
         // Returns "A\tB" where A = ahead, B = behind. Fails cleanly when
         // there's no upstream (returns 0, 0).
-        let (ahead, behind) = crate::git::cli::run_line(
+        let (ahead, behind, tracking_error) = match crate::git::cli::run_line(
             ws.repo.path(),
             ["rev-list", "--count", "--left-right", "HEAD...@{upstream}"],
-        )
-        .ok()
-        .and_then(|line| {
-            let parts: Vec<&str> = line.trim().split('\t').collect();
-            if parts.len() == 2 {
-                Some((
-                    parts[0].parse::<usize>().unwrap_or(0),
-                    parts[1].parse::<usize>().unwrap_or(0),
-                ))
-            } else {
-                None
+        ) {
+            Ok(line) => {
+                let parts: Vec<&str> = line.trim().split('\t').collect();
+                if parts.len() == 2 {
+                    (
+                        parts[0].parse::<usize>().unwrap_or(0),
+                        parts[1].parse::<usize>().unwrap_or(0),
+                        None,
+                    )
+                } else {
+                    (0, 0, Some("Unable to compute ahead/behind counts.".into()))
+                }
             }
-        })
-        .unwrap_or((0, 0));
+            Err(_) if !head_has_upstream => (0, 0, None),
+            Err(err) => (
+                0,
+                0,
+                Some(
+                    crate::git::classify_git_error(format!("{err:#}"))
+                        .user_message("Computing upstream ahead/behind counts"),
+                ),
+            ),
+        };
 
         ws.repo_ui_cache = Some(RepoUiCache {
             branches,
             branch_error,
             stashes,
+            stash_error,
             working,
+            working_error,
             remotes,
             ahead,
             behind,
+            tracking_error,
         });
         ws.last_working_tree_poll = Instant::now();
+        ws.last_repo_external_poll = Instant::now();
+        ws.repo_external_snapshot = Some(capture_repo_external_snapshot(&ws.repo));
     }
 
     /// Poll `git status` on a low-frequency timer so out-of-band edits
     /// (editor save, codegen, terminal commands) update the cached
     /// working-tree counters without requiring a manual refresh.
     fn poll_working_tree_changes(&mut self) {
-        let View::Workspace(tabs) = &mut self.view else {
-            return;
-        };
-        if tabs.launcher_active {
-            return;
-        }
+        let mut should_refresh_cache = false;
+        let mut should_rebuild_graph = false;
+        let mut rebuild_scope = GraphScope::CurrentBranch;
+        let mut show_external_change_hud = false;
 
-        let ws = tabs.current_mut();
-        if ws.last_working_tree_poll.elapsed() < WORKING_TREE_POLL_INTERVAL {
-            return;
-        }
-        ws.last_working_tree_poll = Instant::now();
-
-        let Ok(working) = crate::git::ops::status_entries(ws.repo.path()) else {
-            return;
-        };
-        let Some(cache) = ws.repo_ui_cache.as_mut() else {
-            return;
-        };
-        if cache.working.as_ref() == Some(&working) {
-            return;
-        }
-
-        cache.working = Some(working.clone());
-
-        if let Some(selected_path) = ws.selected_working_file.clone() {
-            let still_present = working.iter().any(|entry| entry.path == selected_path);
-            if still_present {
-                // Force diff/image recomputation for the next paint so
-                // the detail pane reflects the updated file contents.
-                ws.working_file_diff = None;
-                ws.set_image_cache(None);
-            } else {
-                ws.selected_working_file = None;
-                ws.working_file_diff = None;
-                ws.set_image_cache(None);
+        {
+            let View::Workspace(tabs) = &mut self.view else {
+                return;
+            };
+            if tabs.launcher_active {
+                return;
             }
+
+            let ws = tabs.current_mut();
+            let poll_working = ws.last_working_tree_poll.elapsed() >= WORKING_TREE_POLL_INTERVAL;
+            let poll_external = ws.last_repo_external_poll.elapsed() >= WORKING_TREE_POLL_INTERVAL;
+            if !poll_working && !poll_external {
+                return;
+            }
+
+            if poll_working {
+                ws.last_working_tree_poll = Instant::now();
+                if let Some(cache) = ws.repo_ui_cache.as_mut() {
+                    match crate::git::ops::status_entries(ws.repo.path()) {
+                        Ok(working) => {
+                            cache.working_error = None;
+                            if cache.working.as_ref() != Some(&working) {
+                                cache.working = Some(working.clone());
+                                if let Some(selected_path) = ws.selected_working_file.clone() {
+                                    let still_present =
+                                        working.iter().any(|entry| entry.path == selected_path);
+                                    if still_present {
+                                        // Force diff/image recomputation for the next paint so
+                                        // the detail pane reflects the updated file contents.
+                                        ws.working_file_diff = None;
+                                        ws.set_image_cache(None);
+                                    } else {
+                                        ws.selected_working_file = None;
+                                        ws.working_file_diff = None;
+                                        ws.set_image_cache(None);
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            cache.working = None;
+                            cache.working_error = Some(
+                                crate::git::classify_git_error(format!("{err:#}"))
+                                    .user_message("Reading working tree status"),
+                            );
+                        }
+                    }
+                }
+            }
+
+            if poll_external {
+                ws.last_repo_external_poll = Instant::now();
+                let snapshot = capture_repo_external_snapshot(&ws.repo);
+                if let Some(previous) = ws.repo_external_snapshot.as_ref() {
+                    if previous != &snapshot {
+                        should_refresh_cache = true;
+                        should_rebuild_graph =
+                            snapshot.requires_graph_refresh(previous);
+                        show_external_change_hud = true;
+                        rebuild_scope = ws.graph_scope;
+                    }
+                }
+                ws.repo_external_snapshot = Some(snapshot);
+            }
+        }
+
+        if should_rebuild_graph {
+            self.rebuild_graph(rebuild_scope);
+        } else if should_refresh_cache {
+            self.refresh_repo_ui_cache();
+        }
+        if show_external_change_hud {
+            self.hud = Some(Hud::new(
+                "Repository changed outside MergeFox — refreshed",
+                1800,
+            ));
         }
     }
 
@@ -1438,7 +1589,7 @@ impl MergeFoxApp {
 
         match result {
             Ok(path) => self.open_repo(&path),
-            Err(err) => self.last_error = Some(format!("clone failed: {err}")),
+            Err(err) => self.set_git_error("Cloning a repository", err),
         }
     }
 
@@ -2027,6 +2178,7 @@ impl MergeFoxApp {
                     name: remote.name,
                     fetch_url: remote.fetch_url.unwrap_or_default(),
                     push_url: remote.push_url.unwrap_or_default(),
+                    rename_to: String::new(),
                 })
                 .collect(),
             new_remote_name: String::new(),
@@ -2040,6 +2192,7 @@ impl MergeFoxApp {
             identity_email: String::new(),
             identity_global: false,
             identity_loaded: false,
+            worktrees: None,
         });
         self.settings_open = true;
     }
@@ -3361,6 +3514,9 @@ impl MergeFoxApp {
     }
 
     fn start_job_for_repo_path(&mut self, repo_path: &Path, kind: GitJobKind) {
+        if !self.ensure_git_cli_for(&kind_action_label(&kind)) {
+            return;
+        }
         let Some(ws) = self.workspace_by_path_mut(repo_path) else {
             self.last_error = Some(format!("repository not open: {}", repo_path.display()));
             return;
@@ -3371,6 +3527,18 @@ impl MergeFoxApp {
         }
         let path = ws.repo.path().to_path_buf();
         ws.active_job = Some(GitJob::spawn(path, kind));
+    }
+
+    pub fn cancel_active_job(&mut self) {
+        let View::Workspace(tabs) = &mut self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        if let Some(job) = tabs.current().active_job.as_ref() {
+            job.cancel();
+        }
     }
 
     /// Poll the active background job; when done, integrate the result.
@@ -3403,7 +3571,15 @@ impl MergeFoxApp {
                     self.hud = Some(Hud::new(format!("✓ {label}"), 1800));
                 }
                 Err(e) => {
-                    self.last_error = Some(format!("{label} failed: {e}"));
+                    let diagnostic = crate::git::classify_git_error(&e);
+                    if matches!(diagnostic.kind, crate::git::GitErrorKind::Cancelled) {
+                        self.hud = Some(Hud::new(diagnostic.user_message(&label), 1800));
+                    } else {
+                        if matches!(diagnostic.kind, crate::git::GitErrorKind::MissingBinary) {
+                            self.refresh_git_capability();
+                        }
+                        self.last_error = Some(diagnostic.user_message(&label));
+                    }
                 }
             }
         }
@@ -3468,10 +3644,11 @@ impl MergeFoxApp {
                 let elapsed = task.started_at.elapsed();
                 tab.diff_task = None;
                 if profile {
-                    eprintln!(
-                        "[click {:.7}] spawn→result total={:?}",
-                        &oid.to_string()[..7],
-                        elapsed
+                    tracing::debug!(
+                        target: "mergefox::profile::click",
+                        oid = %&oid.to_string()[..7],
+                        elapsed_us = elapsed.as_micros() as u64,
+                        "click spawn→result"
                     );
                 }
                 completed.push((idx, oid, elapsed, result));
@@ -3633,7 +3810,7 @@ fn spawn_lfs_scan(repo_path: &Path) -> LfsScanState {
                 let _ = tx.send(r);
             }
             Err(e) => {
-                eprintln!("mergefox: lfs scan failed: {e:#}");
+                tracing::warn!(error = %e, "lfs scan failed");
                 // Still send an empty result so the UI knows the scan
                 // finished (otherwise sidebar would show "scanning…"
                 // forever).
@@ -3896,7 +4073,7 @@ impl eframe::App for MergeFoxApp {
             } else {
                 (now - last) / 1_000_000
             };
-            eprintln!("[frame start] gap_since_last={}ms", gap_ms);
+            tracing::trace!(target: "mergefox::profile::frame", gap_since_last_ms = gap_ms, "frame start");
         }
         ui::theme::apply(ctx, &self.config.theme);
         handle_hotkeys(ctx, self);
@@ -3992,7 +4169,11 @@ impl eframe::App for MergeFoxApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
         if frame_profile {
-            eprintln!("[frame end] cost={:?}", frame_t0.elapsed());
+            tracing::trace!(
+                target: "mergefox::profile::frame",
+                cost_us = frame_t0.elapsed().as_micros() as u64,
+                "frame end"
+            );
         }
     }
 
@@ -4025,11 +4206,12 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
     // Cmd+Z and Cmd+Shift+Z are *strictly* disambiguated. `consume_shortcut`
     // for Cmd+Z was eating Cmd+Shift+Z events too on macOS, which flipped
     // redo presses into undo ("nothing to undo").
-    let (undo, redo, panic_key, next_tab, prev_tab, close_tab) = ctx.input_mut(|i| {
+    let (undo, redo, panic_key, next_tab, prev_tab, close_tab, open_reflog) = ctx.input_mut(|i| {
         let z = i.key_pressed(egui::Key::Z);
         let esc = i.key_pressed(egui::Key::Escape);
         let tab_k = i.key_pressed(egui::Key::Tab);
         let w_k = i.key_pressed(egui::Key::W);
+        let r_k = i.key_pressed(egui::Key::R);
         let m = i.modifiers;
         // On macOS, `command` already represents the Cmd key; we don't
         // require anything special about ctrl here.
@@ -4046,6 +4228,13 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
         let next_tab = tab_k && ctrl_only;
         let prev_tab = tab_k && ctrl_shift;
         let close_tab = w_k && cmd_only;
+        // Cmd+Shift+R — "I need a recovery lifeline". The reflog is the
+        // universal safety net for destructive ops (hard reset, amend,
+        // force push, rebase gone wrong); this shortcut matches the
+        // Refresh conventions on web browsers (Cmd+Shift+R) while
+        // reading as "recover" in our context. Users in-panic shouldn't
+        // have to hunt for a menu item.
+        let open_reflog = r_k && cmd_shift;
         // Consume the events so textfields / other widgets don't also react.
         if undo || redo {
             i.events.retain(|e| {
@@ -4095,7 +4284,19 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 )
             });
         }
-        (undo, redo, panic_key, next_tab, prev_tab, close_tab)
+        if open_reflog {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::R,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+        }
+        (undo, redo, panic_key, next_tab, prev_tab, close_tab, open_reflog)
     });
 
     if redo {
@@ -4115,6 +4316,13 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
     }
     if close_tab {
         app.close_active_tab();
+    }
+    if open_reflog {
+        // Only meaningful inside a workspace — on welcome / opening-repo
+        // the reflog window has no repo to read from.
+        if matches!(app.view, View::Workspace(_)) {
+            app.reflog_open = true;
+        }
     }
 }
 
@@ -4174,6 +4382,93 @@ fn provider_matches_host(kind: &crate::providers::ProviderKind, host: &str) -> b
         }
         ProviderKind::Generic { host: h } => h.to_ascii_lowercase() == host,
     }
+}
+
+fn kind_action_label(kind: &GitJobKind) -> String {
+    match kind {
+        GitJobKind::Fetch { remote, .. } => format!("Fetching '{remote}'"),
+        GitJobKind::Push { remote, force, .. } => {
+            if *force {
+                format!("Force-pushing to '{remote}'")
+            } else {
+                format!("Pushing to '{remote}'")
+            }
+        }
+        GitJobKind::Pull {
+            remote,
+            branch,
+            strategy,
+            ..
+        } => {
+            let mode = match strategy {
+                crate::git::PullStrategy::Merge => "merge",
+                crate::git::PullStrategy::Rebase => "rebase",
+                crate::git::PullStrategy::FastForwardOnly => "fast-forward only",
+            };
+            format!("Pulling {remote}/{branch} ({mode})")
+        }
+    }
+}
+
+impl RepoExternalSnapshot {
+    fn requires_graph_refresh(&self, previous: &Self) -> bool {
+        self.head_name != previous.head_name
+            || self.head_oid != previous.head_oid
+            || self.packed_refs_mtime_ns != previous.packed_refs_mtime_ns
+            || self.refs_heads_mtime_ns != previous.refs_heads_mtime_ns
+            || self.refs_remotes_mtime_ns != previous.refs_remotes_mtime_ns
+            || self.fetch_head_mtime_ns != previous.fetch_head_mtime_ns
+            || self.stash_log_mtime_ns != previous.stash_log_mtime_ns
+    }
+}
+
+fn capture_repo_external_snapshot(repo: &Repo) -> RepoExternalSnapshot {
+    let git_dir = repo.git_dir();
+    RepoExternalSnapshot {
+        head_name: repo.head_name(),
+        head_oid: repo.head_oid(),
+        head_file_mtime_ns: file_mtime_ns(&git_dir.join("HEAD")),
+        packed_refs_mtime_ns: file_mtime_ns(&git_dir.join("packed-refs")),
+        refs_heads_mtime_ns: dir_tree_mtime_ns(&git_dir.join("refs").join("heads")),
+        refs_remotes_mtime_ns: dir_tree_mtime_ns(&git_dir.join("refs").join("remotes")),
+        fetch_head_mtime_ns: file_mtime_ns(&git_dir.join("FETCH_HEAD")),
+        stash_log_mtime_ns: file_mtime_ns(&git_dir.join("logs").join("refs").join("stash")),
+        index_mtime_ns: file_mtime_ns(&git_dir.join("index")),
+    }
+}
+
+fn file_mtime_ns(path: &Path) -> Option<u128> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(system_time_to_nanos)
+}
+
+fn dir_tree_mtime_ns(path: &Path) -> Option<u128> {
+    let mut newest = file_mtime_ns(path);
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return newest;
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        let child_mtime = if child.is_dir() {
+            dir_tree_mtime_ns(&child)
+        } else {
+            file_mtime_ns(&child)
+        };
+        newest = match (newest, child_mtime) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (None, Some(b)) => Some(b),
+            (some, None) => some,
+        };
+    }
+    newest
+}
+
+fn system_time_to_nanos(time: SystemTime) -> Option<u128> {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
 }
 
 pub fn default_remote_name(ws: &WorkspaceState, config: &Config) -> String {

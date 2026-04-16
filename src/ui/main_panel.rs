@@ -567,34 +567,67 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
                 }
             }
         }
-        CommitAction::CherryPick(oid) => {
+        CommitAction::CherryPick(oids) => {
+            if oids.is_empty() {
+                return out;
+            }
             let before = journal::capture(ws.repo.path()).ok();
-            match ws.repo.cherry_pick_commit(oid) {
-                Ok(new_oid) => {
-                    if let (Some(b), Ok(a)) = (before, journal::capture(ws.repo.path())) {
-                        out.journal_entry = Some((
-                            Operation::CherryPick {
-                                commits: vec![oid.to_string()],
-                            },
-                            b,
-                            a,
-                        ));
+            let mut applied: Vec<gix::ObjectId> = Vec::with_capacity(oids.len());
+            let mut last_new: Option<gix::ObjectId> = None;
+            let mut failure: Option<(gix::ObjectId, anyhow::Error)> = None;
+            // Loop one commit at a time so we journal each pick and
+            // surface conflicts at the exact commit that stopped the
+            // sequence — the user needs to know "picks 1 and 2 landed,
+            // pick 3 of 5 is mid-conflict".
+            for oid in &oids {
+                match ws.repo.cherry_pick_commit(*oid) {
+                    Ok(new_oid) => {
+                        applied.push(*oid);
+                        last_new = Some(new_oid);
                     }
-                    out.hud = Some(format!(
-                        "Cherry-picked {} → {}",
-                        short_sha(&oid),
-                        short_sha(&new_oid)
-                    ));
-                    out.rebuild = Some(scope);
+                    Err(e) => {
+                        failure = Some((*oid, e));
+                        break;
+                    }
                 }
-                Err(e) => {
+            }
+            if !applied.is_empty() {
+                if let (Some(b), Ok(a)) = (before, journal::capture(ws.repo.path())) {
+                    out.journal_entry = Some((
+                        Operation::CherryPick {
+                            commits: applied.iter().map(|o| o.to_string()).collect(),
+                        },
+                        b,
+                        a,
+                    ));
+                }
+                out.rebuild = Some(scope);
+            }
+            match failure {
+                None => {
+                    let summary = match (applied.len(), last_new) {
+                        (1, Some(new_oid)) => format!(
+                            "Cherry-picked {} → {}",
+                            short_sha(&applied[0]),
+                            short_sha(&new_oid)
+                        ),
+                        (n, _) => format!("Cherry-picked {n} commits"),
+                    };
+                    out.hud = Some(summary);
+                }
+                Some((failed_oid, e)) => {
+                    let picked = applied.len();
+                    let total = oids.len();
                     if !matches!(ws.repo.state(), crate::git::RepoState::Clean) {
                         out.hud = Some(format!(
-                            "Resolve conflicts for {} to continue the cherry-pick",
-                            short_sha(&oid)
+                            "Picked {picked}/{total} — resolve conflicts for {} to continue",
+                            short_sha(&failed_oid)
                         ));
                     } else {
-                        out.error = Some(format!("cherry-pick {}: {e:#}", short_sha(&oid)));
+                        out.error = Some(format!(
+                            "cherry-pick {} ({picked}/{total} applied): {e:#}",
+                            short_sha(&failed_oid)
+                        ));
                     }
                 }
             }
@@ -609,7 +642,12 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
             // Hard reset opens a confirmation prompt first — caller only gets
             // to actually reset after confirming.
             if matches!(mode, ResetMode::Hard) {
-                out.prompt = Some(prompt::hard_reset_confirm(branch, target));
+                let preflight = Some(crate::preflight::hard_reset(
+                    ws.repo.path(),
+                    &branch,
+                    target,
+                ));
+                out.prompt = Some(prompt::hard_reset_confirm(branch, target, preflight));
             } else {
                 let before = journal::capture(ws.repo.path()).ok();
                 match ws.repo.reset(mode, target) {
@@ -649,7 +687,12 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
             out.prompt = Some(prompt::rename_branch_prompt(from));
         }
         CommitAction::DeleteBranchPrompt { name, is_remote } => {
-            out.prompt = Some(prompt::delete_branch_confirm(name, is_remote));
+            let preflight = Some(crate::preflight::delete_branch(
+                ws.repo.path(),
+                &name,
+                is_remote,
+            ));
+            out.prompt = Some(prompt::delete_branch_confirm(name, is_remote, preflight));
         }
         CommitAction::SetUpstreamPrompt { branch } => {
             // Pull the remotes from the cached snapshot — no subprocess
