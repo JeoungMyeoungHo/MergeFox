@@ -43,6 +43,10 @@ pub struct MergeFoxApp {
     /// still exist for the journal HUD + legacy paths but are being
     /// migrated out. See `ui::notifications` for the queue.
     pub notifications: crate::ui::notifications::NotificationCenter,
+    /// True once the first `update` frame has fired startup-only
+    /// notifications (git-missing banner today; future additions
+    /// follow the same gate). Flips at most once per process.
+    pub startup_notified: bool,
     /// Blame modal state — current task, last result, error. Lives
     /// on the app so the modal survives frame-to-frame re-renders.
     pub blame: crate::ui::blame::BlameState,
@@ -882,6 +886,7 @@ impl MergeFoxApp {
             last_error: None,
             hud: None,
             notifications: crate::ui::notifications::NotificationCenter::default(),
+            startup_notified: false,
             blame: crate::ui::blame::BlameState::default(),
             bisect_ui: crate::ui::bisect::BisectUiState::default(),
             image_loaders_installed: false,
@@ -912,6 +917,30 @@ impl MergeFoxApp {
 
     pub fn refresh_git_capability(&mut self) {
         self.git_capability = crate::git::probe_git_capability();
+    }
+
+    /// Fire a one-shot startup notification when the system `git`
+    /// binary isn't on PATH. Without this the user only finds out
+    /// during their first write op, which is way too late for a Git
+    /// GUI — every fetch / commit / push silently fails until they
+    /// figure out they need to install git separately.
+    ///
+    /// We don't bundle git in the installer because:
+    ///   * macOS: Xcode CLT ships it; most devs already have it.
+    ///   * Windows: Git for Windows is ~50 MB; bundling would double
+    ///     the mergeFox installer size and the `git` licence (GPLv2)
+    ///     gets weird when combined with our Apache-2.0 code. Users
+    ///     should install git themselves via the official MSI.
+    ///   * Linux: always available via the package manager; our
+    ///     `.deb` / `.rpm` list it as a dependency.
+    pub fn notify_git_probe_on_startup(&mut self) {
+        if !self.git_capability.is_available() {
+            let detail = self.git_capability.install_guidance().to_string();
+            self.notify_err_with_detail(
+                "System `git` not found on PATH — mergeFox needs git for all write operations.",
+                detail,
+            );
+        }
     }
 
     pub fn git_missing_message(&self, action: &str) -> String {
@@ -4374,6 +4403,16 @@ impl eframe::App for MergeFoxApp {
             tracing::trace!(target: "mergefox::profile::frame", gap_since_last_ms = gap_ms, "frame start");
         }
         ui::theme::apply(ctx, &self.config.theme);
+
+        // One-shot startup notifications. Fired on the first `update`
+        // frame so the notification center has been rendered at least
+        // once and the toast isn't competing with layout settling.
+        // Re-checking on each frame would spam the notification queue
+        // if git goes missing mid-session — explicit "check once" flag.
+        if !self.startup_notified {
+            self.startup_notified = true;
+            self.notify_git_probe_on_startup();
+        }
         handle_hotkeys(ctx, self);
         self.poll_opening_repo();
         self.poll_clone_jobs();

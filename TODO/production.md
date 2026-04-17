@@ -69,10 +69,15 @@
 - opt-in, 개인정보(경로/브랜치명) 해시 처리
 - `panic_recovery.rs`와 연동: UI 복구 + dump 저장 병행
 
-### A5. 패키징 자동화  ⛔  **P1**
-- `cargo-dist` 또는 `cargo-bundle` 표준화
-- Homebrew cask, winget, Flathub (베타 이후)
-- `Dockerfile.build`는 재현 빌드용으로 유지
+### A5. 패키징 자동화  🟡  **P1**
+- ✅ `cargo-dist` v0.31 채택 — `dist-workspace.toml` + 자동생성 `release.yml`
+- ✅ 타겟 5종: macOS arm64/x64, Linux x64/arm64, Windows x64
+- ✅ Windows **MSI** (WiX) — 셋업 완료
+- ✅ Shell / PowerShell 설치 스크립트 자동생성
+- ✅ Source tarball + SHA256 체크섬 자동
+- ⛔ DMG는 서명 없이 UX 이득 없어 베타까지 유예 (Gatekeeper가 어차피 차단)
+- ⛔ Homebrew cask / winget / Flathub — 안정 릴리스 후
+- ⛔ `.deb` / `.rpm` — 베타 이후 (git dep를 패키지 메타데이터에 선언)
 
 ### A6. `Cargo.toml` 메타데이터 정리  🟢  **P0**
 - ✅ `repository`, `homepage`, `documentation` 실제 URL
