@@ -133,9 +133,11 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 return;
             }
 
-            if modal.selected_owner.as_ref().is_none_or(|login| {
-                !modal.owners.iter().any(|owner| owner.login == *login)
-            }) {
+            if modal
+                .selected_owner
+                .as_ref()
+                .is_none_or(|login| !modal.owners.iter().any(|owner| owner.login == *login))
+            {
                 modal.selected_owner = modal.owners.first().map(|owner| owner.login.clone());
             }
 

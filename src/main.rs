@@ -30,6 +30,25 @@ fn main() -> eframe::Result<()> {
     // alive for the full `main` scope.
     let _log_guard = logging::init();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--mcp-stdio") {
+        match mcp::server::repo_path_from_args(&args) {
+            Ok(Some(repo_path)) => {
+                if let Err(err) = mcp::server::run_stdio(&repo_path) {
+                    eprintln!("mergefox --mcp-stdio: {err:#}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            Ok(None) => return Ok(()),
+            Err(err) => {
+                eprintln!("mergefox: {err:#}");
+                mcp::server::print_help();
+                std::process::exit(2);
+            }
+        }
+    }
+
     let preferred = preferred_renderer();
     run(preferred).or_else(|err| {
         if matches!(preferred, eframe::Renderer::Glow) {

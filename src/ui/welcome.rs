@@ -7,8 +7,8 @@ use crate::clone::{self, Stage};
 use crate::config::{CloneSizePolicy, UiLanguage};
 use crate::git_url;
 use crate::providers::{
-    self, AccountId, CreateRepositoryDraft, ProviderAccount, RemoteRepoOwner,
-    RemoteRepoOwnerKind, RemoteRepoSummary,
+    self, AccountId, CreateRepositoryDraft, ProviderAccount, RemoteRepoOwner, RemoteRepoOwnerKind,
+    RemoteRepoSummary,
 };
 
 /// What the user asked us to do while drawing this frame. We defer
@@ -518,9 +518,7 @@ fn render_remote_repo_creator(
                 egui::Color32::from_rgb(140, 210, 160),
                 format!(
                     "{} {}/{}",
-                    labels.created_remote_repo,
-                    created.owner,
-                    created.repo
+                    labels.created_remote_repo, created.owner, created.repo
                 ),
             );
             ui.horizontal(|ui| {
@@ -559,15 +557,14 @@ fn render_remote_repo_creator(
             return;
         }
 
-        if create_state
-            .selected_owner
-            .as_ref()
-            .is_none_or(|login| !create_state.owners.iter().any(|owner| owner.login == *login))
-        {
-            create_state.selected_owner = create_state
+        if create_state.selected_owner.as_ref().is_none_or(|login| {
+            !create_state
                 .owners
-                .first()
-                .map(|owner| owner.login.clone());
+                .iter()
+                .any(|owner| owner.login == *login)
+        }) {
+            create_state.selected_owner =
+                create_state.owners.first().map(|owner| owner.login.clone());
         }
 
         ui.horizontal(|ui| {
@@ -575,7 +572,12 @@ fn render_remote_repo_creator(
             let owner_text = create_state
                 .selected_owner
                 .as_deref()
-                .and_then(|login| create_state.owners.iter().find(|owner| owner.login == login))
+                .and_then(|login| {
+                    create_state
+                        .owners
+                        .iter()
+                        .find(|owner| owner.login == login)
+                })
                 .map(remote_repo_owner_label)
                 .unwrap_or_else(|| labels.choose_account.to_string());
             egui::ComboBox::from_id_salt("welcome_create_remote_repo_owner")
@@ -610,10 +612,9 @@ fn render_remote_repo_creator(
             if ui.button(labels.hide_remote_repo_creator).clicked() {
                 create_state.open = false;
             }
-            let can_create =
-                selected_account.is_some()
-                    && create_state.selected_owner.is_some()
-                    && !create_state.name.trim().is_empty();
+            let can_create = selected_account.is_some()
+                && create_state.selected_owner.is_some()
+                && !create_state.name.trim().is_empty();
             ui.add_enabled_ui(can_create && create_state.create_task.is_none(), |ui| {
                 if ui.button(labels.create_remote_repo_submit).clicked() {
                     let Some(account) = selected_account else {

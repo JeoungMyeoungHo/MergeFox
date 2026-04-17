@@ -33,6 +33,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use syn::visit::Visit;
 
@@ -60,6 +61,11 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={FONT_PATH}");
     println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    println!("cargo:rerun-if-changed=.git/refs");
+
+    emit_build_metadata();
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR set by cargo"));
     let out_path = out_dir.join(OUT_FILE);
@@ -146,6 +152,18 @@ fn main() {
         subset_bytes.len(),
         font_bytes.len(),
     );
+}
+
+fn emit_build_metadata() {
+    let commit = Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=MERGEFOX_BUILD_COMMIT={commit}");
 }
 
 /// Walk `src/` and feed every `.rs` file's string literals into the
