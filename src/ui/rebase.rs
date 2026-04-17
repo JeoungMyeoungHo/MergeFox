@@ -52,6 +52,9 @@ mod palette {
     pub const REWORD: Color32 = Color32::from_rgb(222, 180, 80);
     /// Muted grey for Squash.
     pub const SQUASH: Color32 = Color32::from_rgb(160, 160, 170);
+    /// Desaturated muted grey-blue for Fixup — same shape as Squash
+    /// but cooler so the two are telegraphed apart at a glance.
+    pub const FIXUP: Color32 = Color32::from_rgb(130, 150, 180);
     /// Red for Drop.
     pub const DROP: Color32 = Color32::from_rgb(218, 90, 90);
     /// Soft accent used around the bottom detail pane.
@@ -65,6 +68,7 @@ fn action_color(action: RebaseAction) -> Color32 {
         RebaseAction::Pick => palette::PICK,
         RebaseAction::Reword => palette::REWORD,
         RebaseAction::Squash => palette::SQUASH,
+        RebaseAction::Fixup => palette::FIXUP,
         RebaseAction::Drop => palette::DROP,
     }
 }
@@ -153,7 +157,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
                         let item = &mut modal.items[idx];
                         let dimmed = matches!(item.action, RebaseAction::Drop);
-                        let squashed = matches!(item.action, RebaseAction::Squash);
+                        let squashed = item.action.rolls_into_parent();
 
                         render_plan_row(
                             ui,
@@ -258,16 +262,18 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 fn compute_squash_targets(items: &[crate::app::RebasePlanItem]) -> Vec<Option<usize>> {
     let mut out = vec![None; items.len()];
     for (i, item) in items.iter().enumerate() {
-        if matches!(item.action, RebaseAction::Squash) {
-            // Walk backwards to find the nearest non-Squash, non-Drop anchor.
+        if item.action.rolls_into_parent() {
+            // Walk backwards to find the nearest non-Squash, non-Fixup,
+            // non-Drop anchor. That's the commit that keeps the
+            // history entry; our squash/fixup rolls into it.
             for j in (0..i).rev() {
-                match items[j].action {
-                    RebaseAction::Drop | RebaseAction::Squash => continue,
-                    _ => {
-                        out[i] = Some(j);
-                        break;
-                    }
+                if items[j].action.rolls_into_parent()
+                    || matches!(items[j].action, RebaseAction::Drop)
+                {
+                    continue;
                 }
+                out[i] = Some(j);
+                break;
             }
         }
     }
@@ -328,7 +334,7 @@ fn render_plan_row(
                     *select_idx = Some(idx);
                 }
 
-                // Action label + inline dropdown (Pick / Reword / Squash / Drop).
+                // Action label + inline dropdown.
                 egui::ComboBox::from_id_salt(("rebase_action", idx))
                     .selected_text(RichText::new(item.action.label()).color(accent).strong())
                     .width(82.0)
@@ -337,10 +343,21 @@ fn render_plan_row(
                             RebaseAction::Pick,
                             RebaseAction::Reword,
                             RebaseAction::Squash,
+                            RebaseAction::Fixup,
                             RebaseAction::Drop,
                         ] {
                             let label = RichText::new(action.label()).color(action_color(action));
-                            ui.selectable_value(&mut item.action, action, label);
+                            let tip = match action {
+                                RebaseAction::Pick => "Keep this commit as-is.",
+                                RebaseAction::Reword => "Keep the commit, edit its message.",
+                                RebaseAction::Squash =>
+                                    "Merge into the previous kept commit; combine both messages in an editor.",
+                                RebaseAction::Fixup =>
+                                    "Merge into the previous kept commit; discard this commit's message.",
+                                RebaseAction::Drop => "Remove this commit from history.",
+                            };
+                            ui.selectable_value(&mut item.action, action, label)
+                                .on_hover_text(tip);
                         }
                     });
 
@@ -471,6 +488,21 @@ fn render_commit_detail(ui: &mut egui::Ui, item: &mut crate::app::RebasePlanItem
                             .desired_width(f32::INFINITY)
                             .font(egui::TextStyle::Monospace),
                     );
+                }
+                RebaseAction::Fixup => {
+                    ui.colored_label(
+                        palette::FIXUP,
+                        "This commit will be merged into the previous kept commit; its message will be discarded.",
+                    );
+                    let mut preview = item.original_message.clone();
+                    ui.add(
+                        TextEdit::multiline(&mut preview)
+                            .desired_rows(6)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace)
+                            .interactive(false),
+                    );
+                    ui.weak("Switch to Squash if you want to keep / edit this commit's message.");
                 }
                 RebaseAction::Pick => {
                     ui.label(RichText::new("Commit message").strong());

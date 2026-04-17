@@ -162,6 +162,243 @@ fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeInfo> {
     out
 }
 
+/// Summary of the current `git bisect` session.
+#[derive(Debug, Clone, Default)]
+pub struct BisectStatus {
+    pub good_count: u32,
+    pub bad_count: u32,
+    pub skip_count: u32,
+    /// The most recent progress line git printed, e.g.
+    /// "Bisecting: 3 revisions left to test after this". Empty when
+    /// nothing has been marked yet.
+    pub last_progress: String,
+    /// True when git has concluded — `log` ends with a "first bad
+    /// commit is <sha>" line.
+    pub concluded: bool,
+    pub conclusion_sha: Option<String>,
+}
+
+impl BisectStatus {
+    fn parse(log: &str) -> Self {
+        let mut s = Self::default();
+        for line in log.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("# first bad commit: ") {
+                s.concluded = true;
+                s.conclusion_sha = rest.split_whitespace().next().map(|x| x.to_string());
+            } else if trimmed.starts_with("# bad: ") {
+                s.bad_count += 1;
+            } else if trimmed.starts_with("# good: ") {
+                s.good_count += 1;
+            } else if trimmed.starts_with("# skip: ") {
+                s.skip_count += 1;
+            } else if trimmed.starts_with("# Bisecting:") {
+                s.last_progress = trimmed.trim_start_matches("# ").to_string();
+            }
+        }
+        s
+    }
+}
+
+#[cfg(test)]
+mod bisect_tests {
+    use super::*;
+
+    #[test]
+    fn parses_in_progress_session() {
+        let log = "git bisect start\n# bad: abcdef1 commit A\n# good: 1234567 commit B\n# Bisecting: 2 revisions left to test after this (roughly 1 step)\n";
+        let s = BisectStatus::parse(log);
+        assert_eq!(s.bad_count, 1);
+        assert_eq!(s.good_count, 1);
+        assert_eq!(s.skip_count, 0);
+        assert!(!s.concluded);
+        assert!(s.last_progress.contains("2 revisions"));
+    }
+
+    #[test]
+    fn parses_concluded_session() {
+        let log = "git bisect start\n# bad: abcdef1 ...\n# good: 1234567 ...\n# first bad commit: deadbeef12345 the culprit\n";
+        let s = BisectStatus::parse(log);
+        assert!(s.concluded);
+        assert_eq!(s.conclusion_sha.as_deref(), Some("deadbeef12345"));
+    }
+}
+
+/// One row from `git submodule status`.
+#[derive(Debug, Clone)]
+pub struct SubmoduleEntry {
+    /// Submodule path relative to the superproject root.
+    pub path: String,
+    /// The SHA currently recorded / checked out.
+    pub sha: String,
+    /// `git describe` output in parentheses, if git printed one
+    /// ("v1.2.3-4-gabcdef"). Most callers can ignore this.
+    pub described: Option<String>,
+    pub state: SubmoduleState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmoduleState {
+    /// Initialised, checked out at the expected SHA.
+    InSync,
+    /// Never initialised (`git submodule init` not run).
+    NotInitialised,
+    /// Working copy SHA differs from the one in `.gitmodules`. Needs
+    /// `submodule update` (or a superproject commit).
+    Modified,
+    /// Merge conflict inside the submodule.
+    Conflict,
+}
+
+fn parse_submodule_status(text: &str) -> Vec<SubmoduleEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (prefix, rest) = line.split_at(1);
+        let state = match prefix {
+            "-" => SubmoduleState::NotInitialised,
+            "+" => SubmoduleState::Modified,
+            "U" => SubmoduleState::Conflict,
+            _ => SubmoduleState::InSync,
+        };
+        let rest = rest.trim_start();
+        // `<sha> <path>[ (<describe>)]`
+        let Some((sha, rest2)) = rest.split_once(' ') else {
+            continue;
+        };
+        let (path, described) = match rest2.find(" (") {
+            Some(idx) => {
+                let (p, desc) = rest2.split_at(idx);
+                let desc = desc.trim_start_matches(" (").trim_end_matches(')');
+                (p.to_string(), Some(desc.to_string()))
+            }
+            None => (rest2.to_string(), None),
+        };
+        out.push(SubmoduleEntry {
+            path,
+            sha: sha.to_string(),
+            described,
+            state,
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod submodule_tests {
+    use super::*;
+
+    #[test]
+    fn parses_mixed_states() {
+        let input = concat!(
+            " abcdef0123456789 vendor/in-sync (v1.0.0)\n",
+            "-feedfacefeedface vendor/not-init\n",
+            "+deadbeefdeadbeef vendor/modified (heads/main-dirty)\n",
+            "Ucafebabecafebabe vendor/conflict\n",
+        );
+        let v = parse_submodule_status(input);
+        assert_eq!(v.len(), 4);
+        assert_eq!(v[0].state, SubmoduleState::InSync);
+        assert_eq!(v[0].described.as_deref(), Some("v1.0.0"));
+        assert_eq!(v[1].state, SubmoduleState::NotInitialised);
+        assert_eq!(v[2].state, SubmoduleState::Modified);
+        assert_eq!(v[3].state, SubmoduleState::Conflict);
+        assert_eq!(v[3].described, None);
+    }
+}
+
+/// Sparse-checkout state snapshot. See `Repo::sparse_checkout_status`.
+#[derive(Debug, Clone, Default)]
+pub struct SparseCheckoutStatus {
+    /// True when `.git/info/sparse-checkout` exists — i.e. sparse
+    /// mode has been initialised at any point on this clone.
+    pub enabled: bool,
+    /// True when `core.sparseCheckoutCone` is set to true. We only
+    /// manage cone mode through the UI; `enabled && !cone` means an
+    /// external tool / advanced user configured classic mode and we
+    /// surface read-only information without offering to edit it.
+    pub cone: bool,
+    /// The current pattern list (one per line in the internal
+    /// sparse-checkout file). Empty when disabled.
+    pub patterns: Vec<String>,
+}
+
+/// Structured view of `git count-objects -v`. Fields mirror the keys git
+/// emits; everything is optional because git occasionally omits lines on
+/// trivial repos.
+#[derive(Debug, Clone, Default)]
+pub struct CountObjectsSummary {
+    pub count: Option<u64>,
+    pub size_kib: Option<u64>,
+    pub in_pack: Option<u64>,
+    pub packs: Option<u64>,
+    pub size_pack_kib: Option<u64>,
+    pub prune_packable: Option<u64>,
+    pub garbage: Option<u64>,
+    pub size_garbage_kib: Option<u64>,
+}
+
+impl CountObjectsSummary {
+    fn parse(text: &str) -> Self {
+        let mut out = Self::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            let slot: Option<&mut Option<u64>> = match key.trim() {
+                "count" => Some(&mut out.count),
+                "size" => Some(&mut out.size_kib),
+                "in-pack" => Some(&mut out.in_pack),
+                "packs" => Some(&mut out.packs),
+                "size-pack" => Some(&mut out.size_pack_kib),
+                "prune-packable" => Some(&mut out.prune_packable),
+                "garbage" => Some(&mut out.garbage),
+                "size-garbage" => Some(&mut out.size_garbage_kib),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                *slot = value.parse::<u64>().ok();
+            }
+        }
+        out
+    }
+
+    /// Does the repo have a lot of loose objects? Used by the UI to
+    /// suggest running `repack`. Threshold of 1 MiB of loose objects
+    /// matches git's own auto-gc heuristic (`gc.auto` default 6700
+    /// objects, which is ~1 MiB of typical commits).
+    pub fn suggests_repack(&self) -> bool {
+        self.size_kib.map(|kib| kib > 1024).unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod count_objects_tests {
+    use super::*;
+
+    #[test]
+    fn parses_typical_output() {
+        let input = "count: 42\nsize: 128\nin-pack: 9000\npacks: 2\nsize-pack: 4096\nprune-packable: 0\ngarbage: 0\nsize-garbage: 0\n";
+        let s = CountObjectsSummary::parse(input);
+        assert_eq!(s.count, Some(42));
+        assert_eq!(s.size_kib, Some(128));
+        assert_eq!(s.in_pack, Some(9000));
+        assert_eq!(s.packs, Some(2));
+    }
+
+    #[test]
+    fn suggests_repack_when_loose_over_1mib() {
+        let mut s = CountObjectsSummary::default();
+        s.size_kib = Some(2048);
+        assert!(s.suggests_repack());
+        s.size_kib = Some(500);
+        assert!(!s.suggests_repack());
+    }
+}
+
 #[cfg(test)]
 mod worktree_tests {
     use super::*;
@@ -813,6 +1050,248 @@ impl Repo {
         let path_str = path.to_string_lossy().into_owned();
         super::cli::run(&self.path, ["worktree", "unlock", &path_str])?;
         Ok(())
+    }
+
+    // ---------- maintenance (fsck / gc / repack) ----------
+    //
+    // These are long-running and IO-heavy on big repos. Callers are
+    // expected to spawn them on a background thread (see `git::jobs`
+    // pattern) — the ops themselves are plain CLI invocations so
+    // stdout / stderr can be reported back to the UI verbatim.
+
+    /// `git fsck --full` — check the object database for corruption.
+    /// Returns stdout (dangling / missing objects, if any).
+    pub fn fsck(&self) -> Result<String> {
+        let out = super::cli::run(
+            &self.path,
+            ["fsck", "--full", "--strict", "--no-progress"],
+        )?;
+        Ok(out.stdout_str())
+    }
+
+    /// `git gc` — pack loose objects, prune unreachable. `aggressive`
+    /// maps to `--aggressive` (slower, better compression). For the
+    /// common case use `aggressive = false`.
+    pub fn gc(&self, aggressive: bool) -> Result<String> {
+        let mut args: Vec<&str> = vec!["gc"];
+        if aggressive {
+            args.push("--aggressive");
+        }
+        args.push("--no-cruft");
+        let out = super::cli::run(&self.path, args)?;
+        // `git gc` typically says nothing on success — return a short
+        // summary the UI can show as a toast.
+        let mut text = out.stdout_str();
+        if text.trim().is_empty() {
+            text = if aggressive {
+                "gc --aggressive complete".to_string()
+            } else {
+                "gc complete".to_string()
+            };
+        }
+        Ok(text)
+    }
+
+    /// `git repack -Ad` — consolidate all packs into a single one,
+    /// delete redundant old packs (`-d`), include all objects (`-A`).
+    /// Useful after a big fetch / history rewrite. Much cheaper than
+    /// `gc --aggressive` when only packing needs to be redone.
+    pub fn repack(&self) -> Result<String> {
+        let out = super::cli::run(&self.path, ["repack", "-A", "-d", "-l"])?;
+        let mut text = out.stdout_str();
+        if text.trim().is_empty() {
+            text = "repack complete".to_string();
+        }
+        Ok(text)
+    }
+
+    /// `git count-objects -v` — summary of loose object count + pack
+    /// size. Read before offering gc/repack so the UI can say
+    /// "~120 MB of loose objects, repack recommended".
+    pub fn count_objects(&self) -> Result<CountObjectsSummary> {
+        let out = super::cli::run(&self.path, ["count-objects", "-v"])?;
+        Ok(CountObjectsSummary::parse(&out.stdout_str()))
+    }
+
+    // ---------- sparse-checkout ----------
+    //
+    // We use the modern `cone` mode exclusively. Classic (non-cone)
+    // sparse-checkout accepts gitignore-style patterns which is more
+    // flexible but has known correctness footguns that git itself
+    // warns about on every invocation; a UI tool should not be the one
+    // pushing users toward that mode.
+
+    /// Current sparse-checkout state for this repo.
+    pub fn sparse_checkout_status(&self) -> SparseCheckoutStatus {
+        let enabled = self
+            .path
+            .join(".git")
+            .join("info")
+            .join("sparse-checkout")
+            .is_file();
+        // `git config --bool core.sparseCheckoutCone` returns "true" /
+        // "false" / errors when unset. Default to cone=on when enabled
+        // since that's what `git sparse-checkout init` sets.
+        let cone = super::cli::run(
+            &self.path,
+            ["config", "--bool", "core.sparseCheckoutCone"],
+        )
+        .ok()
+        .map(|o| o.stdout_str().trim() == "true")
+        .unwrap_or(enabled);
+        let patterns = if enabled {
+            super::cli::run(&self.path, ["sparse-checkout", "list"])
+                .ok()
+                .map(|o| {
+                    o.stdout_str()
+                        .lines()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        SparseCheckoutStatus {
+            enabled,
+            cone,
+            patterns,
+        }
+    }
+
+    /// Enable sparse-checkout in cone mode and set the given directory
+    /// patterns. Each pattern should be a repo-relative directory path
+    /// ("src/ui", "crates/foo"). Empty list = everything excluded
+    /// except the top-level files — which matches git's own behaviour
+    /// on `sparse-checkout init` with no set call.
+    pub fn sparse_checkout_enable_cone(&self, patterns: &[String]) -> Result<()> {
+        super::cli::run(&self.path, ["sparse-checkout", "init", "--cone"])?;
+        if !patterns.is_empty() {
+            let mut args: Vec<&str> = vec!["sparse-checkout", "set"];
+            for p in patterns {
+                args.push(p.as_str());
+            }
+            super::cli::run(&self.path, args)?;
+        }
+        Ok(())
+    }
+
+    /// Disable sparse-checkout — restores every tracked path on the
+    /// next checkout. Equivalent to `git sparse-checkout disable`.
+    pub fn sparse_checkout_disable(&self) -> Result<()> {
+        super::cli::run(&self.path, ["sparse-checkout", "disable"])?;
+        Ok(())
+    }
+
+    // ---------- submodules ----------
+
+    /// Parse `git submodule status` into structured entries. Each line
+    /// is `<prefix><sha> <path> [(<described>)]` where the prefix is:
+    ///   * ` ` (space) — initialised + checked out at this SHA
+    ///   * `-`         — not initialised
+    ///   * `+`         — SHA in the working copy differs from `.gitmodules`
+    ///   * `U`         — merge conflict
+    pub fn submodule_status(&self) -> Result<Vec<SubmoduleEntry>> {
+        let out = super::cli::run(&self.path, ["submodule", "status"])?;
+        Ok(parse_submodule_status(&out.stdout_str()))
+    }
+
+    /// `git submodule update --init --recursive [path]` or all when
+    /// `path` is `None`.
+    pub fn submodule_update(&self, path: Option<&str>) -> Result<String> {
+        let mut args: Vec<&str> = vec!["submodule", "update", "--init", "--recursive"];
+        if let Some(p) = path {
+            args.push("--");
+            args.push(p);
+        }
+        let out = super::cli::run(&self.path, args)?;
+        Ok(out.stdout_str())
+    }
+
+    /// `git submodule sync --recursive [path]`. Refreshes registered
+    /// URLs from `.gitmodules` — useful after someone renames a
+    /// submodule's remote URL upstream.
+    pub fn submodule_sync(&self, path: Option<&str>) -> Result<String> {
+        let mut args: Vec<&str> = vec!["submodule", "sync", "--recursive"];
+        if let Some(p) = path {
+            args.push("--");
+            args.push(p);
+        }
+        let out = super::cli::run(&self.path, args)?;
+        Ok(out.stdout_str())
+    }
+
+    // ---------- bisect ----------
+    //
+    // `git bisect` is itself a state machine inside git: `start`
+    // initialises `.git/BISECT_*`, each `good`/`bad`/`skip` narrows
+    // the range, and `reset` tears down. We shell out one call at a
+    // time and report the parsed status so the UI can show progress
+    // without duplicating git's internal state.
+
+    /// Start a bisect session. If `bad` / `good` are provided, git
+    /// short-circuits the initial "mark a bad and a good" round and
+    /// jumps straight to the first checkout.
+    pub fn bisect_start(&self, bad: Option<&str>, good: Option<&str>) -> Result<String> {
+        let mut args: Vec<String> = vec!["bisect".into(), "start".into()];
+        if let Some(b) = bad {
+            args.push(b.to_string());
+        }
+        if let Some(g) = good {
+            args.push(g.to_string());
+        }
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = super::cli::run(&self.path, args_ref)?;
+        Ok(out.stdout_str())
+    }
+
+    /// Mark the current HEAD bad. Returns git's message (which usually
+    /// includes the next SHA to check out or the culprit's SHA if
+    /// narrowing is complete).
+    pub fn bisect_bad(&self) -> Result<String> {
+        let out = super::cli::run(&self.path, ["bisect", "bad"])?;
+        Ok(out.stdout_str())
+    }
+
+    pub fn bisect_good(&self) -> Result<String> {
+        let out = super::cli::run(&self.path, ["bisect", "good"])?;
+        Ok(out.stdout_str())
+    }
+
+    /// Mark the current HEAD "skip" — git picks another commit in
+    /// range rather than concluding the decision is blocked on this
+    /// one. Useful for commits that don't build.
+    pub fn bisect_skip(&self) -> Result<String> {
+        let out = super::cli::run(&self.path, ["bisect", "skip"])?;
+        Ok(out.stdout_str())
+    }
+
+    /// End the bisect session and return to the branch in use when
+    /// `bisect start` was called. Always safe to call even if no
+    /// session is active — git returns "We are not bisecting" which
+    /// we pass through.
+    pub fn bisect_reset(&self) -> Result<String> {
+        let out = super::cli::run(&self.path, ["bisect", "reset"])?;
+        Ok(out.stdout_str())
+    }
+
+    /// `BISECT_START` marker file under `.git/` — a cheap yes/no
+    /// check that doesn't require running git. Used to hide the
+    /// "Start bisect" button when a session is already running (and
+    /// vice versa).
+    pub fn bisect_active(&self) -> bool {
+        self.path.join(".git").join("BISECT_START").is_file()
+    }
+
+    /// Read the bisect log so the UI can show "3 commits remaining, 2
+    /// marked good, 1 marked bad". Each line is one of
+    ///   `# bad: <sha> <subject>` / `# good: <sha> …` / `# bisect: N …`
+    /// plus the raw commit commands git writes. We only surface the
+    /// `good` / `bad` / `skip` counters plus the remaining-range line.
+    pub fn bisect_status(&self) -> Option<BisectStatus> {
+        let log = super::cli::run(&self.path, ["bisect", "log"]).ok()?;
+        Some(BisectStatus::parse(&log.stdout_str()))
     }
 
     pub fn staged_diff_text(&self, max_bytes: usize) -> Result<String> {
