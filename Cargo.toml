@@ -1,9 +1,13 @@
 [package]
 name = "mergefox"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2021"
 rust-version = "1.76"
 description = "mergeFox — lightweight cross-platform Git GUI focused on branch management, undo/redo, and remote integrations"
+# `authors` is required by the WiX MSI generator (cargo-dist). We use
+# the GitHub handle as the canonical identity; real contributors show
+# up in git log + NOTICE.
+authors = ["JeoungMyeoungHo"]
 license = "Apache-2.0"
 repository = "https://github.com/JeoungMyeoungHo/MergeFox"
 homepage = "https://github.com/JeoungMyeoungHo/MergeFox"
@@ -19,6 +23,12 @@ exclude = [
     "TODO/",
     "RELEASE_NOTES.md",
 ]
+
+[package.metadata.wix]
+upgrade-guid = "A68E0845-2B4A-4534-9EB2-5B22D77E4FA7"
+path-guid = "5757851E-6DE2-451D-BB58-EB06C4D9D144"
+license = false
+eula = false
 
 [[bin]]
 name = "mergefox"
@@ -159,3 +169,8 @@ panic = "abort"
 
 [profile.dev]
 opt-level = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
