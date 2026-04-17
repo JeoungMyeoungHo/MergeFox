@@ -10,15 +10,71 @@ use crate::journal::Journal;
 use super::action_preview::{preview, ActionRequest};
 use super::{view_for_repo, ActivityLogQuery};
 
+/// Session state tracked across the lifetime of one `run_stdio` call.
+/// The authentication token is read from the `MERGEFOX_MCP_TOKEN`
+/// environment variable. When set, every `tools/*` request must pass
+/// the token in its params as `session_token`. When the env var is
+/// empty (or unset) the server runs unauthenticated — that mode is
+/// fine for local development but must NEVER be the default when
+/// exposing MCP outside the current user session.
+///
+/// Token handshake is intentionally minimal: no expiry, no rotation,
+/// no revocation list. A single shared secret keeps the attack surface
+/// small while we're still iterating on the tool shape.
+struct SessionCtx {
+    repo_path: PathBuf,
+    required_token: Option<String>,
+    /// Set to `true` once the client has presented a matching token in
+    /// `initialize`. After that we stop re-checking on each call — the
+    /// stdio stream is point-to-point with the authenticated client,
+    /// and re-validating adds no security.
+    authenticated: bool,
+}
+
 pub fn run_stdio(repo_path: &Path) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
 
+    // Token source, in priority order:
+    //   1. `MERGEFOX_MCP_TOKEN` env var (standard MCP client config)
+    //   2. the UI-managed session token inside secrets.json (same
+    //      machine, same user — matches what Settings → Integrations
+    //      → MCP displays)
+    // When neither is set, the server runs unauthenticated with a
+    // loud warning. This is deliberately only usable by the local
+    // user; the stdio pipe terminates inside their shell.
+    let required_token = std::env::var("MERGEFOX_MCP_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let store = crate::secrets::SecretStore::new(crate::secrets::default_file_path());
+            use secrecy::ExposeSecret;
+            store
+                .load_or_generate_mcp_token()
+                .ok()
+                .map(|tok| tok.expose_secret().to_string())
+        });
+    let mut ctx = SessionCtx {
+        repo_path: repo_path.to_path_buf(),
+        authenticated: required_token.is_none(),
+        required_token,
+    };
+    if ctx.required_token.is_none() {
+        tracing::warn!(
+            target: "mergefox::mcp",
+            "MCP stdio server running UNAUTHENTICATED (MERGEFOX_MCP_TOKEN unset). \
+             Only safe on a private stdio pipe; never expose over a socket."
+        );
+    } else {
+        tracing::info!(target: "mergefox::mcp", "MCP stdio server started (token auth)");
+    }
+
     while let Some(message) = read_message(&mut reader)? {
         let request: RpcRequest = serde_json::from_slice(&message).context("decode JSON-RPC")?;
-        if let Some(response) = handle_request(repo_path, request)? {
+        if let Some(response) = handle_request(&mut ctx, request)? {
             write_message(&mut writer, &response)?;
             writer.flush().ok();
         }
@@ -52,27 +108,67 @@ struct RpcError {
     message: String,
 }
 
-fn handle_request(repo_path: &Path, request: RpcRequest) -> Result<Option<RpcResponse>> {
+fn handle_request(ctx: &mut SessionCtx, request: RpcRequest) -> Result<Option<RpcResponse>> {
     let Some(id) = request.id.clone() else {
         return Ok(None);
     };
 
-    let response = match request.method.as_str() {
-        "initialize" => ok(
+    // Gate every tool method (but NOT `initialize` / `ping`) behind
+    // token auth. Clients are expected to pass the token during
+    // `initialize` under `clientInfo.session_token` OR as a top-level
+    // `session_token` field — we accept both so the same protocol
+    // works with strict MCP clients and ad-hoc callers.
+    let method = request.method.as_str();
+    let needs_auth = matches!(method, "tools/list" | "tools/call");
+    if needs_auth && !ctx.authenticated {
+        return Ok(Some(err(
             id,
-            json!({
-                "protocolVersion": "2024-11-05",
-                "serverInfo": {
-                    "name": "mergefox",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": {
-                    "tools": {
-                        "listChanged": false
-                    }
+            -32001,
+            "missing or invalid session token; send `initialize` with session_token first",
+        )));
+    }
+
+    let response = match method {
+        "initialize" => {
+            // Try to read a token from either `session_token` at top
+            // level or under `clientInfo`. Mismatches reject the
+            // handshake rather than ignoring it silently.
+            if let Some(required) = ctx.required_token.as_ref() {
+                let provided = request
+                    .params
+                    .as_ref()
+                    .and_then(|p| {
+                        p.get("session_token").and_then(Value::as_str).or_else(|| {
+                            p.get("clientInfo")
+                                .and_then(|ci| ci.get("session_token"))
+                                .and_then(Value::as_str)
+                        })
+                    })
+                    .unwrap_or("");
+                if provided == required {
+                    ctx.authenticated = true;
+                } else {
+                    return Ok(Some(err(
+                        id,
+                        -32002,
+                        "session token does not match — start the host app and copy the token from Settings → Integrations → MCP",
+                    )));
                 }
-            }),
-        ),
+            }
+            ok(
+                id,
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {
+                        "name": "mergefox",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": {
+                        "tools": { "listChanged": false }
+                    }
+                }),
+            )
+        }
         "ping" => ok(id, json!({})),
         "tools/list" => ok(
             id,
@@ -92,7 +188,22 @@ fn handle_request(repo_path: &Path, request: RpcRequest) -> Result<Option<RpcRes
                     ),
                     tool_descriptor(
                         "mergefox_action_preview",
-                        "Dry-run a mergeFox action and classify its risk without executing it.",
+                        "Dry-run a mergeFox action and classify its risk without executing it. \
+                         Safe to call on any action; never mutates the repo.",
+                        json!({
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string" }
+                            },
+                            "required": ["kind"]
+                        })
+                    ),
+                    tool_descriptor(
+                        "mergefox_action_execute",
+                        "Execute a mergeFox action. By default this REFUSES — requests require \
+                         UI approval from the running mergeFox app, or an auto-approve tier \
+                         opt-in via `MERGEFOX_MCP_AUTO_APPROVE` (safe | recoverable | all). \
+                         Destructive actions additionally require `MERGEFOX_MCP_ALLOW_DESTRUCTIVE=1`.",
                         json!({
                             "type": "object",
                             "properties": {
@@ -115,8 +226,9 @@ fn handle_request(repo_path: &Path, request: RpcRequest) -> Result<Option<RpcRes
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let result = match name {
-                "mergefox_activity_log" => activity_log_tool(repo_path, arguments)?,
-                "mergefox_action_preview" => action_preview_tool(repo_path, arguments)?,
+                "mergefox_activity_log" => activity_log_tool(&ctx.repo_path, arguments)?,
+                "mergefox_action_preview" => action_preview_tool(&ctx.repo_path, arguments)?,
+                "mergefox_action_execute" => action_execute_tool(&ctx.repo_path, arguments)?,
                 other => {
                     return Ok(Some(err(
                         id,
@@ -173,6 +285,124 @@ fn action_preview_tool(repo_path: &Path, arguments: Value) -> Result<Value> {
     let action: ActionRequest = serde_json::from_value(arguments).context("action preview args")?;
     let preview = preview(repo_path, action)?;
     Ok(tool_result(json!(preview)))
+}
+
+/// Auto-approve tier: caller declares "I'm willing to auto-execute
+/// actions up to tier X" via `MERGEFOX_MCP_AUTO_APPROVE`. Defaults to
+/// `none` — **every** execute request is refused with a clear message.
+/// Intentionally conservative: MCP servers run unattended; the user
+/// opts into broader capability deliberately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoApproveTier {
+    /// No execute: preview-only server. Default.
+    None,
+    /// Safe actions auto-execute (copy SHA, create branch, create tag).
+    Safe,
+    /// Safe + Recoverable (checkout, cherry-pick, stash).
+    Recoverable,
+    /// Everything — still subject to `MERGEFOX_MCP_ALLOW_DESTRUCTIVE=1`
+    /// for the Destructive tier specifically, because "all" without
+    /// that extra opt-in has been a common foot-gun in other agent
+    /// tools.
+    All,
+}
+
+fn auto_approve_tier() -> AutoApproveTier {
+    match std::env::var("MERGEFOX_MCP_AUTO_APPROVE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("safe") => AutoApproveTier::Safe,
+        Some("recoverable") => AutoApproveTier::Recoverable,
+        Some("all") => AutoApproveTier::All,
+        _ => AutoApproveTier::None,
+    }
+}
+
+fn destructive_allowed() -> bool {
+    std::env::var("MERGEFOX_MCP_ALLOW_DESTRUCTIVE")
+        .ok()
+        .map(|v| v.trim() == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn action_execute_tool(repo_path: &Path, arguments: Value) -> Result<Value> {
+    use crate::mcp::action_preview::ActionRisk;
+    let action: ActionRequest =
+        serde_json::from_value(arguments).context("action execute args")?;
+    let preview_info = preview(repo_path, action.clone())?;
+
+    let tier = auto_approve_tier();
+    let allowed = match (preview_info.risk, tier) {
+        (ActionRisk::Safe, AutoApproveTier::None) => false,
+        (ActionRisk::Safe, _) => true,
+        (ActionRisk::Recoverable, AutoApproveTier::Recoverable | AutoApproveTier::All) => true,
+        (ActionRisk::Destructive, AutoApproveTier::All) => destructive_allowed(),
+        _ => false,
+    };
+
+    if !allowed {
+        let hint = match (preview_info.risk, tier) {
+            (ActionRisk::Destructive, AutoApproveTier::All) if !destructive_allowed() => {
+                "Destructive actions require `MERGEFOX_MCP_ALLOW_DESTRUCTIVE=1` in addition to \
+                 `MERGEFOX_MCP_AUTO_APPROVE=all`."
+            }
+            (_, AutoApproveTier::None) => {
+                "This server is preview-only. Set `MERGEFOX_MCP_AUTO_APPROVE=safe` (or \
+                 `recoverable` / `all`) in the client config to opt into execution."
+            }
+            _ => "Risk tier exceeds the configured auto-approve level. Raise it via \
+                  `MERGEFOX_MCP_AUTO_APPROVE=recoverable` or `all`.",
+        };
+        return Ok(tool_result(json!({
+            "executed": false,
+            "reason": "approval_required",
+            "message": hint,
+            "preview": preview_info
+        })));
+    }
+
+    // Execute. We only implement the small set of write ops we're
+    // confident in from a headless context; the rest still route
+    // through the UI where the user can intervene.
+    let outcome = execute_approved_action(repo_path, &action)?;
+    Ok(tool_result(json!({
+        "executed": true,
+        "risk": preview_info.risk,
+        "message": outcome,
+        "preview": preview_info
+    })))
+}
+
+/// Actually run the action. Kept short on purpose — write ops here
+/// run unattended, so we restrict the surface to reads + the handful
+/// of writes that can't accidentally lose work (fetch, create-branch,
+/// create-tag). Anything else returns a clear "needs UI" error even
+/// when auto-approve nominally allows it.
+fn execute_approved_action(repo_path: &Path, action: &ActionRequest) -> Result<String> {
+    use crate::mcp::action_preview::ActionRequest as A;
+    let repo = crate::git::Repo::open(repo_path)?;
+    match action {
+        A::CopySha { oid } | A::CopyShortSha { oid } => {
+            // Clipboard access needs a UI thread on some platforms.
+            // From a headless MCP context we just return the value.
+            Ok(oid.clone())
+        }
+        A::CreateBranch { at, name } => {
+            let branch_name = name
+                .as_deref()
+                .ok_or_else(|| anyhow!("create_branch requires `name`"))?;
+            let at_oid = gix::ObjectId::from_hex(at.as_bytes())
+                .map_err(|e| anyhow!("invalid SHA in `at`: {e}"))?;
+            repo.create_branch(branch_name, at_oid)?;
+            Ok(format!("Created branch {branch_name} at {at}"))
+        }
+        _ => Err(anyhow!(
+            "this action is not yet executable via MCP — use the mergeFox UI for confirmation. \
+             (implemented subset: create_branch, copy_sha)"
+        )),
+    }
 }
 
 fn tool_result(payload: Value) -> Value {

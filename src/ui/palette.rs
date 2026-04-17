@@ -43,6 +43,7 @@ pub enum PaletteAction {
     OpenCommitModal,
     BlameCurrentFile,
     OpenBisect,
+    ExportJournal,
     Undo,
     Redo,
     PanicRecovery,
@@ -300,6 +301,11 @@ fn collect(app: &MergeFoxApp) -> Vec<PaletteCommand> {
             action: PaletteAction::OpenBisect,
         });
         out.push(PaletteCommand {
+            label: "Export journal to JSON…".into(),
+            hint: None,
+            action: PaletteAction::ExportJournal,
+        });
+        out.push(PaletteCommand {
             label: "Graph scope: Current branch".into(),
             hint: None,
             action: PaletteAction::SetGraphScope(GraphScope::CurrentBranch),
@@ -423,6 +429,9 @@ fn execute(app: &mut MergeFoxApp, action: PaletteAction) {
         PaletteAction::OpenBisect => {
             app.bisect_ui.open = true;
             app.bisect_ui.status = None;
+        }
+        PaletteAction::ExportJournal => {
+            app.export_journal_to_file();
         }
         PaletteAction::Undo => app.undo(),
         PaletteAction::Redo => app.redo(),
