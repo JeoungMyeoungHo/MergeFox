@@ -3441,6 +3441,68 @@ impl MergeFoxApp {
     /// loaded, or the selected file is a binary/image without a path
     /// we can blame) report via the notification center rather than
     /// opening an empty modal.
+    /// Save the active workspace's journal as JSON. Opens an
+    /// `rfd::FileDialog` for the destination; success/failure reports
+    /// through the notification center.
+    ///
+    /// We render the JSON up front (while the workspace borrow is
+    /// live) so the blocking file dialog doesn't hold an `&Journal`
+    /// reference across the await-equivalent. `Journal` isn't
+    /// `Clone`-able by design (cursor file + dir handle would be
+    /// nonsensical to duplicate) — the extracted JSON text is all we
+    /// need.
+    pub fn export_journal_to_file(&mut self) {
+        let (repo_display, json_text) = match &self.view {
+            View::Workspace(tabs) => {
+                let ws = tabs.current();
+                let Some(journal) = ws.journal.as_ref() else {
+                    self.notify_warn(
+                        "No journal for this repository yet — make a change first.",
+                    );
+                    return;
+                };
+                let text = match journal.export_json() {
+                    Ok(t) => t,
+                    Err(err) => {
+                        self.notify_err_with_detail(
+                            "Journal export failed",
+                            format!("{err:#}"),
+                        );
+                        return;
+                    }
+                };
+                let name = ws
+                    .repo
+                    .path()
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "repo".to_string());
+                (name, text)
+            }
+            _ => {
+                self.notify_warn("Open a repository first.");
+                return;
+            }
+        };
+        let suggested = format!("mergefox-journal-{repo_display}.json");
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(&suggested)
+            .add_filter("JSON", &["json"])
+            .save_file()
+        else {
+            return; // user cancelled
+        };
+        match std::fs::write(&dest, json_text) {
+            Ok(()) => self.notify_ok(format!(
+                "Exported journal → {}",
+                dest.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| dest.display().to_string())
+            )),
+            Err(err) => self.notify_err_with_detail("Journal export failed", format!("{err:#}")),
+        }
+    }
+
     pub fn start_blame_for_selected_file(&mut self) {
         let (repo_path, file_path) = match &self.view {
             View::Workspace(tabs) => {

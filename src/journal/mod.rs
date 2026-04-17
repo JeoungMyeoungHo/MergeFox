@@ -233,6 +233,43 @@ impl Journal {
     }
 
     /// Get the current entry the cursor is pointing at.
+    /// Export the journal as a self-contained JSON document suitable
+    /// for sharing or replay. Includes every entry (not just reachable
+    /// ones) plus a manifest so a future `mergefox journal import`
+    /// tool can validate it. Format is intentionally stable JSON —
+    /// pretty-printed, keys alphabetised via serde — so diffs between
+    /// exports survive reformatting.
+    pub fn export_json(&self) -> Result<String> {
+        let doc = serde_json::json!({
+            "format": "mergefox.journal.v1",
+            "exported_at_unix": now_unix(),
+            "entry_count": self.entries.len(),
+            "cursor_id": self
+                .cursor
+                .and_then(|idx| self.entries.get(idx))
+                .map(|e| e.id),
+            "entries": self.entries,
+        });
+        serde_json::to_string_pretty(&doc).context("journal export serialize")
+    }
+
+    /// Write the export to a caller-specified path. Convenience over
+    /// `export_json` for the "Save to file…" button; rejects paths
+    /// inside `.git/mergefox/` so the user can't accidentally clobber
+    /// the live journal.
+    pub fn export_to_file(&self, path: &Path) -> Result<()> {
+        let guard_prefix = self.dir.as_path();
+        if path.starts_with(guard_prefix) {
+            anyhow::bail!(
+                "refusing to write export inside {} — pick a different destination",
+                guard_prefix.display()
+            );
+        }
+        let text = self.export_json()?;
+        fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
     pub fn current(&self) -> Option<&JournalEntry> {
         self.cursor.map(|i| &self.entries[i])
     }
