@@ -23,6 +23,13 @@ independently; migrations are handled in `Config::load`.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] — 2026-04-17
+
+Second alpha. Ships Sprint 2 (UX basics), Phase 3b (git-control
+breadth), and Sprint 4 (MCP autonomy). Binary artifacts are now
+proper platform installers (`.dmg` / `.msi` / `.deb` / AppImage) via
+`cargo-dist`; builds remain unsigned during the alpha.
+
 ### Added
 - `.github/workflows/ci.yml` — fmt (advisory) + clippy (advisory) +
   build + test matrix across macOS / Linux / Windows + `cargo-deny` +
@@ -101,5 +108,6 @@ the full list of shipped features and known limitations. Summary:
   Codeberg (PAT + OAuth device flow).
 - Pastel commit graph with locally-computed author identicons.
 
-[Unreleased]: https://github.com/JeoungMyeoungHo/MergeFox/compare/v0.1.0-alpha.1...HEAD
+[Unreleased]: https://github.com/JeoungMyeoungHo/MergeFox/compare/v0.1.0-alpha.2...HEAD
+[0.1.0-alpha.2]: https://github.com/JeoungMyeoungHo/MergeFox/compare/v0.1.0-alpha.1...v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/JeoungMyeoungHo/MergeFox/releases/tag/v0.1.0-alpha.1
