@@ -178,6 +178,71 @@ impl SecretStore {
         let cred = Credential::new(account.keyring_service(), account.keyring_user());
         self.delete(&cred)
     }
+
+    // ---------- MCP session token ----------
+    //
+    // The MCP stdio server authenticates callers via a shared secret
+    // passed in `MERGEFOX_MCP_TOKEN`. The UI owns the canonical value
+    // (generates it on first read, displays + regenerates in
+    // Settings → Integrations → MCP) and stashes it in the secret
+    // store so it persists across launches.
+
+    /// Load the current MCP session token, generating + persisting a
+    /// new one if none is set. Always returns a value — this is the
+    /// single call site Settings uses when rendering the MCP panel,
+    /// so "nothing yet" would be a distracting empty-state.
+    pub fn load_or_generate_mcp_token(&self) -> Result<SecretString> {
+        let cred = mcp_credential();
+        if let Some(existing) = self.load(&cred)? {
+            return Ok(existing);
+        }
+        let token = generate_mcp_token();
+        self.save(&cred, token.clone())?;
+        Ok(token)
+    }
+
+    /// Rotate the token — persists a fresh value and returns it. Use
+    /// this when the user clicks "Regenerate" in Settings; clients
+    /// that were configured with the old token will start failing
+    /// `initialize` with a clear "session token does not match"
+    /// message (see `mcp::server`).
+    pub fn regenerate_mcp_token(&self) -> Result<SecretString> {
+        let cred = mcp_credential();
+        let token = generate_mcp_token();
+        self.save(&cred, token.clone())?;
+        Ok(token)
+    }
+
+    /// Remove the stored token — MCP server will then run without
+    /// authentication (with a loud `tracing::warn!` on startup).
+    pub fn delete_mcp_token(&self) -> Result<()> {
+        self.delete(&mcp_credential())
+    }
+}
+
+/// Canonical `Credential` key for the MCP session token. Kept out of
+/// the public surface so call sites always go through the typed
+/// helpers above.
+fn mcp_credential() -> Credential {
+    Credential::new("mergefox-mcp", "session-token")
+}
+
+/// Generate a 32-byte URL-safe token. Avoids bringing in a new
+/// dependency by using the `rand_core` + `getrandom` stack that's
+/// already in the graph for ssh-key generation.
+fn generate_mcp_token() -> SecretString {
+    use rand_core::{OsRng, RngCore};
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    // URL-safe base64 without pulling in the `base64` crate — the
+    // token is 32 bytes of entropy so a hex rendering is 64 chars,
+    // perfectly fine for an env var value.
+    let hex = bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    });
+    SecretString::new(hex)
 }
 
 // ---------------- file storage ----------------

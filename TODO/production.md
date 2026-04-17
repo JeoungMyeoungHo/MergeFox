@@ -10,6 +10,7 @@
 **Settings & MCP 추가(이전 세션)**: D1 · D2 · D4 · D5 · D6 · D7 · D8 · D9 · D14 · H1
 **Sprint 2 (UX 기초)**: I1 · I2 · I4 · I6 · C1 · C2 · C3 · C4 · C8 · G4
 **Phase 3b (Git 제어성 확장)**: E1(Fixup 추가) · E2 · E4 · E7 · E9 · E10
+**Sprint 4 (자율성/MCP)**: H4 · H5(부분) · H6(env tier) · H7
 **부분**:
 - A2 — 문서+훅만, 인증서 미보유
 - D3 — mergeFox 설정 범위엔 연결됐지만 git identity/remote 자체는 유지
@@ -466,25 +467,32 @@
 - ⛔ MCP write 경로 실제 연결 전이라 현재 기록은 대부분 `Ui`
 - ⛔ "Undo last 5 agent actions"는 아직
 
-### H4. MCP v1 read-only 서버  🟡  **P1**
+### H4. MCP v1 read-only 서버  🟢  **P1**
 - ✅ `src/mcp/types.rs` / `activity_log.rs` — read-only JSON 스키마 + derived hints
 - ✅ UI의 Activity Log inspector, Forge 패널 `Copy MCP JSON`로 in-process 소비 경로 존재
-- ✅ `mergefox --mcp-stdio [--repo <path>]` stdio JSON-RPC transport 추가
+- ✅ `mergefox --mcp-stdio [--repo <path>]` stdio JSON-RPC transport
 - ✅ 외부 클라이언트가 `mergefox_activity_log` / `mergefox_action_preview` tool 호출 가능
-- ⛔ 세션 토큰은 아직 없음
+- ✅ **세션 토큰 인증** — `MERGEFOX_MCP_TOKEN` env 또는 secrets.json fallback
+- ✅ `SecretStore::{load_or_generate_mcp_token, regenerate_mcp_token, delete_mcp_token}` helpers
 
-### H5. MCP v2 쓰기 티어  ⛔  **P2**
-- Tier 2: auto-approve on clean tree
-- Tier 3: 반드시 모달
-- 승인 큐 UI는 pending_prompt 재사용
+### H5. MCP v2 쓰기 티어  🟡  **P2**
+- ✅ `mergefox_action_execute` tool 추가 + `AutoApproveTier` gate
+- ✅ 기본 refuse + "approval_required" 응답 (`preview` 포함)
+- ✅ 실행 가능 액션: CreateBranch, CopySha (확장 여지 열려 있음)
+- ⛔ UI 측 "pending approvals" 패널은 미구현 (프로세스 간 IPC 복잡도로 유예)
+- ⛔ 확장 가능한 action dispatcher — 현재는 작은 화이트리스트
 
-### H6. Auto-approve 정책 세분화  ⛔  **P2**
-- 특정 브랜치 패턴만
-- 특정 시간대만
-- 특정 작업 타입만
+### H6. Auto-approve 정책 세분화  🟡  **P2**
+- ✅ `MERGEFOX_MCP_AUTO_APPROVE=safe|recoverable|all` tier env var
+- ✅ Destructive는 `MERGEFOX_MCP_ALLOW_DESTRUCTIVE=1` 이중 opt-in
+- ⛔ 브랜치 패턴 / 시간대 필터는 미구현 (env tier로 충분 판단)
 
-### H7. Action 히스토리 export  ⛔  **P2**
-- JSON replay 포맷 (audit / debug / demo)
+### H7. Action 히스토리 export  🟢  **P2**
+- ✅ `Journal::export_json` — 포맷 `mergefox.journal.v1` 매니페스트
+- ✅ `Journal::export_to_file` + `.git/mergefox/` 쓰기 방지 가드
+- ✅ 커맨드 팔레트에서 "Export journal to JSON…" 진입 (rfd 다이얼로그)
+- ✅ 성공/실패는 Notification center 토스트
+- ⛔ Import/replay 경로는 아직 없음
 
 ### H8. Watch mode (subscribe)  ⛔  **P3**
 - 리포 status 변경을 에이전트에 push
