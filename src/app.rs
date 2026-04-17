@@ -3709,6 +3709,34 @@ impl MergeFoxApp {
         });
     }
 
+    /// Push a single tag (by short name — we'll prefix `refs/tags/`
+    /// inside the job). Caller decides the remote; the typical entry
+    /// point is the graph's tag-chip context menu which already knows
+    /// which remote to target.
+    pub fn start_push_tag(&mut self, remote: &str, tag: &str) {
+        let credentials = self.resolve_https_credentials(remote);
+        self.start_job(GitJobKind::PushTag {
+            remote: remote.to_string(),
+            tags: vec![tag.to_string()],
+            all: false,
+            credentials,
+        });
+    }
+
+    /// `git push <remote> --tags` — every local tag not yet on the
+    /// remote. Behind a confirmation prompt because it can dump
+    /// hundreds of tags on a repo that's been using mergeFox through
+    /// a rebase / tag-creation session.
+    pub fn start_push_all_tags(&mut self, remote: &str) {
+        let credentials = self.resolve_https_credentials(remote);
+        self.start_job(GitJobKind::PushTag {
+            remote: remote.to_string(),
+            tags: Vec::new(),
+            all: true,
+            credentials,
+        });
+    }
+
     pub fn start_pull(&mut self, remote: &str, branch: &str, strategy: crate::git::PullStrategy) {
         let credentials = self.resolve_https_credentials(remote);
         self.start_job(GitJobKind::Pull {
@@ -4821,6 +4849,17 @@ fn kind_action_label(kind: &GitJobKind) -> String {
                 crate::git::PullStrategy::FastForwardOnly => "fast-forward only",
             };
             format!("Pulling {remote}/{branch} ({mode})")
+        }
+        GitJobKind::PushTag {
+            remote, tags, all, ..
+        } => {
+            if *all {
+                format!("Pushing all tags to '{remote}'")
+            } else if tags.len() == 1 {
+                format!("Pushing tag '{}' to '{remote}'", tags[0])
+            } else {
+                format!("Pushing {} tags to '{remote}'", tags.len())
+            }
         }
     }
 }

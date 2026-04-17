@@ -791,6 +791,39 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
         ui.close_menu();
     }
 
+    // ---- tag push (only when this commit carries tag refs) ----
+    //
+    // We route through the commit menu rather than the tag-chip
+    // itself because those chips use `Sense::hover()` for rendering
+    // compactness; making them clickable would trade that for an
+    // extra right-click surface per chip, and the commit menu has
+    // plenty of room.
+    let tags_here: Vec<&str> = row
+        .refs
+        .iter()
+        .filter(|r| r.kind == RefKind::Tag)
+        .map(|r| r.short.as_ref())
+        .collect();
+    if !tags_here.is_empty() {
+        ui.separator();
+        for tag in &tags_here {
+            if ui.button(format!("Push tag '{tag}' to remote")).clicked() {
+                action = Some(CommitAction::PushTag {
+                    tag: (*tag).to_string(),
+                });
+                ui.close_menu();
+            }
+        }
+        if ui
+            .button("Push ALL tags to remote")
+            .on_hover_text("git push <remote> --tags — uploads every local tag not yet on the remote.")
+            .clicked()
+        {
+            action = Some(CommitAction::PushAllTags);
+            ui.close_menu();
+        }
+    }
+
     action
 }
 
