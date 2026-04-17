@@ -43,6 +43,11 @@ pub struct MergeFoxApp {
     /// still exist for the journal HUD + legacy paths but are being
     /// migrated out. See `ui::notifications` for the queue.
     pub notifications: crate::ui::notifications::NotificationCenter,
+    /// Blame modal state — current task, last result, error. Lives
+    /// on the app so the modal survives frame-to-frame re-renders.
+    pub blame: crate::ui::blame::BlameState,
+    /// Bisect modal state (buttons + lazy-loaded `BisectStatus`).
+    pub bisect_ui: crate::ui::bisect::BisectUiState,
     /// Installed lazily because most repos never open an image diff.
     pub image_loaders_installed: bool,
     /// Times of recent undo/redo nav steps — used to detect panic spam.
@@ -178,6 +183,21 @@ pub struct SettingsModal {
     /// a refresh, then `Some(list)` (possibly empty if only the main
     /// worktree exists).
     pub worktrees: Option<Vec<crate::git::WorktreeInfo>>,
+    /// Lazy-loaded `git count-objects -v` summary powering the
+    /// maintenance section's "N KiB loose · M KiB packed" banner.
+    /// Cleared to `None` after gc/repack so the banner re-reads.
+    pub count_objects: Option<crate::git::CountObjectsSummary>,
+    /// Lazy-loaded sparse-checkout state. Patterns are edited as a
+    /// multi-line string (`sparse_patterns_draft`) and applied
+    /// through the handler — we keep the last-read status around so
+    /// we can detect which patterns were added / removed for the
+    /// `cone` vs classic-mode warning copy.
+    pub sparse_checkout: Option<crate::git::SparseCheckoutStatus>,
+    pub sparse_patterns_draft: String,
+    /// Lazy-loaded submodule list. `None` until first render, then
+    /// `Some(list)` (empty when the repo has no submodules). Reset
+    /// after update / sync to force a re-read.
+    pub submodules: Option<Vec<crate::git::SubmoduleEntry>>,
     /// Most recent on-screen size of the settings window. Saved back to
     /// config when the modal closes so the next open restores it.
     pub window_size: Option<crate::config::SettingsWindowState>,
@@ -716,6 +736,12 @@ pub enum RebaseAction {
     Pick,
     Reword,
     Squash,
+    /// Fixup — like Squash, but discards this commit's message and
+    /// uses only the previous (kept) commit's message. Matches the
+    /// `fixup` instruction in `git rebase -i`. Dropdown shows this
+    /// separately from Squash so the user doesn't have to remember
+    /// which one eats the message.
+    Fixup,
     Drop,
 }
 
@@ -725,8 +751,15 @@ impl RebaseAction {
             Self::Pick => "Pick",
             Self::Reword => "Reword",
             Self::Squash => "Squash",
+            Self::Fixup => "Fixup",
             Self::Drop => "Drop",
         }
+    }
+    /// Does this action roll into its parent's commit in the final
+    /// history? Both Squash and Fixup return true — the UI uses this
+    /// for the bracket line showing the destination.
+    pub fn rolls_into_parent(self) -> bool {
+        matches!(self, Self::Squash | Self::Fixup)
     }
 }
 
@@ -849,6 +882,8 @@ impl MergeFoxApp {
             last_error: None,
             hud: None,
             notifications: crate::ui::notifications::NotificationCenter::default(),
+            blame: crate::ui::blame::BlameState::default(),
+            bisect_ui: crate::ui::bisect::BisectUiState::default(),
             image_loaders_installed: false,
             nav_history: VecDeque::new(),
             panic_modal_open: false,
@@ -2274,6 +2309,10 @@ impl MergeFoxApp {
             identity_global: false,
             identity_loaded: false,
             worktrees: None,
+            count_objects: None,
+            sparse_checkout: None,
+            sparse_patterns_draft: String::new(),
+            submodules: None,
             window_size: Some(self.config.settings_window.clone()),
             reset_scope: None,
         });
@@ -2477,7 +2516,7 @@ impl MergeFoxApp {
                             Err(e) => break Advance::Failed(format!("rebase step: {e:#}")),
                         }
                     }
-                    RebaseAction::Squash => match ws.repo.start_cherry_pick_apply(step.oid) {
+                    RebaseAction::Squash | RebaseAction::Fixup => match ws.repo.start_cherry_pick_apply(step.oid) {
                         Ok(true) => {
                             break Advance::Blocked {
                                 msg: format!(
@@ -2488,8 +2527,21 @@ impl MergeFoxApp {
                             };
                         }
                         Ok(false) => {
+                            // Both Squash and Fixup finish via the
+                            // same "combine into previous commit"
+                            // path — Fixup already baked the discarded-
+                            // message decision into `step.message`
+                            // during plan compilation (it carries the
+                            // previous message verbatim).
                             if let Err(e) = ws.repo.finish_pending_pick_squash(&step.message) {
-                                break Advance::Failed(format!("squash step: {e:#}"));
+                                break Advance::Failed(format!(
+                                    "{} step: {e:#}",
+                                    if matches!(step.action, RebaseAction::Fixup) {
+                                        "fixup"
+                                    } else {
+                                        "squash"
+                                    }
+                                ));
                             }
                             session.next_index += 1;
                         }
@@ -2564,7 +2616,9 @@ impl MergeFoxApp {
                     RebaseAction::Reword => ws
                         .repo
                         .finish_pending_pick_commit(step.oid, Some(step.message.as_str())),
-                    RebaseAction::Squash => ws.repo.finish_pending_pick_squash(&step.message),
+                    RebaseAction::Squash | RebaseAction::Fixup => {
+                        ws.repo.finish_pending_pick_squash(&step.message)
+                    }
                     RebaseAction::Drop => Ok(step.oid),
                 }
             }
@@ -3382,6 +3436,47 @@ impl MergeFoxApp {
         self.panic_modal_open = true;
     }
 
+    /// Kick off a blame for whichever file is currently selected in
+    /// the diff view. If nothing is selected (welcome screen, no diff
+    /// loaded, or the selected file is a binary/image without a path
+    /// we can blame) report via the notification center rather than
+    /// opening an empty modal.
+    pub fn start_blame_for_selected_file(&mut self) {
+        let (repo_path, file_path) = match &self.view {
+            View::Workspace(tabs) => {
+                let ws = tabs.current();
+                let file = ws
+                    .current_diff
+                    .as_ref()
+                    .and_then(|d| {
+                        ws.selected_file_idx.and_then(|idx| d.files.get(idx))
+                    })
+                    .map(|f| f.new_path.clone().or_else(|| f.old_path.clone()))
+                    .flatten();
+                match file {
+                    Some(p) => (ws.repo.path().to_path_buf(), p),
+                    None => {
+                        self.notify_warn(
+                            "Select a file in the diff view before running blame.",
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => {
+                self.notify_warn("Open a repository first.");
+                return;
+            }
+        };
+        self.blame.open = true;
+        self.blame.error = None;
+        self.blame.result = None;
+        self.blame.task = Some(crate::ui::blame::BlameTask::spawn(
+            repo_path,
+            file_path.into(),
+        ));
+    }
+
     /// Drain any completed navigation tasks across all open tabs.
     ///
     /// On success the cursor is finally advanced (we deferred this until
@@ -4145,6 +4240,28 @@ fn build_rebase_steps(items: &[RebasePlanItem]) -> Result<Vec<RebaseSessionStep>
                     message: combined,
                 });
             }
+            RebaseAction::Fixup => {
+                // Fixup rolls into the previous kept commit AND
+                // discards this commit's message. The rebase execution
+                // path already handles `Squash` with a "combined
+                // message that's now the final commit message" model —
+                // we produce the same shape but the message carried
+                // forward is the PREVIOUS message unchanged, so this
+                // commit's text never lands.
+                let previous = last_kept_message
+                    .clone()
+                    .context("the first kept commit cannot use fixup")?;
+                last_kept_message = Some(previous.clone());
+                // Execution-side treats this as Squash with the previous
+                // message — `finish_pending_pick_squash(previous)` is a
+                // correct reduction. We still record `Fixup` so the
+                // session log shows the user's chosen semantics.
+                steps.push(RebaseSessionStep {
+                    oid: item.oid,
+                    action: RebaseAction::Fixup,
+                    message: previous,
+                });
+            }
             RebaseAction::Drop => steps.push(RebaseSessionStep {
                 oid: item.oid,
                 action: RebaseAction::Drop,
@@ -4235,6 +4352,8 @@ impl eframe::App for MergeFoxApp {
         ui::reflog::show(ctx, self);
         ui::shortcuts::show(ctx, self);
         ui::palette::show(ctx, self);
+        ui::blame::show(ctx, self);
+        ui::bisect::show(ctx, self);
         ui::settings::show(ctx, self);
         ui::publish_remote::show(ctx, self);
         ui::forge::show(ctx, self);

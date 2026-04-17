@@ -41,6 +41,8 @@ pub enum PaletteAction {
     OpenShortcuts,
     OpenActivityLog,
     OpenCommitModal,
+    BlameCurrentFile,
+    OpenBisect,
     Undo,
     Redo,
     PanicRecovery,
@@ -280,6 +282,23 @@ fn collect(app: &MergeFoxApp) -> Vec<PaletteCommand> {
             hint: None,
             action: PaletteAction::OpenCommitModal,
         });
+        // Blame only makes sense when a file is actually selected in
+        // the diff view; we include it unconditionally and let the
+        // executor report "no file selected" via notification.
+        out.push(PaletteCommand {
+            label: "Blame current file".into(),
+            hint: None,
+            action: PaletteAction::BlameCurrentFile,
+        });
+        out.push(PaletteCommand {
+            label: if ws.repo.bisect_active() {
+                "Continue bisect (Good / Bad / Skip)".into()
+            } else {
+                "Start bisect…".into()
+            },
+            hint: None,
+            action: PaletteAction::OpenBisect,
+        });
         out.push(PaletteCommand {
             label: "Graph scope: Current branch".into(),
             hint: None,
@@ -397,6 +416,13 @@ fn execute(app: &mut MergeFoxApp, action: PaletteAction) {
         PaletteAction::OpenActivityLog => app.activity_log_open = true,
         PaletteAction::OpenCommitModal => {
             app.commit_modal_open = true;
+        }
+        PaletteAction::BlameCurrentFile => {
+            app.start_blame_for_selected_file();
+        }
+        PaletteAction::OpenBisect => {
+            app.bisect_ui.open = true;
+            app.bisect_ui.status = None;
         }
         PaletteAction::Undo => app.undo(),
         PaletteAction::Redo => app.redo(),

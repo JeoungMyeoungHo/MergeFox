@@ -9,6 +9,7 @@
 **Phase 1/2/3a**: A1 · A6 · B2 · B3 · F4 · E5 · E8
 **Settings & MCP 추가(이전 세션)**: D1 · D2 · D4 · D5 · D6 · D7 · D8 · D9 · D14 · H1
 **Sprint 2 (UX 기초)**: I1 · I2 · I4 · I6 · C1 · C2 · C3 · C4 · C8 · G4
+**Phase 3b (Git 제어성 확장)**: E1(Fixup 추가) · E2 · E4 · E7 · E9 · E10
 **부분**:
 - A2 — 문서+훅만, 인증서 미보유
 - D3 — mergeFox 설정 범위엔 연결됐지만 git identity/remote 자체는 유지
@@ -276,13 +277,19 @@
 
 ## E. Git 제어성
 
-### E1. Interactive rebase UI 확장  ⛔  **P1**
-- `features.md`의 Drop/Move에 더해 **squash / fixup / reword / edit**
-- 세션 중 스텝 편집 가능
+### E1. Interactive rebase UI 확장  🟡  **P1**
+- ✅ `RebaseAction::Fixup` 추가 — Squash와 같은 rolling-into-parent이지만 메시지 버림
+- ✅ 드롭다운에 Fixup 포함 + per-action 툴팁 (Pick/Reword/Squash/Fixup/Drop 차이 설명)
+- ✅ `rolls_into_parent()` 헬퍼 — squash target/bracket 계산 통합
+- ✅ 실행 경로(plan compile + cherry-pick finish) Fixup 처리
+- ⛔ `edit` (mid-rebase 중단) 미구현 — 복잡도 이유로 보류
 
-### E2. Bisect UI  ⛔  **P2**
-- `good` / `bad` 마크, 자동 이진 탐색 진행
-- Tower/JetBrains 수준
+### E2. Bisect UI  🟢  **P2**
+- ✅ `Repo::bisect_{start,good,bad,skip,reset,active,status}` — 모든 서브커맨드
+- ✅ `BisectStatus` 파서 (good/bad/skip 카운터 + last_progress + concluded SHA) + 유닛테스트 2건
+- ✅ `src/ui/bisect.rs` — Start 폼 / 진행 중 good/bad/skip 버튼 / 결론 SHA 하이라이트
+- ✅ 커맨드 팔레트에서 "Start bisect" / "Continue bisect" 진입
+- ✅ 각 액션 후 자동 graph rebuild (HEAD가 움직였으니)
 
 ### E3. Cherry-pick 범위 / 다중 선택  🟡  **P1**
 - ✅ `CommitAction::CherryPick(Vec<Oid>)` enum 리팩터
@@ -290,9 +297,11 @@
 - ✅ Journal 엔트리는 실제 적용된 커밋만 기록
 - ⛔ Multi-select UI(Shift-click / range 선택) 미배선 — 콜사이트는 현재 단일원소 vec
 
-### E4. Submodule 관리  ⛔  **P2**
-- `update --init`, `foreach`, status 뷰
-- 사이드바 섹션
+### E4. Submodule 관리  🟡  **P2**
+- ✅ `Repo::submodule_status` + 파서(in-sync/not-init/modified/conflict 4종 상태) + 유닛테스트
+- ✅ `submodule_update(path?)`, `submodule_sync(path?)` — 전체 or 단일
+- ✅ Settings → Repository 섹션 — 각 서브모듈 상태 뱃지 + Update/Sync 버튼 + 전체 Update/Sync
+- ⛔ `foreach` (임의 명령 실행)은 미구현 — UI 복잡도 대비 사용 빈도 낮음
 
 ### E5. Worktree list/remove/lock  🟢  **P1**
 - ✅ `Repo::list_worktrees` / `remove_worktree` / `lock_worktree` / `unlock_worktree`
@@ -305,21 +314,31 @@
 - ✅ `Repo::rename_remote` + Settings UI "Rename to" 인라인 행 (기본 원격 자동 마이그레이션)
 - ⛔ 원격별 `prune` 토글, `fetch --tags` 정책 등 세부 옵션 미추가
 
-### E7. Blame 뷰어  ❓  **P1**
-- diff_view 통합 여부 확인 필요
-- 커밋 호핑 + 파일별 timeline
+### E7. Blame 뷰어  🟡  **P1**
+- ✅ `src/git/blame.rs` — `--porcelain` 스트림 파서 + 유닛테스트
+- ✅ `src/ui/blame.rs` — 모달 뷰어, 저자별 색상(deterministic HSL 해시), SHA/author/date/content 컬럼, "Copy all"
+- ✅ 백그라운드 스레드 실행(`BlameTask` + channel poll)
+- ✅ 커맨드 팔레트 "Blame current file" 진입
+- ⛔ 커밋 호핑 (line의 commit을 클릭 → 해당 커밋으로 이동)은 미구현
+- ⛔ diff view 파일 헤더의 "Blame" 버튼은 미배선 (현재는 팔레트/자동 호출만)
 
 ### E8. Reflog HUD 접근성  🟢  **P2**
 - ✅ ⌘/Ctrl+Shift+R 글로벌 숏컷 — 워크스페이스 뷰 안에서만 활성
 - ✅ 탑바 ↺ 버튼 툴팁에 숏컷 표기
 - ⛔ HUD(하단 스트립)에는 상시 표시 안 함 — 숏컷 + 탑바로 충분 판단
 
-### E9. Maintenance 메뉴  ⛔  **P2**
-- `fsck`, `gc`, `repack`
-- Settings → Repository → Maintenance
+### E9. Maintenance 메뉴  🟢  **P2**
+- ✅ `Repo::{fsck, gc(aggressive), repack, count_objects}`
+- ✅ `CountObjectsSummary` 파서 + `suggests_repack()` 휴리스틱 + 유닛테스트 2건
+- ✅ Settings → Repository → Maintenance 섹션 — 현재 팩 요약, fsck/gc/gc --aggressive/repack 버튼
+- ✅ 결과는 `tracing::info!` + 토스트(에러는 `notify_err_with_detail`)
+- ⛔ 대형 리포 타임아웃은 GitJob화 필요 — 지금은 UI 프리즈, 보류
 
-### E10. Sparse checkout / partial clone  ⛔  **P2**
-- 모노레포 대응
+### E10. Sparse checkout / partial clone  🟡  **P2**
+- ✅ `Repo::sparse_checkout_{status,enable_cone,disable}` (cone 모드만 관리)
+- ✅ `SparseCheckoutStatus` — enabled / cone / patterns
+- ✅ Settings → Repository 섹션 — multiline 패턴 편집, Apply/Disable/Enable, classic(non-cone) 모드 감지 시 read-only + 전환 안내
+- ⛔ Partial clone(`--filter=blob:none` 등)은 clone 플로우에 별도 통합 필요 — 미구현
 
 ### E11. Notes  ⛔  **P3**
 - code review 워크플로

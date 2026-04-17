@@ -1,4 +1,6 @@
 pub mod activity_log;
+pub mod bisect;
+pub mod blame;
 pub mod columns;
 pub mod commit_modal;
 pub mod conflicts;
