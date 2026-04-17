@@ -44,6 +44,8 @@ pub enum PaletteAction {
     BlameCurrentFile,
     OpenBisect,
     ExportJournal,
+    PushTag(String),
+    PushAllTags,
     Undo,
     Redo,
     PanicRecovery,
@@ -305,6 +307,28 @@ fn collect(app: &MergeFoxApp) -> Vec<PaletteCommand> {
             hint: None,
             action: PaletteAction::ExportJournal,
         });
+
+        // Tags: one row per local tag + one "push all" shortcut. We
+        // pull the tag list directly from the repo because the graph
+        // cache only contains tags attached to commits we're currently
+        // showing (branch-scope dependent); the palette should surface
+        // *every* local tag regardless of graph scope.
+        if let Ok(tags) = ws.repo.list_tags() {
+            for tag in &tags {
+                out.push(PaletteCommand {
+                    label: format!("Push tag '{tag}'"),
+                    hint: Some("to default remote".into()),
+                    action: PaletteAction::PushTag(tag.clone()),
+                });
+            }
+            if !tags.is_empty() {
+                out.push(PaletteCommand {
+                    label: "Push ALL tags".into(),
+                    hint: Some("git push <remote> --tags".into()),
+                    action: PaletteAction::PushAllTags,
+                });
+            }
+        }
         out.push(PaletteCommand {
             label: "Graph scope: Current branch".into(),
             hint: None,
@@ -432,6 +456,12 @@ fn execute(app: &mut MergeFoxApp, action: PaletteAction) {
         }
         PaletteAction::ExportJournal => {
             app.export_journal_to_file();
+        }
+        PaletteAction::PushTag(tag) => {
+            crate::ui::main_panel::dispatch_action(app, crate::actions::CommitAction::PushTag { tag });
+        }
+        PaletteAction::PushAllTags => {
+            crate::ui::main_panel::dispatch_action(app, crate::actions::CommitAction::PushAllTags);
         }
         PaletteAction::Undo => app.undo(),
         PaletteAction::Redo => app.redo(),

@@ -764,6 +764,20 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
             app.start_push(&remote, &branch, force);
             return out;
         }
+        CommitAction::PushTag { tag } => {
+            let remote = default_remote(ws, &app.config);
+            app.start_push_tag(&remote, &tag);
+            return out;
+        }
+        CommitAction::PushAllTags => {
+            let remote = default_remote(ws, &app.config);
+            // No confirmation for now — `--tags` is mostly additive
+            // (git won't delete remote tags, only upload missing
+            // local ones). If we ever expose `--follow-tags` with
+            // deletion semantics, it needs a preflight modal.
+            app.start_push_all_tags(&remote);
+            return out;
+        }
 
         // ---- not yet implemented ----
         CommitAction::DropCommitPrompt(oid)

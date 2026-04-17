@@ -60,6 +60,16 @@ pub enum CommitAction {
         branch: String,
         force: bool,
     },
+    /// Push a single tag to the default remote. The dispatcher
+    /// resolves which remote by looking up the repo's configured
+    /// default (falling back to `origin`).
+    PushTag {
+        tag: String,
+    },
+    /// `git push <remote> --tags` — every local tag not yet on the
+    /// remote. Dispatcher shows a pre-flight that counts outgoing
+    /// tags so the user knows what they're about to broadcast.
+    PushAllTags,
     SetUpstreamPrompt {
         branch: String,
     },
@@ -136,6 +146,8 @@ impl CommitAction {
             Self::Push { branch, force } => {
                 format!("{} {branch}", if *force { "force-push" } else { "push" })
             }
+            Self::PushTag { tag } => format!("push tag {tag}"),
+            Self::PushAllTags => "push all tags".to_string(),
             Self::SetUpstreamPrompt { branch } => format!("set upstream for {branch}"),
             Self::RenameBranchPrompt { from } => format!("rename branch {from}"),
             Self::DeleteBranchPrompt { name, is_remote } => {

@@ -102,6 +102,16 @@ pub enum GitJobKind {
         strategy: PullStrategy,
         credentials: Option<HttpsCredentials>,
     },
+    /// Push one or more tags. Separate from `Push` because tag push
+    /// has different semantics (no upstream, no force-with-lease
+    /// relevance for annotated tags, can push many at once). `tags`
+    /// empty + `all` = true maps to `git push <remote> --tags`.
+    PushTag {
+        remote: String,
+        tags: Vec<String>,
+        all: bool,
+        credentials: Option<HttpsCredentials>,
+    },
 }
 
 /// HTTPS credentials for a single git network op. We keep the password
@@ -213,6 +223,17 @@ impl GitJob {
                 };
                 format!("Pulling {remote}/{branch} ({s})")
             }
+            GitJobKind::PushTag {
+                remote, tags, all, ..
+            } => {
+                if *all {
+                    format!("Pushing all tags to {remote}")
+                } else if tags.len() == 1 {
+                    format!("Pushing tag {} to {remote}", tags[0])
+                } else {
+                    format!("Pushing {} tags to {remote}", tags.len())
+                }
+            }
         }
     }
 }
@@ -260,6 +281,20 @@ fn run_job(
             &remote,
             &branch,
             strategy,
+            credentials.as_ref(),
+            progress,
+            cancel_requested.as_ref(),
+        ),
+        GitJobKind::PushTag {
+            remote,
+            tags,
+            all,
+            credentials,
+        } => do_push_tag(
+            path,
+            &remote,
+            &tags,
+            all,
             credentials.as_ref(),
             progress,
             cancel_requested.as_ref(),
@@ -364,6 +399,39 @@ fn do_push(
                 .run_with_control(Some(cancel_requested), Some(git_job_timeout()))?;
         }
     }
+    mark(&progress, "done");
+    Ok(())
+}
+
+/// Push one or more tags. We build a single `git push <remote> ...`
+/// call with either `--tags` or an explicit list of `refs/tags/<name>`
+/// refspecs. Tag push is network-only (no index touch), so we skip
+/// the `.git/index.lock` pre-flight that `do_push` runs.
+fn do_push_tag(
+    path: &std::path::Path,
+    remote_name: &str,
+    tags: &[String],
+    all: bool,
+    credentials: Option<&HttpsCredentials>,
+    progress: Arc<Mutex<JobProgress>>,
+    cancel_requested: &AtomicBool,
+) -> Result<()> {
+    mark(&progress, "pushing tags");
+    let mut cmd = build_cmd_with_creds(path, credentials);
+    cmd = cmd.arg("push").arg(remote_name);
+    if all {
+        cmd = cmd.arg("--tags");
+    } else {
+        if tags.is_empty() {
+            anyhow::bail!("no tags given and `--all` is false");
+        }
+        for t in tags {
+            // Explicit refs/tags/<name> refspec so git doesn't treat a
+            // tag name that happens to match a branch as ambiguous.
+            cmd = cmd.arg(format!("refs/tags/{t}"));
+        }
+    }
+    cmd.run_with_control(Some(cancel_requested), Some(git_job_timeout()))?;
     mark(&progress, "done");
     Ok(())
 }

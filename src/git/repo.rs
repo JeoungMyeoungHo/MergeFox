@@ -995,6 +995,27 @@ impl Repo {
         Ok(())
     }
 
+    /// Enumerate every local tag (short name, most-recent-first).
+    /// Used by the command palette to offer "Push tag <foo>" entries
+    /// without the user having to memorise their tag list.
+    pub fn list_tags(&self) -> Result<Vec<String>> {
+        let out = super::cli::run(
+            &self.path,
+            [
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "--sort=-creatordate",
+                "refs/tags/",
+            ],
+        )?;
+        Ok(out
+            .stdout_str()
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    }
+
     /// Rename a configured remote. Git automatically rewrites upstream
     /// tracking config for any branch that was following `old_name/*`,
     /// which is the main reason this is a first-class op rather than
