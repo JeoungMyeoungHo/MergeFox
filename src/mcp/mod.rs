@@ -15,10 +15,13 @@
 //! let view = activity_log::view_for_repo(&journal, ActivityLogQuery::recent(50));
 //! ```
 
+pub mod action_preview;
 pub mod activity_log;
 pub mod forge;
+pub mod server;
 pub mod types;
 
+pub use action_preview::{preview as preview_action, ActionPreview, ActionRequest, ActionRisk};
 pub use activity_log::{view_for_repo, ActivityLogQuery, ActivityLogView};
 pub use forge::{
     forge_view_for_state, ForgeIssueView, ForgePullRequestView, ForgeRepoView, ForgeSelectedView,

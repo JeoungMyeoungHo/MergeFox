@@ -65,13 +65,15 @@ pub enum PendingPrompt {
         author_name: String,
         author_email: String,
         submitted: bool,
+        /// Pre-flight summary of whether the commit being amended is
+        /// already on any remote. If the commit has been pushed,
+        /// amending rewrites history and the next push needs a force —
+        /// we surface the warning inline rather than after the fact.
+        preflight: Option<crate::preflight::PreflightInfo>,
     },
     /// Create a new stash entry. `message` is optional (empty → git uses its
     /// default "WIP on <branch>: <sha> <subject>").
-    StashPush {
-        message: String,
-        submitted: bool,
-    },
+    StashPush { message: String, submitted: bool },
     /// Confirmation-only (no text input). `confirmed` flips true on OK.
     ///
     /// `preflight` carries the pre-computed impact summary (commits lost,
@@ -117,28 +119,28 @@ impl ConfirmKind {
     }
 
     fn body(&self) -> String {
+        // Short body that sets the scene. Concrete numbers / severity
+        // cues are rendered from `PreflightInfo` below this text — keep
+        // the body itself purely descriptive so it doesn't duplicate
+        // what the preflight lines already show.
         match self {
             Self::DeleteBranch { name, is_remote } => format!(
-                "Delete {} branch `{name}`?\n\nThis cannot be undone by mergefox\n(refs are still in the reflog, though).",
+                "Delete {} branch `{name}`?\n\nRecoverable via the reflog (⌘⇧R) for a few weeks.",
                 if *is_remote { "remote-tracking" } else { "local" }
             ),
             Self::HardReset { branch, target } => format!(
-                "Hard-reset branch `{branch}` to {}?\n\nAny uncommitted changes will be LOST.\nWe'll auto-stash first if the tree is dirty.",
+                "Hard-reset `{branch}` to {}?\n\nDirty files are auto-stashed first. Use ⌘⇧R to restore from the reflog if needed.",
                 short_sha(target)
             ),
             Self::DropCommit { oid } => format!(
-                "Drop commit {}?\n\nUses a rebase to remove this single commit.\nNot yet implemented.",
+                "Drop commit {}?\n\nRebases descendants past this commit. A backup ref is created before the rebase runs.",
                 short_sha(oid)
             ),
             Self::DropStash { index, message } => format!(
-                "Drop stash@{{{index}}}?\n\n{message}\n\nThe stash will be removed from the stash list. Recoverable via reflog only for a short time."
+                "Drop stash@{{{index}}}?\n\n{message}\n\nRecoverable from the reflog (⌘⇧R) for a short time."
             ),
             Self::ForcePush { remote, branch } => format!(
-                "Force-push `{branch}` to `{remote}`?\n\n\
-                 ⚠ This OVERWRITES the remote branch with your local version.\n\
-                 Commits on the remote that aren't in your local history will be LOST.\n\n\
-                 Use this after amend, rebase, or reset — never on a shared branch\n\
-                 unless you've coordinated with other contributors."
+                "Force-push `{branch}` to `{remote}`?\n\nPrefer `force-with-lease` unless you're certain no one else pushed while you worked."
             ),
         }
     }
@@ -392,6 +394,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     author_override,
                     author_name,
                     author_email,
+                    preflight,
                     ..
                 } => {
                     ui.label("New commit message:");
@@ -400,6 +403,14 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                             .desired_rows(4)
                             .desired_width(f32::INFINITY),
                     );
+                    // Inline "this is already pushed" warning — silent
+                    // when HEAD is local-only.
+                    if let Some(info) = preflight.as_ref() {
+                        if !info.is_empty() {
+                            ui.add_space(6.0);
+                            render_preflight(ui, info);
+                        }
+                    }
                     ui.add_space(6.0);
                     if let Some(author) = current_author.as_ref() {
                         ui.weak(format!("Current author: {}", author.display()));
@@ -586,12 +597,16 @@ pub fn set_upstream_prompt(
     current_upstream: Option<String>,
     remote_branches: Vec<String>,
 ) -> PendingPrompt {
-    let current_remote = current_upstream
-        .as_deref()
-        .and_then(|upstream| upstream.split_once('/').map(|(remote, _)| remote.to_string()));
-    let current_branch = current_upstream
-        .as_deref()
-        .and_then(|upstream| upstream.split_once('/').map(|(_, branch)| branch.to_string()));
+    let current_remote = current_upstream.as_deref().and_then(|upstream| {
+        upstream
+            .split_once('/')
+            .map(|(remote, _)| remote.to_string())
+    });
+    let current_branch = current_upstream.as_deref().and_then(|upstream| {
+        upstream
+            .split_once('/')
+            .map(|(_, branch)| branch.to_string())
+    });
     // Default to the existing upstream's remote when present, otherwise
     // `origin` when it exists, otherwise the first remote, otherwise no
     // selection (which triggers the "add remote" empty state).
@@ -634,6 +649,7 @@ fn remote_branch_candidates(selected_remote: &str, remote_branches: &[String]) -
 pub fn amend_message_prompt(
     initial: String,
     current_author: Option<crate::git::ops::CommitAuthor>,
+    preflight: Option<crate::preflight::PreflightInfo>,
 ) -> PendingPrompt {
     let (author_name, author_email) = current_author
         .as_ref()
@@ -646,6 +662,7 @@ pub fn amend_message_prompt(
         author_name,
         author_email,
         submitted: false,
+        preflight,
     }
 }
 

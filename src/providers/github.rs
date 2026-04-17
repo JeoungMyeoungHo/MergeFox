@@ -15,8 +15,8 @@ use serde::Deserialize;
 use super::error::{ProviderError, ProviderResult};
 use super::types::{
     CreateRepositoryDraft, CreatedRepositoryRef, IssueDraft, IssueRef, IssueState, IssueSummary,
-    PrState, ProviderKind, ProviderProfile, PullRequestDraft, PullRequestRef,
-    PullRequestSummary, RemoteRepoOwner, RemoteRepoOwnerKind, RemoteRepoSummary, RepoMeta,
+    PrState, ProviderKind, ProviderProfile, PullRequestDraft, PullRequestRef, PullRequestSummary,
+    RemoteRepoOwner, RemoteRepoOwnerKind, RemoteRepoSummary, RepoMeta,
 };
 
 pub struct GitHubProvider;

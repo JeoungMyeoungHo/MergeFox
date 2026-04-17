@@ -85,6 +85,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let mut open = true;
     let mut result: CommitIntent = CommitIntent::None;
     let mut move_intent: Option<MoveIntent> = None;
+    let mut open_ai_settings = false;
 
     // Prune stale selections (files that disappeared from the status list,
     // e.g. just got committed in another pane) so the selection counter
@@ -200,10 +201,16 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 } else {
                     "✨ Generate message"
                 });
-                let resp =
-                    ui.add_enabled(app_has_ai_endpoint_snapshot && !ai_in_flight_snapshot, button);
+                let resp = ui.add_enabled(!ai_in_flight_snapshot, button);
                 if !app_has_ai_endpoint_snapshot {
-                    resp.on_hover_text("Configure an AI endpoint in Settings → AI first.");
+                    resp.clone()
+                        .on_hover_text("Configure an AI endpoint in Settings → AI first.");
+                    if resp.clicked() {
+                        result = CommitIntent::GenerateMessage;
+                    }
+                    if ui.button("AI settings…").clicked() {
+                        open_ai_settings = true;
+                    }
                 } else if ai_in_flight_snapshot {
                     ui.spinner();
                 } else if resp.clicked() {
@@ -308,6 +315,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     // new state.
     if let Some(intent) = move_intent {
         apply_move_intent(app, intent);
+    }
+    if open_ai_settings {
+        app.open_settings_section(crate::ui::settings::SettingsSection::Ai);
     }
 
     match result {
@@ -507,7 +517,7 @@ fn render_panel(
 
     // Scrollable file list.
     egui::ScrollArea::vertical()
-        .id_source(match kind {
+        .id_salt(match kind {
             PanelKind::Unstaged => "commit_unstaged_scroll",
             PanelKind::Staged => "commit_staged_scroll",
         })
@@ -730,6 +740,12 @@ fn start_ai_generation(app: &mut MergeFoxApp) {
             if let Some(m) = app.commit_modal.as_mut() {
                 m.ai_error = Some("No AI endpoint configured.".to_string());
             }
+            app.hud = Some(crate::app::Hud::with_action(
+                "AI isn't configured yet.",
+                2600,
+                "Open AI settings",
+                crate::app::HudIntent::OpenSettings(crate::ui::settings::SettingsSection::Ai),
+            ));
             return;
         }
     };

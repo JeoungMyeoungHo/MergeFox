@@ -1,7 +1,7 @@
 //! Small floating HUD shown briefly after undo/redo so the user always
 //! sees what just happened and where they now stand on the timeline.
 
-use egui::{Align2, Color32, Context, FontId, Stroke};
+use egui::{Align2, Color32, Context, RichText, Stroke};
 
 use crate::app::MergeFoxApp;
 use crate::app::View;
@@ -27,18 +27,11 @@ pub fn show(ctx: &Context, app: &mut MergeFoxApp) {
         None
     };
 
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::new("mergefox-hud"),
-    ));
     let visuals = ctx.style().visuals.clone();
+    let mut clicked_action = None;
 
-    let screen = ctx.screen_rect();
-    let pad = egui::Vec2::new(16.0, 12.0);
-
-    // Compose lines
-    let mut lines: Vec<(String, Color32, f32)> = Vec::new();
-    lines.push((hud.message.clone(), visuals.strong_text_color(), 14.0));
+    let mut lines: Vec<(String, Color32)> = Vec::new();
+    lines.push((hud.message.clone(), visuals.strong_text_color()));
     if let Some((pos, total, can_undo, can_redo)) = cursor_info {
         lines.push((
             format!(
@@ -55,27 +48,9 @@ pub fn show(ctx: &Context, app: &mut MergeFoxApp) {
                 },
             ),
             visuals.weak_text_color(),
-            11.0,
         ));
     }
 
-    // Measure
-    let mut max_w = 0.0_f32;
-    let mut total_h = 0.0_f32;
-    let mut galleys = Vec::new();
-    for (line, color, size) in &lines {
-        let galley = painter.layout_no_wrap(line.clone(), FontId::proportional(*size), *color);
-        max_w = max_w.max(galley.size().x);
-        total_h += galley.size().y + 4.0;
-        galleys.push(galley);
-    }
-    total_h -= 4.0; // no trailing gap
-
-    let box_size = egui::Vec2::new(max_w, total_h) + pad * 2.0;
-    let center = egui::pos2(screen.center().x, screen.top() + 48.0);
-    let rect = egui::Rect::from_center_size(center, box_size);
-
-    // Fade
     let age_ms = hud.shown_at.elapsed().as_millis() as u64;
     let fade_in = (age_ms as f32 / 150.0).clamp(0.0, 1.0);
     let fade_out = if age_ms + 300 >= hud.duration_ms {
@@ -86,25 +61,56 @@ pub fn show(ctx: &Context, app: &mut MergeFoxApp) {
     let alpha = (fade_in * fade_out * 235.0) as u8;
 
     let bg = visuals.window_fill().gamma_multiply(alpha as f32 / 255.0);
-    let stroke = Stroke::new(
+    let frame_stroke = Stroke::new(
         1.0,
         visuals
             .window_stroke()
             .color
             .gamma_multiply(alpha as f32 / 255.0),
     );
-    painter.rect(rect, 8.0, bg, stroke);
+    egui::Area::new(egui::Id::new("mergefox-hud"))
+        .order(egui::Order::Foreground)
+        .anchor(Align2::CENTER_TOP, [0.0, 48.0])
+        .show(ctx, |ui| {
+            egui::Frame::window(ui.style())
+                .fill(bg)
+                .stroke(frame_stroke)
+                .rounding(8.0)
+                .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+                .show(ui, |ui| {
+                    ui.set_max_width(520.0);
+                    ui.vertical_centered(|ui| {
+                        for (idx, (line, color)) in lines.iter().enumerate() {
+                            let color = Color32::from_rgba_unmultiplied(
+                                color.r(),
+                                color.g(),
+                                color.b(),
+                                alpha,
+                            );
+                            let text = if idx == 0 {
+                                RichText::new(line).color(color).strong().size(14.0)
+                            } else {
+                                RichText::new(line).color(color).size(11.0)
+                            };
+                            ui.label(text);
+                        }
+                        if let Some(action) = hud.action.clone() {
+                            ui.add_space(6.0);
+                            if ui
+                                .button(RichText::new(action.label).color(visuals.hyperlink_color))
+                                .clicked()
+                            {
+                                clicked_action = Some(action.intent);
+                            }
+                        }
+                    });
+                });
+        });
 
-    // Draw text
-    let mut y = rect.min.y + pad.y;
-    for (i, galley) in galleys.into_iter().enumerate() {
-        let anchor_x = center.x;
-        let size = galley.size();
-        let pos = egui::pos2(anchor_x - size.x / 2.0, y);
-        let mut color = lines[i].1;
-        color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
-        painter.galley(pos, galley, color);
-        y += size.y + 4.0;
+    if let Some(action) = clicked_action {
+        match action {
+            crate::app::HudIntent::OpenSettings(section) => app.open_settings_section(section),
+        }
+        app.hud = None;
     }
-    let _ = Align2::CENTER_TOP; // keep import live if needed
 }

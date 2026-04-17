@@ -19,6 +19,13 @@ pub struct BranchInfo {
     pub is_remote: bool,
     pub upstream: Option<String>,
     pub last_commit_summary: Option<String>,
+    /// Populated by `populate_tracking_counts` after a fetch — commits
+    /// this branch has that the upstream doesn't (ahead) and vice
+    /// versa (behind). `None` when the branch has no upstream set or
+    /// the upstream ref was not present at walk time (fresh clone,
+    /// never fetched).
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +311,45 @@ impl Repo {
         RepoState::Clean
     }
 
+    /// Populate `ahead` / `behind` counts on each local branch by
+    /// comparing against its upstream. Bounded — caps per-branch output
+    /// to avoid runaway cost on a fresh clone with a diverged history.
+    ///
+    /// Separate from `list_branches` so callers that don't need the
+    /// counts (graph walk, checkout selector) skip the extra subprocesses.
+    /// Intended to run on the background thread that populates
+    /// `repo_ui_cache`.
+    pub fn populate_tracking_counts(&self, branches: &mut [BranchInfo]) {
+        for branch in branches.iter_mut() {
+            if branch.is_remote {
+                continue;
+            }
+            let Some(upstream) = branch.upstream.clone() else {
+                continue;
+            };
+            // `rev-list --left-right --count branch...upstream` returns
+            // two tab-separated numbers: left=ahead, right=behind.
+            let range = format!("{}...{}", branch.name, upstream);
+            let out = match super::cli::run(
+                &self.path,
+                ["rev-list", "--left-right", "--count", &range],
+            ) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            if out.status != 0 {
+                continue;
+            }
+            let line = out.stdout_str();
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            branch.ahead = parts[0].parse::<u32>().ok();
+            branch.behind = parts[1].parse::<u32>().ok();
+        }
+    }
+
     pub fn list_branches(&self, include_remote: bool) -> Result<Vec<BranchInfo>> {
         let head_full_name = self.gix.head_name().ok().flatten();
         let head_short = head_full_name
@@ -325,6 +371,8 @@ impl Repo {
                 is_remote: false,
                 upstream,
                 last_commit_summary,
+                ahead: None,
+                behind: None,
             });
         }
 
@@ -342,6 +390,8 @@ impl Repo {
                     is_remote: true,
                     upstream: None,
                     last_commit_summary,
+                    ahead: None,
+                    behind: None,
                 });
             }
         }

@@ -6,7 +6,18 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let sidebar_fill = crate::ui::theme::sidebar_fill(&app.config.theme);
     let language = app.config.ui_language;
 
-    let (branch_error, stash_error, local, remote, configured_remotes, stashes, current_branch, head_branch, forge, lfs) = {
+    let (
+        branch_error,
+        stash_error,
+        local,
+        remote,
+        configured_remotes,
+        stashes,
+        current_branch,
+        head_branch,
+        forge,
+        lfs,
+    ) = {
         let View::Workspace(tabs) = &mut app.view else {
             return;
         };
@@ -84,12 +95,23 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.collapsing("Local", |ui| {
+                    if local.is_empty() {
+                        // Brand-new repo before first commit, or a freshly-
+                        // inited workspace. Explain *why* and suggest the
+                        // very next action so an empty panel doesn't look
+                        // like a broken state.
+                        ui.weak("No local branches yet.");
+                        ui.weak("Create your first commit to bring up `main`.");
+                        ui.add_space(4.0);
+                    }
                     for branch in &local {
                         branch_row(
                             ui,
                             branch,
                             current_branch.as_deref(),
-                            configured_remotes.is_empty() && branch.is_head && branch.upstream.is_none(),
+                            configured_remotes.is_empty()
+                                && branch.is_head
+                                && branch.upstream.is_none(),
                             &mut select_branch,
                             &mut branch_action,
                             &mut open_publish_remote,
@@ -99,6 +121,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 ui.collapsing("Remote", |ui| {
                     if configured_remotes.is_empty() {
                         ui.weak("No remotes configured yet.");
+                        ui.weak("Add one in Settings → Repository, or publish your current branch below.");
                         if let Some(branch) = head_branch.as_deref() {
                             if ui.small_button("Publish current branch…").clicked() {
                                 open_publish_remote = Some(branch.to_string());
@@ -107,6 +130,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         ui.add_space(4.0);
                     } else if remote.is_empty() {
                         ui.weak("No remote-tracking branches yet.");
+                        ui.weak("Fetch from a configured remote to populate this list.");
                         ui.add_space(4.0);
                     }
                     for branch in &remote {
@@ -152,6 +176,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         if let Some(stashes) = &stashes {
                             if stashes.is_empty() {
                                 ui.weak("No stashes.");
+                                ui.weak("Use + Stash above to save a work-in-progress snapshot.");
                             } else {
                                 for stash in stashes {
                                     stash_row(ui, stash, &mut stash_action);
@@ -204,6 +229,20 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     }
 }
 
+/// Hover text for the ahead/behind pill. Combined into one string so
+/// both arrows share the same tooltip surface — otherwise users have
+/// to hover twice to read both halves.
+fn ahead_behind_tooltip(ahead: u32, behind: u32) -> String {
+    match (ahead, behind) {
+        (a, 0) => format!("{a} commit{} to push", if a == 1 { "" } else { "s" }),
+        (0, b) => format!("{b} commit{} to pull", if b == 1 { "" } else { "s" }),
+        (a, b) => format!(
+            "Diverged: {a} local-only, {b} upstream-only commit{} — resolve with pull (merge or rebase)",
+            if b == 1 { "" } else { "s" }
+        ),
+    }
+}
+
 fn branch_row(
     ui: &mut egui::Ui,
     branch: &BranchInfo,
@@ -228,6 +267,32 @@ fn branch_row(
             match &branch.upstream {
                 Some(u) => {
                     ui.weak(egui::RichText::new(format!("→ {u}")).small());
+                    // Ahead/behind pill — shows the shape of the
+                    // divergence at a glance. Hidden when both are zero
+                    // so in-sync branches stay visually quiet. Color
+                    // hints: orange for behind (need to pull), green-ish
+                    // for ahead (ready to push).
+                    if let (Some(ahead), Some(behind)) = (branch.ahead, branch.behind) {
+                        if ahead > 0 || behind > 0 {
+                            let mut parts: Vec<(String, egui::Color32)> = Vec::new();
+                            if ahead > 0 {
+                                parts.push((
+                                    format!("↑{ahead}"),
+                                    egui::Color32::from_rgb(116, 192, 136),
+                                ));
+                            }
+                            if behind > 0 {
+                                parts.push((
+                                    format!("↓{behind}"),
+                                    egui::Color32::from_rgb(220, 150, 80),
+                                ));
+                            }
+                            for (text, color) in parts {
+                                ui.label(egui::RichText::new(text).color(color).small().monospace())
+                                    .on_hover_text(ahead_behind_tooltip(ahead, behind));
+                            }
+                        }
+                    }
                 }
                 None => {
                     ui.weak(

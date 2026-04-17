@@ -642,7 +642,9 @@ mod tests {
 
     #[test]
     fn classify_missing_git_spawn_error() {
-        let err = classify_git_error("spawn git (status in \"/tmp/repo\"): No such file or directory (os error 2)");
+        let err = classify_git_error(
+            "spawn git (status in \"/tmp/repo\"): No such file or directory (os error 2)",
+        );
         assert_eq!(err.kind, GitErrorKind::MissingBinary);
     }
 
@@ -654,7 +656,9 @@ mod tests {
 
     #[test]
     fn classify_auth_prompt_error() {
-        let err = classify_git_error("fatal: could not read Username for 'https://github.com': terminal prompts disabled");
+        let err = classify_git_error(
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+        );
         assert_eq!(err.kind, GitErrorKind::Authentication);
     }
 

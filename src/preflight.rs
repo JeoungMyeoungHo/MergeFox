@@ -121,11 +121,7 @@ pub fn delete_branch(repo_path: &Path, name: &str, is_remote: bool) -> Preflight
     // differs — for a balanced answer we compare against *all other
     // branches* via `--branches` + `--not` + rev-parse.
     let other_refs = list_other_branch_refs(repo_path, name);
-    let mut args: Vec<String> = vec![
-        "log".into(),
-        "--oneline".into(),
-        name.into(),
-    ];
+    let mut args: Vec<String> = vec!["log".into(), "--oneline".into(), name.into()];
     for r in &other_refs {
         args.push("--not".into());
         args.push(r.clone());
@@ -157,11 +153,7 @@ pub fn delete_branch(repo_path: &Path, name: &str, is_remote: bool) -> Preflight
 /// Force-push preview. Reports how many commits on the remote branch are
 /// about to be overwritten — this is the "someone else pushed first"
 /// scenario that force push silently destroys.
-pub fn force_push(
-    repo_path: &Path,
-    remote: &str,
-    branch: &str,
-) -> PreflightInfo {
+pub fn force_push(repo_path: &Path, remote: &str, branch: &str) -> PreflightInfo {
     let mut info = PreflightInfo::default();
     let tracking = format!("{remote}/{branch}");
     // Commits on the remote that the local branch doesn't have.
@@ -197,9 +189,62 @@ pub fn force_push(
     if let Some(n) = count_commits(repo_path, &range_ahead) {
         info.push(
             Severity::Info,
-            format!("{n} local commit{} will be pushed.", if n == 1 { "" } else { "s" }),
+            format!(
+                "{n} local commit{} will be pushed.",
+                if n == 1 { "" } else { "s" }
+            ),
         );
     }
+    info
+}
+
+/// Amend-HEAD preview. Answers the question "will this amend rewrite a
+/// commit I've already pushed?" — which, if yes, means the next push
+/// needs `--force` (or ideally `--force-with-lease`) to land. Matches
+/// `TODO/production.md` §G4.
+///
+/// Returns an empty `PreflightInfo` when HEAD is only local, so the
+/// non-destructive happy path (first-ever amend before push) stays
+/// visually quiet.
+pub fn amend_head(repo_path: &Path) -> PreflightInfo {
+    let mut info = PreflightInfo::default();
+    // `git branch --remotes --contains HEAD` lists every remote-tracking
+    // branch that already has this commit. Non-empty = "remote somewhere
+    // knows about this commit already".
+    let out = match cli::run(
+        repo_path,
+        ["branch", "--remotes", "--contains", "HEAD"]
+            .iter()
+            .copied(),
+    ) {
+        Ok(o) => o,
+        Err(_) => return info, // preflight unavailable — don't alarm
+    };
+    let matches: Vec<String> = out
+        .stdout_str()
+        .lines()
+        .map(|s| s.trim().trim_start_matches('*').trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if matches.is_empty() {
+        return info;
+    }
+    let preview = matches.join(", ");
+    info.push(
+        Severity::Warning,
+        format!(
+            "This commit is already on {} remote branch{}: {}. \
+             Amending rewrites history — the next push will need \
+             `--force-with-lease` to land.",
+            matches.len(),
+            if matches.len() == 1 { "" } else { "es" },
+            preview
+        ),
+    );
+    info.push(
+        Severity::Info,
+        "If someone else pulled this commit, they'll need to rebase onto your amended version.",
+    );
     info
 }
 

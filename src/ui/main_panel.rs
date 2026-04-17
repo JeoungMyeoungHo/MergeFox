@@ -675,7 +675,6 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
                 }
             }
         }
-
         // ---- prompts (collect input first, run on confirm) ----
         CommitAction::CreateBranchPrompt(oid) => {
             out.prompt = Some(prompt::create_branch_prompt(oid));
@@ -704,15 +703,12 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
                 .as_ref()
                 .map(|c| c.remotes.clone())
                 .unwrap_or_default();
-            let current_upstream = ws
-                .repo_ui_cache
-                .as_ref()
-                .and_then(|c| {
-                    c.branches
-                        .iter()
-                        .find(|b| !b.is_remote && b.name == branch)
-                        .and_then(|b| b.upstream.clone())
-                });
+            let current_upstream = ws.repo_ui_cache.as_ref().and_then(|c| {
+                c.branches
+                    .iter()
+                    .find(|b| !b.is_remote && b.name == branch)
+                    .and_then(|b| b.upstream.clone())
+            });
             let remote_branches = ws
                 .repo_ui_cache
                 .as_ref()
@@ -742,9 +738,14 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
             let current = crate::git::cli::run(ws.repo.path(), ["log", "-1", "--format=%B"])
                 .map(|out| out.stdout_str().trim_end_matches('\n').to_string())
                 .unwrap_or_default();
+            // Pre-flight: is the HEAD commit already on a remote?
+            // If so the modal surfaces a "this will need force-push"
+            // warning inline before the user commits.
+            let preflight = Some(crate::preflight::amend_head(ws.repo.path()));
             out.prompt = Some(prompt::amend_message_prompt(
                 current,
                 Some(current_author),
+                preflight,
             ));
         }
 

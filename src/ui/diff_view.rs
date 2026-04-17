@@ -453,11 +453,9 @@ fn render_working_tree_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, entries:
                                 ws.working_file_diff = None;
                             } else {
                                 ws.selected_working_file = Some(entry.path.clone());
-                                ws.working_file_diff = crate::git::diff_text_for_working_entry(
-                                    ws.repo.path(),
-                                    entry,
-                                )
-                                .ok();
+                                ws.working_file_diff =
+                                    crate::git::diff_text_for_working_entry(ws.repo.path(), entry)
+                                        .ok();
                             }
                             ws.selected_file_view = SelectedFileView::Diff;
                             ws.set_image_cache(None);
@@ -607,10 +605,7 @@ fn render_working_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceState, path: 
             }
         });
     });
-    ui.small(format!(
-        "Working Tree · {}",
-        working_tree_stats_str(&entry)
-    ));
+    ui.small(format!("Working Tree · {}", working_tree_stats_str(&entry)));
     ui.separator();
 
     if ws.working_file_diff.is_none() {
@@ -1340,12 +1335,7 @@ fn render_highlighted_snapshot(ui: &mut egui::Ui, file: &FileDiff, cache: &Snaps
     render_text_snapshot(ui, &path, &cache.text, &cache.line_bounds);
 }
 
-fn render_text_snapshot(
-    ui: &mut egui::Ui,
-    path: &str,
-    text: &str,
-    bounds: &[(u32, u32)],
-) {
+fn render_text_snapshot(ui: &mut egui::Ui, path: &str, text: &str, bounds: &[(u32, u32)]) {
     let gutter_color = ui.visuals().widgets.noninteractive.fg_stroke.color;
     let line_bg = ui.visuals().faint_bg_color.gamma_multiply(0.22);
     let total = bounds.len();
@@ -1371,11 +1361,8 @@ fn render_text_snapshot(
                         gutter_color.gamma_multiply(0.78),
                     );
 
-                    let job = crate::ui::syntax::highlighted_code_job(
-                        line,
-                        Some(path),
-                        ui.visuals(),
-                    );
+                    let job =
+                        crate::ui::syntax::highlighted_code_job(line, Some(path), ui.visuals());
                     ui.add(egui::Label::new(job).sense(egui::Sense::hover()));
                 });
             }
