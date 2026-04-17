@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 /// Current on-disk schema version. Bump when making a breaking change to
 /// the JSON shape; add a matching arm in `Config::load` to migrate.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 const MAX_RECENTS: usize = 20;
 
@@ -39,6 +39,8 @@ pub struct Config {
     pub ui_language: UiLanguage,
     #[serde(default)]
     pub theme: ThemeSettings,
+    #[serde(default)]
+    pub settings_window: SettingsWindowState,
     #[serde(default)]
     pub repo_settings: BTreeMap<String, RepoSettings>,
     #[serde(default)]
@@ -65,6 +67,7 @@ impl Default for Config {
             recents: Vec::new(),
             ui_language: UiLanguage::default(),
             theme: ThemeSettings::default(),
+            settings_window: SettingsWindowState::default(),
             repo_settings: BTreeMap::new(),
             provider_accounts: Vec::new(),
             ai_endpoint: None,
@@ -284,6 +287,31 @@ impl ThemeSettings {
     }
 }
 
+fn default_settings_window_width() -> f32 {
+    860.0
+}
+
+fn default_settings_window_height() -> f32 {
+    460.0
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettingsWindowState {
+    #[serde(default = "default_settings_window_width")]
+    pub width: f32,
+    #[serde(default = "default_settings_window_height")]
+    pub height: f32,
+}
+
+impl Default for SettingsWindowState {
+    fn default() -> Self {
+        Self {
+            width: default_settings_window_width(),
+            height: default_settings_window_height(),
+        }
+    }
+}
+
 /// What to do when the user clones a repository whose size we can learn
 /// from the provider (GitHub / GitLab) ahead of time.
 ///
@@ -378,7 +406,7 @@ impl PullStrategyPref {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoSettings {
     #[serde(default)]
     pub default_remote: Option<String>,
@@ -404,9 +432,6 @@ impl Config {
             Ok(c) => c,
             Err(_) => return Self::default(),
         };
-        // Schema migrations would go here — for now we only accept v1 and
-        // treat unknown future versions as "read with caution": keep what
-        // deserialized, don't try to interpret unknown fields.
         cfg
     }
 
@@ -422,14 +447,13 @@ impl Config {
             recents: &self.recents,
             ui_language: self.ui_language,
             theme: &self.theme,
+            settings_window: &self.settings_window,
             repo_settings: &self.repo_settings,
             provider_accounts: &self.provider_accounts,
             ai_endpoint: self.ai_endpoint.as_ref(),
             clone_defaults: &self.clone_defaults,
         };
-        let json = serde_json::to_string_pretty(&to_write)?;
-        fs::write(&path, json).with_context(|| format!("write {}", path.display()))?;
-        Ok(())
+        write_config(&path, &to_write)
     }
 
     pub fn touch_recent(&mut self, path: PathBuf) {
@@ -499,6 +523,7 @@ struct SerConfig<'a> {
     recents: &'a [RecentRepo],
     ui_language: UiLanguage,
     theme: &'a ThemeSettings,
+    settings_window: &'a SettingsWindowState,
     repo_settings: &'a BTreeMap<String, RepoSettings>,
     provider_accounts: &'a [crate::providers::ProviderAccount],
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -506,14 +531,13 @@ struct SerConfig<'a> {
     clone_defaults: &'a CloneDefaults,
 }
 
-fn config_path() -> Option<PathBuf> {
+pub fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("mergefox").join("config.json"))
 }
 
 fn load_from(path: &Path) -> Result<Config> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let cfg = serde_json::from_slice(&bytes)?;
-    Ok(cfg)
+    load_from_bytes(path, &bytes)
 }
 
 /// Canonical path string used as a map key — resolves symlinks and removes
@@ -526,4 +550,143 @@ fn canonical(path: &Path) -> PathBuf {
 
 fn repo_key(path: &Path) -> String {
     canonical(path).to_string_lossy().into_owned()
+}
+
+fn load_from_bytes(path: &Path, bytes: &[u8]) -> Result<Config> {
+    let mut cfg: Config = serde_json::from_slice(bytes)?;
+    if cfg.schema > SCHEMA_VERSION {
+        return Ok(cfg);
+    }
+    if cfg.schema == SCHEMA_VERSION {
+        return Ok(cfg);
+    }
+
+    let from_schema = cfg.schema;
+    let backup_path = backup_original(path, from_schema, bytes)?;
+    cfg = migrate_config(cfg);
+    if let Err(err) = save_config_to_path(path, &cfg) {
+        rollback_backup(path, bytes)?;
+        anyhow::bail!(
+            "migrate config {} -> {} failed (backup at {}): {err:#}",
+            from_schema,
+            SCHEMA_VERSION,
+            backup_path.display()
+        );
+    }
+    Ok(cfg)
+}
+
+fn migrate_config(mut cfg: Config) -> Config {
+    cfg.schema = SCHEMA_VERSION;
+    if !(cfg.settings_window.width.is_finite() && cfg.settings_window.width >= 320.0) {
+        cfg.settings_window.width = default_settings_window_width();
+    }
+    if !(cfg.settings_window.height.is_finite() && cfg.settings_window.height >= 240.0) {
+        cfg.settings_window.height = default_settings_window_height();
+    }
+    cfg
+}
+
+fn backup_original(path: &Path, from_schema: u32, bytes: &[u8]) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .context("config path has no parent directory for backup")?;
+    fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = parent.join(format!("config.backup-v{from_schema}-{stamp}.json"));
+    fs::write(&backup, bytes).with_context(|| format!("write {}", backup.display()))?;
+    Ok(backup)
+}
+
+fn rollback_backup(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    fs::write(path, bytes).with_context(|| format!("restore {}", path.display()))?;
+    Ok(())
+}
+
+fn save_config_to_path(path: &Path, cfg: &Config) -> Result<()> {
+    let to_write = SerConfig {
+        schema: SCHEMA_VERSION,
+        recents: &cfg.recents,
+        ui_language: cfg.ui_language,
+        theme: &cfg.theme,
+        settings_window: &cfg.settings_window,
+        repo_settings: &cfg.repo_settings,
+        provider_accounts: &cfg.provider_accounts,
+        ai_endpoint: cfg.ai_endpoint.as_ref(),
+        clone_defaults: &cfg.clone_defaults,
+    };
+    write_config(path, &to_write)
+}
+
+fn write_config(path: &Path, value: &impl Serialize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let json = serde_json::to_vec_pretty(value)?;
+    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        fs::write(path, fs::read(&tmp)?).with_context(|| format!("write {}", path.display()))?;
+        let _ = fs::remove_file(&tmp);
+        tracing::debug!(error = %err, path = %path.display(), "config rename fallback used");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_from_bytes, SCHEMA_VERSION};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_config_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("mergefox-config-test-{name}-{stamp}"))
+    }
+
+    #[test]
+    fn older_schema_is_migrated_and_backed_up() {
+        let dir = temp_config_dir("migrate");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let bytes = br#"{
+            "schema": 1,
+            "ui_language": "english",
+            "theme": { "preset": "merge_fox", "custom_palette": {
+                "accent": {"r":255,"g":139,"b":61},
+                "background": {"r":22,"g":23,"b":28},
+                "foreground": {"r":241,"g":236,"b":229},
+                "translucent_panels": true,
+                "contrast": 62
+            }},
+            "repo_settings": {},
+            "provider_accounts": [],
+            "clone_defaults": {
+                "size_policy": "prompt",
+                "prompt_threshold_mb": 500,
+                "shallow_depth": 100
+            }
+        }"#;
+
+        let cfg = load_from_bytes(&path, bytes).unwrap();
+        assert_eq!(cfg.schema, SCHEMA_VERSION);
+        let backups = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("config.backup-v1-"))
+            .count();
+        assert_eq!(backups, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

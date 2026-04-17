@@ -37,6 +37,12 @@ pub struct MergeFoxApp {
     pub git_capability: GitCapability,
     pub last_error: Option<String>,
     pub hud: Option<Hud>,
+    /// Unified notification queue. New call sites should use
+    /// `self.notify_ok / notify_info / notify_warn / notify_err`
+    /// instead of touching `hud` or `last_error` directly — those two
+    /// still exist for the journal HUD + legacy paths but are being
+    /// migrated out. See `ui::notifications` for the queue.
+    pub notifications: crate::ui::notifications::NotificationCenter,
     /// Installed lazily because most repos never open an image diff.
     pub image_loaders_installed: bool,
     /// Times of recent undo/redo nav steps — used to detect panic spam.
@@ -56,6 +62,15 @@ pub struct MergeFoxApp {
     pub activity_log_open: bool,
     /// True when the reflog recovery window should render.
     pub reflog_open: bool,
+    /// True when the keyboard-shortcuts cheatsheet should render.
+    /// Opened with `?` and closed with Esc or the window `x`.
+    pub shortcuts_open: bool,
+    /// True when the command palette (⌘K) is visible. Query + selected
+    /// index live alongside so they survive re-renders without being
+    /// recomputed from scratch each frame.
+    pub palette_open: bool,
+    pub palette_query: String,
+    pub palette_selected: usize,
     /// True when the settings window should render.
     pub settings_open: bool,
     /// Persistent in-window edits for the settings modal.
@@ -129,6 +144,7 @@ pub struct SettingsModal {
     /// Which left-sidebar category is active. Persists while the window is
     /// open; reset to `General` when (re)opened.
     pub section: ui::settings::SettingsSection,
+    pub search_query: String,
     pub language: UiLanguage,
     pub theme: ThemeSettings,
     pub repo_path: Option<PathBuf>,
@@ -162,6 +178,10 @@ pub struct SettingsModal {
     /// a refresh, then `Some(list)` (possibly empty if only the main
     /// worktree exists).
     pub worktrees: Option<Vec<crate::git::WorktreeInfo>>,
+    /// Most recent on-screen size of the settings window. Saved back to
+    /// config when the modal closes so the next open restores it.
+    pub window_size: Option<crate::config::SettingsWindowState>,
+    pub reset_scope: Option<ui::settings::SettingsResetScope>,
 }
 
 pub struct PublishRemoteModal {
@@ -187,6 +207,7 @@ pub struct PublishRemoteModal {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct RemoteDraft {
     pub name: String,
     pub fetch_url: String,
@@ -747,14 +768,44 @@ pub struct RebaseSession {
 
 pub struct Hud {
     pub message: String,
+    pub action: Option<HudAction>,
     pub shown_at: Instant,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HudAction {
+    pub label: String,
+    pub intent: HudIntent,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum HudIntent {
+    OpenSettings(ui::settings::SettingsSection),
 }
 
 impl Hud {
     pub fn new(msg: impl Into<String>, duration_ms: u64) -> Self {
         Self {
             message: msg.into(),
+            action: None,
+            shown_at: Instant::now(),
+            duration_ms,
+        }
+    }
+
+    pub fn with_action(
+        msg: impl Into<String>,
+        duration_ms: u64,
+        label: impl Into<String>,
+        intent: HudIntent,
+    ) -> Self {
+        Self {
+            message: msg.into(),
+            action: Some(HudAction {
+                label: label.into(),
+                intent,
+            }),
             shown_at: Instant::now(),
             duration_ms,
         }
@@ -797,6 +848,7 @@ impl MergeFoxApp {
             git_capability: crate::git::probe_git_capability(),
             last_error: None,
             hud: None,
+            notifications: crate::ui::notifications::NotificationCenter::default(),
             image_loaders_installed: false,
             nav_history: VecDeque::new(),
             panic_modal_open: false,
@@ -806,6 +858,10 @@ impl MergeFoxApp {
             columns_popover_open: false,
             activity_log_open: false,
             reflog_open: false,
+            shortcuts_open: false,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selected: 0,
             settings_open: false,
             settings_modal: None,
             publish_remote_modal: None,
@@ -1282,10 +1338,16 @@ impl MergeFoxApp {
             return;
         }
         let ws = tabs.current_mut();
-        let (branch_error, branches) = match ws.repo.list_branches(true) {
+        let (branch_error, mut branches) = match ws.repo.list_branches(true) {
             Ok(branches) => (None, branches),
             Err(err) => (Some(format!("error: {err}")), Vec::new()),
         };
+        // Ahead/behind counts vs. upstream for the sidebar pill. Cheap
+        // per branch (one `rev-list --count`), runs only when the
+        // cache refresh fires, and `populate_tracking_counts` already
+        // no-ops the branches that have no upstream so unconfigured
+        // remotes cost nothing.
+        ws.repo.populate_tracking_counts(&mut branches);
         let head_has_upstream = branches
             .iter()
             .find(|branch| branch.is_head && !branch.is_remote)
@@ -1294,9 +1356,10 @@ impl MergeFoxApp {
         let (stash_error, stashes) = match crate::git::ops::stash_list(ws.repo.path()) {
             Ok(entries) => (None, Some(entries)),
             Err(err) => (
-                Some(crate::git::classify_git_error(format!("{err:#}")).user_message(
-                    "Reading stash list",
-                )),
+                Some(
+                    crate::git::classify_git_error(format!("{err:#}"))
+                        .user_message("Reading stash list"),
+                ),
                 None,
             ),
         };
@@ -1430,8 +1493,7 @@ impl MergeFoxApp {
                 if let Some(previous) = ws.repo_external_snapshot.as_ref() {
                     if previous != &snapshot {
                         should_refresh_cache = true;
-                        should_rebuild_graph =
-                            snapshot.requires_graph_refresh(previous);
+                        should_rebuild_graph = snapshot.requires_graph_refresh(previous);
                         show_external_change_hud = true;
                         rebuild_scope = ws.graph_scope;
                     }
@@ -1630,7 +1692,10 @@ impl MergeFoxApp {
                 .and_then(|name| name.to_str())
                 .map(str::to_owned)
                 .unwrap_or_else(|| "repository".to_string());
-            let preferred_account = self.config.repo_settings_for(ws.repo.path()).provider_account;
+            let preferred_account = self
+                .config
+                .repo_settings_for(ws.repo.path())
+                .provider_account;
             (repo_path, branch, repository_name, preferred_account)
         };
 
@@ -1801,8 +1866,7 @@ impl MergeFoxApp {
                 if let Some(state) = self.background_welcome_state_mut() {
                     state.remote_repos.create_repo.owners_task = None;
                     state.remote_repos.create_repo.owners.clear();
-                    state.remote_repos.create_repo.last_error =
-                        Some(format!("keyring: {err:#}"));
+                    state.remote_repos.create_repo.last_error = Some(format!("keyring: {err:#}"));
                 }
                 return;
             }
@@ -1841,8 +1905,7 @@ impl MergeFoxApp {
             Err(err) => {
                 if let Some(state) = self.background_welcome_state_mut() {
                     state.remote_repos.create_repo.create_task = None;
-                    state.remote_repos.create_repo.last_error =
-                        Some(format!("keyring: {err:#}"));
+                    state.remote_repos.create_repo.last_error = Some(format!("keyring: {err:#}"));
                 }
                 return;
             }
@@ -2091,7 +2154,10 @@ impl MergeFoxApp {
                 modal.repo_path.clone(),
                 modal.branch.clone(),
                 modal.remote_name.trim().to_string(),
-                modal.selected_account.as_ref().map(|account| account.slug()),
+                modal
+                    .selected_account
+                    .as_ref()
+                    .map(|account| account.slug()),
             )
         };
 
@@ -2140,7 +2206,10 @@ impl MergeFoxApp {
                 self.publish_remote_modal = None;
                 self.start_push_for_repo_path(&repo_path, &remote_name, &branch, false, true);
                 self.hud = Some(Hud::new(
-                    format!("Created {}/{} — publishing {branch}", created.owner, created.repo),
+                    format!(
+                        "Created {}/{} — publishing {branch}",
+                        created.owner, created.repo
+                    ),
                     2200,
                 ));
             }
@@ -2153,6 +2222,17 @@ impl MergeFoxApp {
     }
 
     pub fn open_settings(&mut self) {
+        self.open_settings_section(ui::settings::SettingsSection::General);
+    }
+
+    pub fn open_settings_section(&mut self, section: ui::settings::SettingsSection) {
+        if let Some(modal) = self.settings_modal.as_mut() {
+            modal.section = section;
+            modal.feedback = None;
+            self.settings_open = true;
+            return;
+        }
+
         let (repo_path, repo_settings, remotes) = match &self.view {
             View::Workspace(tabs) => {
                 let ws = tabs.current();
@@ -2166,7 +2246,8 @@ impl MergeFoxApp {
         };
 
         self.settings_modal = Some(SettingsModal {
-            section: ui::settings::SettingsSection::General,
+            section,
+            search_query: String::new(),
             language: self.config.ui_language,
             theme: self.config.theme.clone(),
             repo_path,
@@ -2193,6 +2274,8 @@ impl MergeFoxApp {
             identity_global: false,
             identity_loaded: false,
             worktrees: None,
+            window_size: Some(self.config.settings_window.clone()),
+            reset_scope: None,
         });
         self.settings_open = true;
     }
@@ -3106,11 +3189,18 @@ impl MergeFoxApp {
         }
     }
 
-    fn workspace_by_path_mut(&mut self, repo_path: &Path) -> Option<&mut WorkspaceState> {
+    pub fn workspace_by_path_mut(&mut self, repo_path: &Path) -> Option<&mut WorkspaceState> {
         let View::Workspace(tabs) = &mut self.view else {
             return None;
         };
         tabs.tabs.iter_mut().find(|ws| ws.repo.path() == repo_path)
+    }
+
+    pub fn workspace_by_path(&self, repo_path: &Path) -> Option<&WorkspaceState> {
+        let View::Workspace(tabs) = &self.view else {
+            return None;
+        };
+        tabs.tabs.iter().find(|ws| ws.repo.path() == repo_path)
     }
 
     fn refresh_forge_for_repo_path(&mut self, repo_path: &Path) {
@@ -3126,6 +3216,16 @@ impl MergeFoxApp {
     // ------------ journal helpers ------------
 
     pub fn journal_record(&mut self, op: Operation, before: RepoSnapshot, after: RepoSnapshot) {
+        self.journal_record_with_source(op, before, after, OpSource::Ui);
+    }
+
+    pub fn journal_record_with_source(
+        &mut self,
+        op: Operation,
+        before: RepoSnapshot,
+        after: RepoSnapshot,
+        source: OpSource,
+    ) {
         let View::Workspace(tabs) = &mut self.view else {
             return;
         };
@@ -3133,9 +3233,26 @@ impl MergeFoxApp {
         let Some(journal) = ws.journal.as_mut() else {
             return;
         };
-        if let Err(e) = journal.record(op, before, after, OpSource::Ui) {
+        if let Err(e) = journal.record(op, before, after, source) {
             self.last_error = Some(format!("journal record: {e:#}"));
         }
+    }
+
+    pub fn journal_record_mcp(
+        &mut self,
+        agent: impl Into<String>,
+        op: Operation,
+        before: RepoSnapshot,
+        after: RepoSnapshot,
+    ) {
+        self.journal_record_with_source(
+            op,
+            before,
+            after,
+            OpSource::Mcp {
+                agent: agent.into(),
+            },
+        );
     }
 
     pub fn undo(&mut self) {
@@ -3507,7 +3624,9 @@ impl MergeFoxApp {
 
     fn start_job(&mut self, kind: GitJobKind) {
         let repo_path = match &self.view {
-            View::Workspace(tabs) if !tabs.launcher_active => tabs.current().repo.path().to_path_buf(),
+            View::Workspace(tabs) if !tabs.launcher_active => {
+                tabs.current().repo.path().to_path_buf()
+            }
             _ => return,
         };
         self.start_job_for_repo_path(&repo_path, kind);
@@ -4107,12 +4226,15 @@ impl eframe::App for MergeFoxApp {
         }
 
         ui::hud::show(ctx, self);
+        ui::notifications::show(ctx, self);
         ui::panic_recovery::show(ctx, self);
         ui::commit_modal::show(ctx, self);
         ui::prompt::show(ctx, self);
         ui::columns::show(ctx, self);
         ui::activity_log::show(ctx, self);
         ui::reflog::show(ctx, self);
+        ui::shortcuts::show(ctx, self);
+        ui::palette::show(ctx, self);
         ui::settings::show(ctx, self);
         ui::publish_remote::show(ctx, self);
         ui::forge::show(ctx, self);
@@ -4131,9 +4253,11 @@ impl eframe::App for MergeFoxApp {
         if self.remote_repo_refresh_in_progress() {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
-        if self.publish_remote_modal.as_ref().is_some_and(|modal| {
-            modal.owners_task.is_some() || modal.create_task.is_some()
-        }) {
+        if self
+            .publish_remote_modal
+            .as_ref()
+            .is_some_and(|modal| modal.owners_task.is_some() || modal.create_task.is_some())
+        {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.forge_refresh_task.is_some()
@@ -4206,12 +4330,21 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
     // Cmd+Z and Cmd+Shift+Z are *strictly* disambiguated. `consume_shortcut`
     // for Cmd+Z was eating Cmd+Shift+Z events too on macOS, which flipped
     // redo presses into undo ("nothing to undo").
-    let (undo, redo, panic_key, next_tab, prev_tab, close_tab, open_reflog) = ctx.input_mut(|i| {
+    // `?` pulls up the shortcuts cheat-sheet. We suppress it when a
+    // text field owns keyboard focus (commit message, settings inputs)
+    // so typing literal `?` into a message still works — the rule
+    // matches the one we use for `Esc` inside the Settings modal.
+    let shortcuts_hotkey_allowed = !ctx.wants_keyboard_input();
+
+    let (undo, redo, panic_key, next_tab, prev_tab, close_tab, open_reflog, open_shortcuts, open_palette) = ctx.input_mut(|i| {
         let z = i.key_pressed(egui::Key::Z);
         let esc = i.key_pressed(egui::Key::Escape);
         let tab_k = i.key_pressed(egui::Key::Tab);
         let w_k = i.key_pressed(egui::Key::W);
         let r_k = i.key_pressed(egui::Key::R);
+        let k_k = i.key_pressed(egui::Key::K);
+        let questionmark =
+            i.key_pressed(egui::Key::Questionmark) || i.key_pressed(egui::Key::Slash);
         let m = i.modifiers;
         // On macOS, `command` already represents the Cmd key; we don't
         // require anything special about ctrl here.
@@ -4235,6 +4368,19 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
         // reading as "recover" in our context. Users in-panic shouldn't
         // have to hunt for a menu item.
         let open_reflog = r_k && cmd_shift;
+        // `?` (also `Shift+/` on US layouts) brings up the cheatsheet.
+        // Must have no other modifiers so it doesn't clash with future
+        // Cmd+? bindings. Suppressed while a text field has focus —
+        // see `shortcuts_hotkey_allowed` above.
+        let open_shortcuts = questionmark
+            && !m.ctrl
+            && !m.alt
+            && !m.command
+            && shortcuts_hotkey_allowed;
+        // ⌘K / Ctrl+K — command palette. Always available, even while
+        // a text field is focused (that's the whole point of the
+        // palette; users hit it mid-typing to jump around).
+        let open_palette = k_k && cmd_only;
         // Consume the events so textfields / other widgets don't also react.
         if undo || redo {
             i.events.retain(|e| {
@@ -4296,7 +4442,41 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 )
             });
         }
-        (undo, redo, panic_key, next_tab, prev_tab, close_tab, open_reflog)
+        if open_shortcuts {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Questionmark | egui::Key::Slash,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+        }
+        if open_palette {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::K,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+        }
+        (
+            undo,
+            redo,
+            panic_key,
+            next_tab,
+            prev_tab,
+            close_tab,
+            open_reflog,
+            open_shortcuts,
+            open_palette,
+        )
     });
 
     if redo {
@@ -4322,6 +4502,21 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
         // the reflog window has no repo to read from.
         if matches!(app.view, View::Workspace(_)) {
             app.reflog_open = true;
+        }
+    }
+    if open_shortcuts {
+        // Toggle — pressing `?` a second time closes the cheatsheet,
+        // matching the "press same key to dismiss" mental model.
+        app.shortcuts_open = !app.shortcuts_open;
+    }
+    if open_palette {
+        // Toggle — ⌘K again closes the palette without executing an
+        // action. Resetting query + selection keeps the next open
+        // from inheriting stale input.
+        app.palette_open = !app.palette_open;
+        if !app.palette_open {
+            app.palette_query.clear();
+            app.palette_selected = 0;
         }
     }
 }
@@ -4632,8 +4827,7 @@ mod tests {
     #[test]
     fn default_remote_prefers_explicit_setting_when_usable() {
         let remotes = vec!["tradeosx".to_string(), "backup".to_string()];
-        let selected =
-            select_default_remote_name(Some("backup"), Some("tradeosx"), &remotes);
+        let selected = select_default_remote_name(Some("backup"), Some("tradeosx"), &remotes);
         assert_eq!(selected.as_deref(), Some("backup"));
     }
 
@@ -4647,8 +4841,7 @@ mod tests {
     #[test]
     fn default_remote_ignores_missing_preference_and_uses_first_available() {
         let remotes = vec!["tradeosx".to_string()];
-        let selected =
-            select_default_remote_name(Some("origin"), Some("origin"), &remotes);
+        let selected = select_default_remote_name(Some("origin"), Some("origin"), &remotes);
         assert_eq!(selected.as_deref(), Some("tradeosx"));
     }
 }

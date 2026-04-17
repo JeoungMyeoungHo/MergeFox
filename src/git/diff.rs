@@ -204,8 +204,13 @@ pub fn diff_for_commit(repo_path: &Path, oid: gix::ObjectId) -> Result<RepoDiff>
 /// we fall back to staged-only / unstaged-only plumbing.
 pub fn diff_text_for_working_entry(repo_path: &Path, entry: &StatusEntry) -> Result<String> {
     if !matches!(entry.kind, EntryKind::Untracked) {
-        let mut cmd =
-            super::cli::GitCommand::new(repo_path).args(["diff", "HEAD", "--binary", "--unified=3", "--"]);
+        let mut cmd = super::cli::GitCommand::new(repo_path).args([
+            "diff",
+            "HEAD",
+            "--binary",
+            "--unified=3",
+            "--",
+        ]);
         cmd = cmd.arg(&entry.path);
         if let Ok(text) = run_diff_command(cmd) {
             return Ok(text);
@@ -214,7 +219,14 @@ pub fn diff_text_for_working_entry(repo_path: &Path, entry: &StatusEntry) -> Res
 
     let text = if matches!(entry.kind, EntryKind::New | EntryKind::Untracked) {
         super::cli::GitCommand::new(repo_path)
-            .args(["diff", "--no-index", "--binary", "--unified=3", "--", "/dev/null"])
+            .args([
+                "diff",
+                "--no-index",
+                "--binary",
+                "--unified=3",
+                "--",
+                "/dev/null",
+            ])
             .arg(&entry.path)
     } else if entry.kind == EntryKind::Deleted {
         super::cli::GitCommand::new(repo_path)
@@ -241,11 +253,9 @@ pub fn file_diff_for_working_entry(entry: &StatusEntry, patch_text: &str) -> Fil
     let fallback_status = delta_status_for_working_entry(entry);
     let (fallback_old_path, fallback_new_path) = fallback_paths_for_working_entry(entry);
 
-    let patch = parse_patches(patch_text)
-        .into_iter()
-        .find(|p| {
-            p.new_path.as_ref() == Some(&entry.path) || p.old_path.as_ref() == Some(&entry.path)
-        });
+    let patch = parse_patches(patch_text).into_iter().find(|p| {
+        p.new_path.as_ref() == Some(&entry.path) || p.old_path.as_ref() == Some(&entry.path)
+    });
 
     let old_path = patch
         .as_ref()

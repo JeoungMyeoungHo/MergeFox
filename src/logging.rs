@@ -140,4 +140,3 @@ pub fn log_dir() -> Option<PathBuf> {
     }
     dirs::data_dir().map(|d| d.join("mergefox").join("logs"))
 }
-

@@ -161,7 +161,8 @@ impl GitJob {
         let progress_t = progress.clone();
         let cancel_t = cancel_requested.clone();
         thread::spawn(move || {
-            let result = run_job(&repo_path, kind_t, progress_t, cancel_t).map_err(|e| format!("{e:#}"));
+            let result =
+                run_job(&repo_path, kind_t, progress_t, cancel_t).map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
 
