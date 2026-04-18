@@ -196,6 +196,11 @@ pub struct GraphView {
 #[derive(Default)]
 pub struct GraphInteraction {
     pub clicked: Option<usize>,
+    /// Cmd/Ctrl-click on a commit — adds or removes it from the
+    /// multi-commit basket. Reported instead of (not alongside)
+    /// `clicked` so the existing single-select diff flow isn't
+    /// fired on modifier-clicks.
+    pub toggle_basket: Option<usize>,
     pub action: Option<CommitAction>,
     pub clear_commit_selection: bool,
     pub open_commit: bool,
@@ -233,6 +238,11 @@ impl GraphView {
         working_entries: Option<&[crate::git::StatusEntry]>,
         working_selected: &mut bool,
         _working_expanded: &mut bool,
+        // Read-only view of the multi-commit basket. Used to decorate
+        // rows with a checkmark overlay so the user can see which
+        // commits are currently in the basket. Caller handles
+        // toggling (see `GraphInteraction::toggle_basket`).
+        basket: &std::collections::BTreeSet<gix::ObjectId>,
     ) -> GraphInteraction {
         let row_count = self.graph.rows.len();
         if row_count == 0 && working_entries.map(|e| e.is_empty()).unwrap_or(true) {
@@ -363,7 +373,17 @@ impl GraphView {
                         Sense::click_and_drag(),
                     );
 
-                    // Selection background
+                    let row = &self.graph.rows[idx];
+                    let in_basket = basket.contains(&row.oid);
+
+                    // Selection background — layered:
+                    //   1. Basket membership → faint accent tint (distinct
+                    //      from the active-row highlight so a user can
+                    //      tell "selected for basket" apart from "diff
+                    //      is showing this commit").
+                    //   2. Active selected_row wins over basket tint
+                    //      so the currently-viewed row stays legible.
+                    //   3. Hover is below both.
                     if self.selected_row == Some(idx) {
                         ui.painter().rect_filled(
                             rect,
@@ -372,6 +392,13 @@ impl GraphView {
                                 .selection
                                 .bg_fill
                                 .gamma_multiply(if ui.visuals().dark_mode { 0.42 } else { 0.18 }),
+                        );
+                    } else if in_basket {
+                        let accent = ui.visuals().selection.bg_fill;
+                        ui.painter().rect_filled(
+                            rect,
+                            0.0,
+                            accent.gamma_multiply(if ui.visuals().dark_mode { 0.18 } else { 0.09 }),
                         );
                     } else if resp.hovered() {
                         ui.painter().rect_filled(
@@ -382,8 +409,17 @@ impl GraphView {
                     }
 
                     if resp.clicked() {
-                        self.selected_row = Some(idx);
-                        out.clicked = Some(idx);
+                        // Cmd (macOS) / Ctrl (Linux/Windows) modifier
+                        // toggles basket membership without changing the
+                        // primary selection. Plain click = select row for
+                        // the diff panel as before.
+                        let modifiers = ui.input(|i| i.modifiers);
+                        if modifiers.command {
+                            out.toggle_basket = Some(idx);
+                        } else {
+                            self.selected_row = Some(idx);
+                            out.clicked = Some(idx);
+                        }
                     }
 
                     let row = &self.graph.rows[idx];
@@ -904,17 +940,36 @@ fn paint_graph_cell(
         );
     }
 
-    // Commit dot
-    painter.circle_filled(
-        Pos2::new(lane_x(row.lane), mid_y),
-        DOT_RADIUS,
-        lane_color(row.lane),
-    );
-    painter.circle_stroke(
-        Pos2::new(lane_x(row.lane), mid_y),
-        DOT_RADIUS,
-        Stroke::new(1.0, Color32::from_black_alpha(80)),
-    );
+    // Commit dot.
+    //
+    // Merge commits (>1 parent, hence >1 outgoing edge) render as a
+    // hollow ring so they're visually distinct from linear commits.
+    // Convention we match: a solid dot "is" a commit; a ring "joins"
+    // multiple lines of history. This is the same idiom used by
+    // GitKraken, Sourcetree, and `gitk --topo-order` when it shades
+    // merge nodes differently.
+    let dot_pos = Pos2::new(lane_x(row.lane), mid_y);
+    let base_color = lane_color(row.lane);
+    let is_merge = row.edges_out.len() > 1;
+    if is_merge {
+        // Ring: stroked outer, filled inner hole in the panel's
+        // background so we punch a hole through any lane line that
+        // happens to pass through.
+        let bg = painter.ctx().style().visuals.panel_fill;
+        painter.circle_filled(dot_pos, DOT_RADIUS, bg);
+        painter.circle_stroke(
+            dot_pos,
+            DOT_RADIUS,
+            Stroke::new(LINE_WIDTH.max(1.6), base_color),
+        );
+    } else {
+        painter.circle_filled(dot_pos, DOT_RADIUS, base_color);
+        painter.circle_stroke(
+            dot_pos,
+            DOT_RADIUS,
+            Stroke::new(1.0, Color32::from_black_alpha(80)),
+        );
+    }
 }
 
 /// Header row titles, rendered once above the scrollable list.

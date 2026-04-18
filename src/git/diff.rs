@@ -26,6 +26,22 @@ pub struct RepoDiff {
     pub title: String,
     pub commit_message: Option<String>,
     pub commit_author: Option<String>,
+    /// Author email (trimmed of `<>` wrappers). `None` for working-tree
+    /// diffs or when gix couldn't parse the signature.
+    pub commit_author_email: Option<String>,
+    /// Unix seconds when the commit was AUTHORED (not committed — the
+    /// two differ after rebase / cherry-pick / amend). `None` for
+    /// working-tree diffs. The UI formats this as both absolute and
+    /// relative time so rebased commits still show the original write
+    /// date.
+    pub commit_author_time: Option<i64>,
+    /// Full commit OID for the currently-shown commit, so the UI can
+    /// render a short hash badge without the caller having to thread
+    /// the OID through separately.
+    pub commit_oid: Option<gix::ObjectId>,
+    /// Parent OIDs — usually 0 (root) or 1 (linear history), more for
+    /// merges. Displayed as a list of short hashes next to `parent:`.
+    pub commit_parent_oids: Vec<gix::ObjectId>,
     pub files: Box<[FileDiff]>,
 }
 
@@ -134,9 +150,16 @@ pub fn diff_for_commit(repo_path: &Path, oid: gix::ObjectId) -> Result<RepoDiff>
     let gix_repo = gix::discover(repo_path).context("open gix repo for diff")?;
     let t_gix_discover = t0.elapsed();
 
-    let (title, commit_message, commit_author) = commit_meta(&gix_repo, oid).unwrap_or_else(|| {
+    let meta = commit_meta(&gix_repo, oid).unwrap_or_else(|| {
         let s = oid.to_string();
-        (s[..7.min(s.len())].to_string(), None, None)
+        CommitMeta {
+            title: s[..7.min(s.len())].to_string(),
+            message: None,
+            author_name: None,
+            author_email: None,
+            author_time: None,
+            parent_oids: Vec::new(),
+        }
     });
     let t_meta = t0.elapsed();
 
@@ -189,9 +212,13 @@ pub fn diff_for_commit(repo_path: &Path, oid: gix::ObjectId) -> Result<RepoDiff>
     }
 
     Ok(RepoDiff {
-        title,
-        commit_message,
-        commit_author,
+        title: meta.title,
+        commit_message: meta.message,
+        commit_author: meta.author_name,
+        commit_author_email: meta.author_email,
+        commit_author_time: meta.author_time,
+        commit_oid: Some(oid),
+        commit_parent_oids: meta.parent_oids,
         files: files.into_boxed_slice(),
     })
 }
@@ -318,26 +345,64 @@ pub fn file_diff_for_working_entry(entry: &StatusEntry, patch_text: &str) -> Fil
 
 // ---- internal helpers ----
 
-fn commit_meta(
-    gix_repo: &gix::Repository,
-    oid: gix::ObjectId,
-) -> Option<(String, Option<String>, Option<String>)> {
+/// What `commit_meta` returns; grouped into a named struct rather
+/// than an ever-growing tuple so future additions (committer,
+/// signature verification, …) don't force updates at every call site.
+struct CommitMeta {
+    title: String,
+    message: Option<String>,
+    author_name: Option<String>,
+    author_email: Option<String>,
+    author_time: Option<i64>,
+    parent_oids: Vec<gix::ObjectId>,
+}
+
+fn commit_meta(gix_repo: &gix::Repository, oid: gix::ObjectId) -> Option<CommitMeta> {
     let commit = gix_repo.find_object(oid).ok()?.try_into_commit().ok()?;
-    let parent_ids: Vec<gix::ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+    let parent_oids: Vec<gix::ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
     let msg = commit.message().ok()?;
-    let summary = msg.summary().to_string();
-    let author_name = commit.author().ok().map(|a| a.name.to_string());
+    // Full message = summary + blank + body when body is present.
+    // The detail view already wraps this in a scroll area so long
+    // release-note style messages are fine.
+    let full = match msg.body.as_ref() {
+        Some(body) => {
+            let body_str = body.to_string();
+            let body_trimmed = body_str.trim();
+            if body_trimmed.is_empty() {
+                msg.summary().to_string()
+            } else {
+                format!("{}\n\n{body_trimmed}", msg.summary())
+            }
+        }
+        None => msg.summary().to_string(),
+    };
+
+    let (author_name, author_email, author_time) = match commit.author() {
+        Ok(sig) => (
+            Some(sig.name.to_string()),
+            Some(sig.email.to_string()),
+            sig.time().ok().map(|t| t.seconds),
+        ),
+        Err(_) => (None, None, None),
+    };
 
     let oid_s = oid.to_string();
     let short = &oid_s[..7.min(oid_s.len())];
-    let title = if let Some(pid) = parent_ids.first() {
+    let title = if let Some(pid) = parent_oids.first() {
         let ps = pid.to_string();
         format!("{} → {short}", &ps[..7.min(ps.len())])
     } else {
         format!("<root> → {short}")
     };
 
-    Some((title, Some(summary), author_name))
+    Some(CommitMeta {
+        title,
+        message: Some(full),
+        author_name,
+        author_email,
+        author_time,
+        parent_oids,
+    })
 }
 
 fn run_diff_command(cmd: super::cli::GitCommand) -> Result<String> {

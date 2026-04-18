@@ -416,6 +416,13 @@ pub struct WorkspaceState {
     pub active_job: Option<GitJob>,
     /// Currently-selected commit in the graph (drives the diff panel).
     pub selected_commit: Option<gix::ObjectId>,
+    /// Multi-select "basket" of commits for cross-cutting operations
+    /// (combined diff, file-focused inspection, revert-to-WT, non-linear
+    /// squash). Populated via Cmd/Ctrl-click on graph rows; the regular
+    /// `selected_commit` click behaviour is unaffected when the basket
+    /// is empty. Stored as a `BTreeSet` so membership lookup is log-N
+    /// and iteration order is deterministic (for prompt snapshots, etc.).
+    pub commit_basket: std::collections::BTreeSet<gix::ObjectId>,
     /// Diff of `selected_commit` vs its first parent, if available.
     pub current_diff: Option<Arc<RepoDiff>>,
     /// Which file in `current_diff.files` the user is viewing in the
@@ -987,12 +994,60 @@ impl MergeFoxApp {
         }
     }
 
+    /// Render the commit-basket floating bar and dispatch its intent.
+    /// Bar auto-hides when the basket has fewer than 2 entries.
+    pub fn handle_commit_basket_bar(&mut self, ctx: &egui::Context) {
+        // Only the active workspace tab gets a basket bar — a background
+        // tab's basket shouldn't poke through the foreground view.
+        let intent = match &self.view {
+            View::Workspace(tabs) if !tabs.launcher_active => {
+                ui::commit_basket::show(ctx, tabs.current())
+            }
+            _ => None,
+        };
+        let Some(intent) = intent else { return };
+
+        use ui::commit_basket::BasketIntent;
+        match intent {
+            BasketIntent::Clear => {
+                if let View::Workspace(tabs) = &mut self.view {
+                    tabs.current_mut().commit_basket.clear();
+                }
+            }
+            BasketIntent::ShowCombinedDiff
+            | BasketIntent::FocusFile
+            | BasketIntent::RevertToWorkingTree
+            | BasketIntent::SquashIntoOne => {
+                // Wired in subsequent phases. Surface a toast so the
+                // user gets feedback that the intent registered while
+                // the backend is in flight.
+                self.notify_info(format!("Basket: {intent:?} — not yet wired"));
+            }
+        }
+    }
+
     pub fn set_git_error(&mut self, action: &str, err: impl std::fmt::Display) {
         let diagnostic = crate::git::classify_git_error(err.to_string());
         if matches!(diagnostic.kind, crate::git::GitErrorKind::MissingBinary) {
             self.refresh_git_capability();
         }
-        self.last_error = Some(diagnostic.user_message(action));
+        let summary = diagnostic.user_message(action);
+        let raw = err.to_string();
+        // Surface as a sticky bottom-right toast. The raw git output
+        // often has details ("hint: ...", branch/ref names) that the
+        // summary omits — we include it as the detail line so pushes
+        // / merge conflicts stay actionable without the user opening
+        // a terminal.
+        let detail = if raw.trim().is_empty() || raw.trim() == summary.trim() {
+            None
+        } else {
+            Some(raw)
+        };
+        match detail {
+            Some(d) => self.notify_err_with_detail(summary.clone(), d),
+            None => self.notify_err(summary.clone()),
+        }
+        self.last_error = Some(summary);
     }
 
     pub fn ensure_image_loaders(&mut self, ctx: &egui::Context) {
@@ -1268,6 +1323,7 @@ impl MergeFoxApp {
             journal,
             active_job: None,
             selected_commit: None,
+            commit_basket: std::collections::BTreeSet::new(),
             current_diff: None,
             selected_file_idx: None,
             selected_file_view: SelectedFileView::Diff,
@@ -4663,6 +4719,7 @@ impl eframe::App for MergeFoxApp {
         ui::forge::show(ctx, self);
         ui::rebase::show(ctx, self);
         ui::conflicts::show(ctx, self);
+        self.handle_commit_basket_bar(ctx);
 
         if self.clone_in_progress() {
             ctx.request_repaint_after(Duration::from_millis(100));

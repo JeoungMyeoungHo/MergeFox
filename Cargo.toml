@@ -137,7 +137,24 @@ tracing-appender = "0.2"
 # Sensitive string wrapper — zero on drop
 secrecy = "0.8"
 gix-traverse = "0.55.0"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "bmp",
+    "tga",
+    "tiff",
+    "webp",
+    "ico",
+    # OpenEXR for HDR textures common in game/VFX pipelines. Relatively
+    # heavy (adds OpenEXR-rs transitively) but worth it for the
+    # asset-preview thumbnails so game artists aren't blind to `.exr`.
+    "exr",
+    # HDR (Radiance) — lightweight, pairs with EXR for HDR workflows.
+    "hdr",
+    # QOI — tiny modern lossless format, zero-cost addition.
+    "qoi",
+] }
 
 # Compile-time font subsetter — reads every `.rs` source file, collects all
 # string literals, and produces a slimmed-down Pretendard subset containing

@@ -344,10 +344,13 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 );
             }
 
-            if let Some(err) = last_error {
-                ui.separator();
-                ui.colored_label(egui::Color32::LIGHT_RED, err);
-            }
+            // Errors used to render inline here as a red label, but
+            // long multi-line diagnostics (push rejections, merge
+            // conflicts) overflowed the top bar and pushed other
+            // controls off-screen. They now go to the bottom-right
+            // toast stack — see `ui::notifications`. The `last_error`
+            // field is still populated for diagnostics / journal.
+            let _ = last_error;
         });
     });
 
