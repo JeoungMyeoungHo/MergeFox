@@ -44,6 +44,13 @@ impl Default for DetailTab {
     }
 }
 
+/// Confirmation-dialog flag kept in egui memory. When the user presses
+/// Rebase with "Backup current state" UNCHECKED we first pop a warning
+/// — history rewrite without a safety tag is worth one extra click.
+/// `true` means the warning is currently on-screen.
+#[derive(Clone, Copy, Default)]
+struct ConfirmNoBackup(bool);
+
 mod palette {
     use egui::Color32;
     /// Green dot / text tint for Pick.
@@ -87,9 +94,17 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         .data(|d| d.get_temp::<DetailTab>(detail_tab_id))
         .unwrap_or_default();
 
+    let confirm_id = egui::Id::new("rebase_confirm_no_backup");
+    let mut confirm_no_backup: ConfirmNoBackup = ctx
+        .data(|d| d.get_temp::<ConfirmNoBackup>(confirm_id))
+        .unwrap_or_default();
+
     let mut open = true;
     let mut cancel = false;
     let mut start = false;
+    // Set when the user clicks Rebase; we may gate on the confirm dialog
+    // before flipping `start`.
+    let mut request_start = false;
 
     egui::Window::new("Interactive Rebase")
         .open(&mut open)
@@ -227,16 +242,41 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 ui.checkbox(
                     &mut modal.backup_current_state,
                     "Backup current state with tag",
+                )
+                .on_hover_text(
+                    "Creates a lightweight tag pointing at the current HEAD before the \
+                     rebase starts, so you can always get back to exactly this state with \
+                     `git reset --hard <tag>`.",
                 );
+                if !modal.backup_current_state {
+                    // Inline warning sits right next to the checkbox, so
+                    // the missing safety net doesn't stay invisible.
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        palette::REWORD,
+                        RichText::new("⚠ no safety tag").small(),
+                    )
+                    .on_hover_text(
+                        "Without a backup tag, you'll need the reflog to recover if this \
+                         rebase goes sideways.",
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let rebase_btn =
                         egui::Button::new(RichText::new("Rebase").color(Color32::WHITE).strong())
                             .fill(palette::ACCENT)
                             .min_size(egui::vec2(96.0, 26.0));
-                    if ui.add(rebase_btn).clicked() {
-                        start = true;
+                    let rebase_resp = ui.add(rebase_btn);
+                    if rebase_resp.clicked() {
+                        request_start = true;
                     }
-                    if ui.button(RichText::new("Cancel")).clicked() {
+                    // Keyboard shortcut hint.
+                    rebase_resp.on_hover_text("Start the rebase (Ctrl+Enter).");
+                    if ui
+                        .button(RichText::new("Cancel"))
+                        .on_hover_text("Close without rebasing (Esc).")
+                        .clicked()
+                    {
                         cancel = true;
                     }
                 });
@@ -245,10 +285,106 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
     ctx.data_mut(|d| d.insert_temp(detail_tab_id, detail_tab));
 
+    // ---------- Keyboard shortcuts --------------------------------------
+    // Only active while the modal is still on-screen. Esc cancels,
+    // Ctrl/Cmd+Enter confirms (mirrors macOS dialog convention).
+    if open && !cancel {
+        let (esc, ctrl_enter) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                (i.modifiers.ctrl || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::Enter),
+            )
+        });
+        // Esc dismisses the confirm dialog first if it's up, otherwise
+        // cancels the whole modal — matches what most dialogs do.
+        if esc {
+            if confirm_no_backup.0 {
+                confirm_no_backup.0 = false;
+            } else {
+                cancel = true;
+            }
+        }
+        if ctrl_enter && !confirm_no_backup.0 {
+            request_start = true;
+        }
+    }
+
+    // ---------- Confirm dialog (no-backup warning) ----------------------
+    // If the user asked to start but hasn't backed up, gate on a confirm.
+    // Once the dialog is dismissed via "Rebase anyway" we flip `start`;
+    // "Go back" just closes the dialog and leaves the modal in place.
+    let needs_backup_warning = if let View::Workspace(tabs) = &app.view {
+        tabs.current()
+            .rebase_modal
+            .as_ref()
+            .map(|m| !m.backup_current_state)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if request_start {
+        if needs_backup_warning {
+            confirm_no_backup.0 = true;
+        } else {
+            start = true;
+        }
+    }
+
+    if confirm_no_backup.0 {
+        // Tower/Fork use an inline secondary dialog for this; we use a
+        // small modal Window centered above the main one.
+        let mut confirm_open = true;
+        egui::Window::new("Rewrite history without a backup?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut confirm_open)
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.colored_label(
+                    palette::DROP,
+                    RichText::new("⚠ This will rewrite your branch without a safety tag.")
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    "If the rebase produces an unexpected result you'll only be able to \
+                     recover via the reflog (`git reflog` + `git reset --hard`). \
+                     Most rebases are safe — this is just a nudge.",
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let go_btn = egui::Button::new(
+                            RichText::new("Rebase anyway").color(Color32::WHITE).strong(),
+                        )
+                        .fill(palette::DROP)
+                        .min_size(egui::vec2(120.0, 26.0));
+                        if ui.add(go_btn).clicked() {
+                            start = true;
+                            confirm_no_backup.0 = false;
+                        }
+                        if ui.button("Go back").clicked() {
+                            confirm_no_backup.0 = false;
+                        }
+                    });
+                });
+            });
+        // Clicking the window's close (X) is equivalent to "Go back".
+        if !confirm_open {
+            confirm_no_backup.0 = false;
+        }
+    }
+
+    ctx.data_mut(|d| d.insert_temp(confirm_id, confirm_no_backup));
+
     if !open || cancel {
         if let View::Workspace(tabs) = &mut app.view {
             tabs.current_mut().rebase_modal = None;
         }
+        // Reset the gating flag so it doesn't stick around for next open.
+        ctx.data_mut(|d| d.insert_temp(confirm_id, ConfirmNoBackup(false)));
     }
     if start {
         app.start_rebase_session();
@@ -321,9 +457,20 @@ fn render_plan_row(
         .rounding(Rounding::same(2.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Action dot (clickable selection)
-                let (dot_rect, dot_resp) =
-                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                // Action dot (clickable selection). Halo on hover gives a
+                // subtle affordance without introducing a dedicated hover
+                // color across the whole row.
+                let (dot_rect, dot_resp) = ui.allocate_exact_size(
+                    egui::vec2(14.0, 14.0),
+                    egui::Sense::click().union(egui::Sense::hover()),
+                );
+                if dot_resp.hovered() {
+                    ui.painter().circle_filled(
+                        dot_rect.center(),
+                        7.0,
+                        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 70),
+                    );
+                }
                 ui.painter().circle_filled(dot_rect.center(), 5.0, accent);
                 if dimmed {
                     // Hollow out for Drop so it reads as "removed"
@@ -333,6 +480,7 @@ fn render_plan_row(
                 if dot_resp.clicked() {
                     *select_idx = Some(idx);
                 }
+                let _ = dot_resp.on_hover_text("Select this commit");
 
                 // Action label + inline dropdown.
                 egui::ComboBox::from_id_salt(("rebase_action", idx))
@@ -361,16 +509,28 @@ fn render_plan_row(
                         }
                     });
 
-                // Reorder arrows ↑ / ↓
+                // Reorder arrows ↑ / ↓. We stack them vertically in a
+                // fixed-width column so the subject alignment stays
+                // stable across rows regardless of which arrows are
+                // enabled. Tooltips double as hover affordance.
                 ui.vertical(|ui| {
                     ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
+                    ui.spacing_mut().item_spacing.y = 1.0;
                     ui.add_enabled_ui(can_move_up, |ui| {
-                        if ui.small_button("▲").clicked() {
+                        if ui
+                            .small_button("▲")
+                            .on_hover_text("Move commit up (earlier in history)")
+                            .clicked()
+                        {
                             *move_up = Some(idx);
                         }
                     });
                     ui.add_enabled_ui(can_move_down, |ui| {
-                        if ui.small_button("▼").clicked() {
+                        if ui
+                            .small_button("▼")
+                            .on_hover_text("Move commit down (later in history)")
+                            .clicked()
+                        {
                             *move_down = Some(idx);
                         }
                     });
@@ -415,25 +575,57 @@ fn render_plan_row(
                     *select_idx = Some(idx);
                 }
 
-                // Right-aligned metadata: author · sha · date.
+                // Right-aligned metadata: author · sha · date, each in a
+                // fixed-width cell so alignment stays tidy across rows
+                // and long author strings don't push the subject around.
+                // Columns are laid out right-to-left, so we add DATE
+                // first, then SHA, then author (which grows leftward).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let base_color = if dimmed {
+                        palette::MUTED
+                    } else if selected {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 210)
+                    } else {
+                        palette::MUTED
+                    };
+                    let mk = |s: String| {
+                        let mut rt = RichText::new(s).color(base_color).monospace().small();
+                        if dimmed {
+                            rt = rt.strikethrough();
+                        }
+                        rt
+                    };
+
+                    // DATE: roughly "12mo ago" worst case → ~72px.
                     let date = relative_time(item.timestamp);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(72.0, 16.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.add(egui::Label::new(mk(date)).truncate());
+                        },
+                    );
+                    // SHA: always 7 hex chars → ~64px.
                     let sha = short_sha(&item.oid);
-                    let meta = format!("{}   {}   {}", item.author, sha, date);
-                    let mut rt = RichText::new(meta)
-                        .color(if dimmed {
-                            palette::MUTED
-                        } else if selected {
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 210)
-                        } else {
-                            palette::MUTED
-                        })
-                        .monospace()
-                        .small();
-                    if dimmed {
-                        rt = rt.strikethrough();
-                    }
-                    ui.add(egui::Label::new(rt).truncate());
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(64.0, 16.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.add(egui::Label::new(mk(sha)).truncate())
+                                .on_hover_text(item.oid.to_string());
+                        },
+                    );
+                    // AUTHOR: fixed-width cell so very long "Firstname
+                    // Middlename Lastname" entries get truncated with ellipsis
+                    // rather than pushing SHA/date off the row.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(140.0, 16.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.add(egui::Label::new(mk(item.author.clone())).truncate())
+                                .on_hover_text(&item.author);
+                        },
+                    );
                 });
                 // Keep strike stroke variable used (silence lints when
                 // the theme doesn't surface it visually).
