@@ -402,6 +402,8 @@ mod count_objects_tests {
 #[cfg(test)]
 mod worktree_tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_main_only() {
@@ -423,6 +425,46 @@ mod worktree_tests {
         assert!(!w[1].is_main && w[1].is_detached);
         assert!(w[2].is_locked);
         assert_eq!(w[2].lock_reason.as_deref(), Some("on external drive"));
+    }
+
+    #[test]
+    fn list_remotes_ignores_incomplete_remote_sections() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "mergefox-remote-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create temp repo root");
+        crate::git::cli::run(&root, ["init"]).expect("git init");
+        crate::git::cli::run(
+            &root,
+            [
+                "remote",
+                "add",
+                "tradeosx",
+                "https://github.com/tradeosx/tradeai.git",
+            ],
+        )
+        .expect("add real remote");
+
+        let config_path = root.join(".git").join("config");
+        let mut config = fs::read_to_string(&config_path).expect("read git config");
+        config.push_str("\n[remote \"origin\"]\n");
+        config.push_str("[remote \"tradeai\"]\n");
+        fs::write(&config_path, config).expect("append incomplete remotes");
+
+        let repo = Repo::open(&root).expect("open repo");
+        let remotes = repo.list_remotes().expect("list remotes");
+        let names = remotes
+            .into_iter()
+            .map(|remote| remote.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["tradeosx"]);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
@@ -935,10 +977,17 @@ impl Repo {
         let mut out = Vec::new();
         for name in self.gix.remote_names() {
             let name_str = name.to_string();
-            let remote = self
-                .gix
-                .find_remote(name.as_ref())
-                .with_context(|| format!("find remote {name_str}"))?;
+            let remote = match self.gix.find_remote(name.as_ref()) {
+                Ok(remote) => remote,
+                Err(err) => {
+                    // Some tools leave empty `[remote "..."]`
+                    // stanzas behind. Core git ignores those for
+                    // `remote -v` / `remote get-url`, so we skip them
+                    // instead of failing the entire remote listing.
+                    tracing::debug!(remote = %name_str, error = %err, "ignoring incomplete remote config");
+                    continue;
+                }
+            };
             let fetch_url = remote
                 .url(gix::remote::Direction::Fetch)
                 .map(|u| u.to_bstring().to_string());
@@ -1083,10 +1132,7 @@ impl Repo {
     /// `git fsck --full` — check the object database for corruption.
     /// Returns stdout (dangling / missing objects, if any).
     pub fn fsck(&self) -> Result<String> {
-        let out = super::cli::run(
-            &self.path,
-            ["fsck", "--full", "--strict", "--no-progress"],
-        )?;
+        let out = super::cli::run(&self.path, ["fsck", "--full", "--strict", "--no-progress"])?;
         Ok(out.stdout_str())
     }
 
@@ -1153,13 +1199,10 @@ impl Repo {
         // `git config --bool core.sparseCheckoutCone` returns "true" /
         // "false" / errors when unset. Default to cone=on when enabled
         // since that's what `git sparse-checkout init` sets.
-        let cone = super::cli::run(
-            &self.path,
-            ["config", "--bool", "core.sparseCheckoutCone"],
-        )
-        .ok()
-        .map(|o| o.stdout_str().trim() == "true")
-        .unwrap_or(enabled);
+        let cone = super::cli::run(&self.path, ["config", "--bool", "core.sparseCheckoutCone"])
+            .ok()
+            .map(|o| o.stdout_str().trim() == "true")
+            .unwrap_or(enabled);
         let patterns = if enabled {
             super::cli::run(&self.path, ["sparse-checkout", "list"])
                 .ok()
@@ -1427,13 +1470,14 @@ impl Repo {
         Ok(())
     }
 
-    pub fn delete_branch(&self, name: &str, is_remote: bool) -> Result<()> {
+    pub fn delete_branch(&self, name: &str, is_remote: bool, force: bool) -> Result<()> {
         if is_remote {
             // Remote-tracking branch: delete the local ref
             super::cli::run(&self.path, ["branch", "-r", "-d", name])
                 .with_context(|| format!("delete remote branch {name}"))?;
         } else {
-            super::cli::run(&self.path, ["branch", "-d", name])
+            let delete_flag = if force { "-D" } else { "-d" };
+            super::cli::run(&self.path, ["branch", delete_flag, name])
                 .with_context(|| format!("delete branch {name}"))?;
         }
         Ok(())

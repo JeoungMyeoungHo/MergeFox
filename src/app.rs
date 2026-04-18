@@ -532,6 +532,12 @@ pub struct WorkspaceState {
     pub selected_working_tree: bool,
 }
 
+#[derive(Default)]
+struct ResolvedGitTransport {
+    credentials: Option<crate::git::jobs::HttpsCredentials>,
+    ssh_key_path: Option<PathBuf>,
+}
+
 /// Per-tab cached view of repo state. Populated by
 /// `MergeFoxApp::refresh_repo_ui_cache` after mutations.
 pub struct RepoUiCache {
@@ -2623,37 +2629,39 @@ impl MergeFoxApp {
                             Err(e) => break Advance::Failed(format!("rebase step: {e:#}")),
                         }
                     }
-                    RebaseAction::Squash | RebaseAction::Fixup => match ws.repo.start_cherry_pick_apply(step.oid) {
-                        Ok(true) => {
-                            break Advance::Blocked {
-                                msg: format!(
-                                    "Resolve conflicts for {} to continue rebase",
-                                    short_sha(&step.oid)
-                                ),
-                                scope,
-                            };
-                        }
-                        Ok(false) => {
-                            // Both Squash and Fixup finish via the
-                            // same "combine into previous commit"
-                            // path — Fixup already baked the discarded-
-                            // message decision into `step.message`
-                            // during plan compilation (it carries the
-                            // previous message verbatim).
-                            if let Err(e) = ws.repo.finish_pending_pick_squash(&step.message) {
-                                break Advance::Failed(format!(
-                                    "{} step: {e:#}",
-                                    if matches!(step.action, RebaseAction::Fixup) {
-                                        "fixup"
-                                    } else {
-                                        "squash"
-                                    }
-                                ));
+                    RebaseAction::Squash | RebaseAction::Fixup => {
+                        match ws.repo.start_cherry_pick_apply(step.oid) {
+                            Ok(true) => {
+                                break Advance::Blocked {
+                                    msg: format!(
+                                        "Resolve conflicts for {} to continue rebase",
+                                        short_sha(&step.oid)
+                                    ),
+                                    scope,
+                                };
                             }
-                            session.next_index += 1;
+                            Ok(false) => {
+                                // Both Squash and Fixup finish via the
+                                // same "combine into previous commit"
+                                // path — Fixup already baked the discarded-
+                                // message decision into `step.message`
+                                // during plan compilation (it carries the
+                                // previous message verbatim).
+                                if let Err(e) = ws.repo.finish_pending_pick_squash(&step.message) {
+                                    break Advance::Failed(format!(
+                                        "{} step: {e:#}",
+                                        if matches!(step.action, RebaseAction::Fixup) {
+                                            "fixup"
+                                        } else {
+                                            "squash"
+                                        }
+                                    ));
+                                }
+                                session.next_index += 1;
+                            }
+                            Err(e) => break Advance::Failed(format!("squash step: {e:#}")),
                         }
-                        Err(e) => break Advance::Failed(format!("squash step: {e:#}")),
-                    },
+                    }
                 }
             }
         };
@@ -3563,18 +3571,13 @@ impl MergeFoxApp {
             View::Workspace(tabs) => {
                 let ws = tabs.current();
                 let Some(journal) = ws.journal.as_ref() else {
-                    self.notify_warn(
-                        "No journal for this repository yet — make a change first.",
-                    );
+                    self.notify_warn("No journal for this repository yet — make a change first.");
                     return;
                 };
                 let text = match journal.export_json() {
                     Ok(t) => t,
                     Err(err) => {
-                        self.notify_err_with_detail(
-                            "Journal export failed",
-                            format!("{err:#}"),
-                        );
+                        self.notify_err_with_detail("Journal export failed", format!("{err:#}"));
                         return;
                     }
                 };
@@ -3617,17 +3620,13 @@ impl MergeFoxApp {
                 let file = ws
                     .current_diff
                     .as_ref()
-                    .and_then(|d| {
-                        ws.selected_file_idx.and_then(|idx| d.files.get(idx))
-                    })
+                    .and_then(|d| ws.selected_file_idx.and_then(|idx| d.files.get(idx)))
                     .map(|f| f.new_path.clone().or_else(|| f.old_path.clone()))
                     .flatten();
                 match file {
                     Some(p) => (ws.repo.path().to_path_buf(), p),
                     None => {
-                        self.notify_warn(
-                            "Select a file in the diff view before running blame.",
-                        );
+                        self.notify_warn("Select a file in the diff view before running blame.");
                         return;
                     }
                 }
@@ -3736,10 +3735,11 @@ impl MergeFoxApp {
     /// Kick off a fetch for the given remote. Returns immediately; UI
     /// polls `active_job` each frame for progress / completion.
     pub fn start_fetch(&mut self, remote: &str) {
-        let credentials = self.resolve_https_credentials(remote);
+        let transport = self.resolve_git_transport(remote);
         self.start_job(GitJobKind::Fetch {
             remote: remote.to_string(),
-            credentials,
+            credentials: transport.credentials,
+            ssh_key_path: transport.ssh_key_path,
         });
     }
 
@@ -3756,7 +3756,7 @@ impl MergeFoxApp {
         set_upstream: bool,
     ) {
         let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-        let credentials = self.resolve_https_credentials_for_repo_path(repo_path, remote);
+        let transport = self.resolve_git_transport_for_repo_path(repo_path, remote);
         self.start_job_for_repo_path(
             repo_path,
             GitJobKind::Push {
@@ -3764,7 +3764,8 @@ impl MergeFoxApp {
                 refspec,
                 force,
                 set_upstream,
-                credentials,
+                credentials: transport.credentials,
+                ssh_key_path: transport.ssh_key_path,
             },
         );
     }
@@ -3777,13 +3778,14 @@ impl MergeFoxApp {
         set_upstream: bool,
     ) {
         let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-        let credentials = self.resolve_https_credentials(remote);
+        let transport = self.resolve_git_transport(remote);
         self.start_job(GitJobKind::Push {
             remote: remote.to_string(),
             refspec,
             force,
             set_upstream,
-            credentials,
+            credentials: transport.credentials,
+            ssh_key_path: transport.ssh_key_path,
         });
     }
 
@@ -3792,12 +3794,13 @@ impl MergeFoxApp {
     /// point is the graph's tag-chip context menu which already knows
     /// which remote to target.
     pub fn start_push_tag(&mut self, remote: &str, tag: &str) {
-        let credentials = self.resolve_https_credentials(remote);
+        let transport = self.resolve_git_transport(remote);
         self.start_job(GitJobKind::PushTag {
             remote: remote.to_string(),
             tags: vec![tag.to_string()],
             all: false,
-            credentials,
+            credentials: transport.credentials,
+            ssh_key_path: transport.ssh_key_path,
         });
     }
 
@@ -3806,112 +3809,101 @@ impl MergeFoxApp {
     /// hundreds of tags on a repo that's been using mergeFox through
     /// a rebase / tag-creation session.
     pub fn start_push_all_tags(&mut self, remote: &str) {
-        let credentials = self.resolve_https_credentials(remote);
+        let transport = self.resolve_git_transport(remote);
         self.start_job(GitJobKind::PushTag {
             remote: remote.to_string(),
             tags: Vec::new(),
             all: true,
-            credentials,
+            credentials: transport.credentials,
+            ssh_key_path: transport.ssh_key_path,
         });
     }
 
     pub fn start_pull(&mut self, remote: &str, branch: &str, strategy: crate::git::PullStrategy) {
-        let credentials = self.resolve_https_credentials(remote);
+        let transport = self.resolve_git_transport(remote);
         self.start_job(GitJobKind::Pull {
             remote: remote.to_string(),
             branch: branch.to_string(),
             strategy,
-            credentials,
+            credentials: transport.credentials,
+            ssh_key_path: transport.ssh_key_path,
         });
     }
 
-    /// If the given remote points at an HTTPS URL whose host matches a
-    /// connected provider account, look up the stored PAT / OAuth token
-    /// from the secret store and return it packaged as
-    /// [`HttpsCredentials`] for `jobs.rs` to inject via the inline
-    /// credential helper.
+    /// Resolve per-remote transport overrides from MergeFox settings.
     ///
-    /// Returns `None` when:
-    ///   * we can't read the remote URL
-    ///   * it's an SSH URL (ssh-agent / configured keys handle auth)
-    ///   * no account is connected for this host
-    ///   * the secret store doesn't have a token for that account
+    /// For HTTPS remotes this injects the selected provider account's
+    /// PAT/OAuth token as an inline credential helper.
     ///
-    /// In all those cases the job falls through to plain `git`, which
-    /// with `GIT_TERMINAL_PROMPT=0` will either succeed (public repo /
-    /// osxkeychain helper / SSH key) or fail fast with an actionable
-    /// error (rather than hanging on a TTY prompt forever).
-    fn resolve_https_credentials(
-        &self,
-        remote: &str,
-    ) -> Option<crate::git::jobs::HttpsCredentials> {
+    /// For SSH remotes this selects the provider account's bound local
+    /// SSH private key path, when one is configured and still exists.
+    fn resolve_git_transport(&self, remote: &str) -> ResolvedGitTransport {
         // 1. Get the repo path from the currently-active workspace.
         let repo_path = match &self.view {
             View::Workspace(tabs) if !tabs.launcher_active => {
                 tabs.current().repo.path().to_path_buf()
             }
-            _ => return None,
+            _ => return ResolvedGitTransport::default(),
         };
-        self.resolve_https_credentials_for_repo_path(&repo_path, remote)
+        self.resolve_git_transport_for_repo_path(&repo_path, remote)
     }
 
-    fn resolve_https_credentials_for_repo_path(
+    fn resolve_git_transport_for_repo_path(
         &self,
         repo_path: &Path,
         remote: &str,
-    ) -> Option<crate::git::jobs::HttpsCredentials> {
-        // 2. Ask git for the URL. This is a tiny synchronous subprocess,
-        //    but we only do it on the user's explicit push/pull/fetch
-        //    click (not per frame), so the cost is fine.
-        let url = crate::git::cli::run_line(repo_path, ["remote", "get-url", remote]).ok()?;
+    ) -> ResolvedGitTransport {
+        let url = match crate::git::cli::run_line(repo_path, ["remote", "get-url", remote]) {
+            Ok(url) => url,
+            Err(_) => return ResolvedGitTransport::default(),
+        };
+        let account = self.resolve_provider_account_for_remote_url(repo_path, &url);
 
-        // 3. Parse the host. SSH / file / relative URLs → None.
-        let host = remote_host(&url)?;
-        let remote_owner = crate::git_url::parse(&url).map(|parsed| parsed.owner);
+        if remote_uses_ssh(&url) {
+            return ResolvedGitTransport {
+                credentials: None,
+                ssh_key_path: account
+                    .and_then(|account| account.ssh_key_path.clone())
+                    .filter(|path| path.exists()),
+            };
+        }
 
-        // 4. Find the right account. Priority:
-        //    a) Per-repo explicit selection (Settings → Repository → Account)
-        //    b) A single connected account whose provider kind matches the host
-        //    c) For multi-account hosts, one whose username matches the remote owner
-        //
-        //    If multiple host matches remain ambiguous, fall back to the
-        //    user's normal git credential flow instead of injecting a
-        //    potentially wrong token for the wrong account.
-        let repo_settings = self.config.repo_settings_for(&repo_path);
-        let account = if let Some(slug) = &repo_settings.provider_account {
-            // Explicit per-repo override — find by slug.
-            self.config
+        let Some(account) = account else {
+            return ResolvedGitTransport::default();
+        };
+        let token = match self.secret_store.load_pat(&account.id).ok().flatten() {
+            Some(token) => token,
+            None => return ResolvedGitTransport::default(),
+        };
+        use secrecy::ExposeSecret;
+        ResolvedGitTransport {
+            credentials: Some(crate::git::jobs::HttpsCredentials {
+                username: "x-access-token".into(),
+                password: token.expose_secret().to_string(),
+            }),
+            ssh_key_path: None,
+        }
+    }
+
+    fn resolve_provider_account_for_remote_url<'a>(
+        &'a self,
+        repo_path: &Path,
+        url: &str,
+    ) -> Option<&'a crate::providers::ProviderAccount> {
+        let parsed = crate::git_url::parse(url)?;
+        let repo_settings = self.config.repo_settings_for(repo_path);
+        if let Some(slug) = &repo_settings.provider_account {
+            return self
+                .config
                 .provider_accounts
                 .iter()
-                .find(|acc| acc.id.slug() == *slug)
-        } else {
-            select_auto_provider_account(
-                &self.config.provider_accounts,
-                &host,
-                remote_owner.as_deref(),
-            )
-        }?;
-
-        // 5. Pull the token from the secret store (OS keychain or the
-        //    file fallback).
-        let token = self
-            .secret_store
-            .load_pat(&account.id)
-            .ok()
-            .flatten()
-            .map(|s| {
-                use secrecy::ExposeSecret;
-                s.expose_secret().to_string()
-            })?;
-
-        // Username convention: for token-based HTTPS auth, git hosts
-        // accept any non-empty string as the user — `x-access-token`
-        // is the broadly-documented choice for GitHub and also works
-        // on GitLab / Bitbucket / Gitea / Codeberg.
-        Some(crate::git::jobs::HttpsCredentials {
-            username: "x-access-token".into(),
-            password: token,
-        })
+                .find(|acc| acc.id.slug() == *slug);
+        }
+        select_auto_provider_account(
+            &self.config.provider_accounts,
+            &parsed.host,
+            Some(parsed.owner.as_str()),
+        )
     }
 
     fn start_job(&mut self, kind: GitJobKind) {
@@ -3940,6 +3932,98 @@ impl MergeFoxApp {
         ws.active_job = Some(GitJob::spawn(path, kind));
     }
 
+    fn auth_failure_message_for_job(
+        &self,
+        repo_path: &Path,
+        kind: &GitJobKind,
+        diagnostic: &crate::git::cli::GitError,
+        action_label: &str,
+    ) -> Option<String> {
+        if !matches!(diagnostic.kind, crate::git::GitErrorKind::Authentication) {
+            return None;
+        }
+        let remote = match kind {
+            GitJobKind::Fetch { remote, .. }
+            | GitJobKind::Push { remote, .. }
+            | GitJobKind::Pull { remote, .. }
+            | GitJobKind::PushTag { remote, .. } => remote,
+        };
+        let url = crate::git::cli::run_line(repo_path, ["remote", "get-url", remote]).ok()?;
+        let raw_lower = diagnostic.raw.to_ascii_lowercase();
+        if remote_uses_ssh(&url) {
+            let parsed = crate::git_url::parse(&url);
+            if let Some(parsed) = parsed.as_ref() {
+                let repo_settings = self.config.repo_settings_for(repo_path);
+                if repo_settings.provider_account.is_none()
+                    && auto_provider_selection_is_ambiguous(
+                        &self.config.provider_accounts,
+                        &parsed.host,
+                        Some(parsed.owner.as_str()),
+                    )
+                {
+                    return Some(format!(
+                        "{action_label} failed because this SSH remote matches multiple connected accounts. Open Settings -> Repository, choose the Push/Pull account for this repo, then bind an SSH key to that account in Settings -> Integrations."
+                    ));
+                }
+            }
+            if let Some(account) = self.resolve_provider_account_for_remote_url(repo_path, &url) {
+                match account.ssh_key_path.as_ref() {
+                    Some(path) if !path.exists() => {
+                        return Some(format!(
+                            "{action_label} failed because MergeFox is configured to use SSH key `{}` for account `{}`, but that file no longer exists. Open Settings -> Integrations, choose a valid key for that account, then retry.",
+                            path.display(),
+                            account.id.slug()
+                        ));
+                    }
+                    None => {
+                        return Some(format!(
+                            "{action_label} failed because this remote uses SSH, but account `{}` does not have a bound SSH key in MergeFox yet. Open Settings -> Integrations, bind a key to that account, then retry.",
+                            account.id.slug()
+                        ));
+                    }
+                    Some(path) if raw_lower.contains("permission denied (publickey)") => {
+                        return Some(format!(
+                            "{action_label} failed because this remote uses SSH and the server rejected MergeFox's bound key `{}` for account `{}`. Check that the public key is registered on the correct Git provider account, then retry.",
+                            path.display(),
+                            account.id.slug()
+                        ));
+                    }
+                    Some(_) => {
+                        return Some(format!(
+                            "{action_label} failed while authenticating over SSH with MergeFox's bound key for account `{}`. Verify that the key is registered on the correct Git provider account, or switch the remote URL to HTTPS.",
+                            account.id.slug()
+                        ));
+                    }
+                }
+            }
+            if raw_lower.contains("permission denied (publickey)") {
+                return Some(format!(
+                    "{action_label} failed because this remote uses SSH and the server rejected the current SSH key. Connected PAT/OAuth accounts in MergeFox are only used for HTTPS remotes. Open Settings -> Integrations to generate/copy a key and register it with your Git provider, load the right key in ssh-agent, or switch the remote URL to HTTPS."
+                ));
+            }
+            return Some(format!(
+                "{action_label} failed while authenticating over SSH. Connected PAT/OAuth accounts in MergeFox are only used for HTTPS remotes. Check which SSH key this machine is offering for `{remote}`, register that key with your Git provider, or switch the remote URL to HTTPS."
+            ));
+        }
+        let host = remote_host(&url)?;
+        let remote_owner = crate::git_url::parse(&url).map(|parsed| parsed.owner);
+        let repo_settings = self.config.repo_settings_for(repo_path);
+        if repo_settings.provider_account.is_some() {
+            return None;
+        }
+        if auto_provider_selection_is_ambiguous(
+            &self.config.provider_accounts,
+            &host,
+            remote_owner.as_deref(),
+        ) {
+            return Some(format!(
+                "{} Multiple connected accounts match this HTTPS remote, so MergeFox could not choose one automatically. Open Settings -> Repository and set a Push/Pull account for this repo, then retry.",
+                diagnostic.user_message(action_label)
+            ));
+        }
+        None
+    }
+
     pub fn cancel_active_job(&mut self) {
         let View::Workspace(tabs) = &mut self.view else {
             return;
@@ -3954,7 +4038,7 @@ impl MergeFoxApp {
 
     /// Poll the active background job; when done, integrate the result.
     fn poll_active_job(&mut self) {
-        let (finished, scope) = {
+        let (finished, scope, repo_path, job_kind) = {
             let View::Workspace(tabs) = &mut self.view else {
                 return;
             };
@@ -3964,7 +4048,12 @@ impl MergeFoxApp {
             };
             match job.poll() {
                 None => return, // still running
-                Some(r) => (r, ws.graph_scope),
+                Some(r) => (
+                    r,
+                    ws.graph_scope,
+                    ws.repo.path().to_path_buf(),
+                    job.kind.clone(),
+                ),
             }
         };
 
@@ -3989,7 +4078,15 @@ impl MergeFoxApp {
                         if matches!(diagnostic.kind, crate::git::GitErrorKind::MissingBinary) {
                             self.refresh_git_capability();
                         }
-                        self.last_error = Some(diagnostic.user_message(&label));
+                        let message = self
+                            .auth_failure_message_for_job(
+                                &repo_path,
+                                &job_kind,
+                                &diagnostic,
+                                &label,
+                            )
+                            .unwrap_or_else(|| diagnostic.user_message(&label));
+                        self.last_error = Some(message);
                     }
                 }
             }
@@ -4662,7 +4759,17 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
     // matches the one we use for `Esc` inside the Settings modal.
     let shortcuts_hotkey_allowed = !ctx.wants_keyboard_input();
 
-    let (undo, redo, panic_key, next_tab, prev_tab, close_tab, open_reflog, open_shortcuts, open_palette) = ctx.input_mut(|i| {
+    let (
+        undo,
+        redo,
+        panic_key,
+        next_tab,
+        prev_tab,
+        close_tab,
+        open_reflog,
+        open_shortcuts,
+        open_palette,
+    ) = ctx.input_mut(|i| {
         let z = i.key_pressed(egui::Key::Z);
         let esc = i.key_pressed(egui::Key::Escape);
         let tab_k = i.key_pressed(egui::Key::Tab);
@@ -4698,11 +4805,8 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
         // Must have no other modifiers so it doesn't clash with future
         // Cmd+? bindings. Suppressed while a text field has focus —
         // see `shortcuts_hotkey_allowed` above.
-        let open_shortcuts = questionmark
-            && !m.ctrl
-            && !m.alt
-            && !m.command
-            && shortcuts_hotkey_allowed;
+        let open_shortcuts =
+            questionmark && !m.ctrl && !m.alt && !m.command && shortcuts_hotkey_allowed;
         // ⌘K / Ctrl+K — command palette. Always available, even while
         // a text field is focused (that's the whole point of the
         // palette; users hit it mid-typing to jump around).
@@ -4874,6 +4978,11 @@ fn remote_host(url: &str) -> Option<String> {
     } else {
         Some(host.to_ascii_lowercase())
     }
+}
+
+fn remote_uses_ssh(url: &str) -> bool {
+    let url = url.trim();
+    url.starts_with("git@") || url.starts_with("ssh://")
 }
 
 /// Does a connected-account's provider kind match this remote host?
@@ -5065,11 +5174,13 @@ fn select_default_remote_name(
     remotes: &[String],
 ) -> Option<String> {
     preferred_remote
-        .filter(|preferred| remotes.iter().any(|name| name == preferred))
+        .filter(|preferred| remotes.is_empty() || remotes.iter().any(|name| name == preferred))
         .map(str::to_string)
         .or_else(|| {
             upstream_remote
-                .filter(|upstream| remotes.iter().any(|name| name == upstream))
+                .filter(|upstream| {
+                    remotes.is_empty() || remotes.iter().any(|name| name == upstream)
+                })
                 .map(str::to_string)
         })
         .or_else(|| remotes.first().cloned())
@@ -5096,11 +5207,35 @@ fn select_auto_provider_account<'a>(
         .find(|acc| acc.id.username.eq_ignore_ascii_case(remote_owner))
 }
 
+fn auto_provider_selection_is_ambiguous(
+    accounts: &[crate::providers::ProviderAccount],
+    host: &str,
+    remote_owner: Option<&str>,
+) -> bool {
+    let mut host_matches = accounts
+        .iter()
+        .filter(|acc| provider_matches_host(&acc.id.kind, host));
+    let Some(_first) = host_matches.next() else {
+        return false;
+    };
+    if host_matches.next().is_none() {
+        return false;
+    }
+
+    let Some(remote_owner) = remote_owner else {
+        return true;
+    };
+    !accounts
+        .iter()
+        .filter(|acc| provider_matches_host(&acc.id.kind, host))
+        .any(|acc| acc.id.username.eq_ignore_ascii_case(remote_owner))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        provider_matches_host, remote_host, select_auto_provider_account,
-        select_default_remote_name, upstream_remote_name,
+        auto_provider_selection_is_ambiguous, provider_matches_host, remote_host,
+        select_auto_provider_account, select_default_remote_name, upstream_remote_name,
     };
     use crate::providers::{AccountId, AuthMethod, ProviderAccount, ProviderKind};
 
@@ -5114,6 +5249,7 @@ mod tests {
             avatar_url: None,
             method: AuthMethod::OAuth,
             created_unix: 0,
+            ssh_key_path: None,
         }
     }
 
@@ -5155,6 +5291,38 @@ mod tests {
     }
 
     #[test]
+    fn ambiguity_helper_flags_org_owned_repo_with_multiple_accounts() {
+        let accounts = vec![github_account("alice"), github_account("bob")];
+        assert!(auto_provider_selection_is_ambiguous(
+            &accounts,
+            "github.com",
+            Some("tradinglab")
+        ));
+        assert!(auto_provider_selection_is_ambiguous(
+            &accounts,
+            "github.com",
+            None
+        ));
+    }
+
+    #[test]
+    fn ambiguity_helper_allows_single_or_owner_matched_account() {
+        let one = vec![github_account("alice")];
+        assert!(!auto_provider_selection_is_ambiguous(
+            &one,
+            "github.com",
+            Some("tradinglab")
+        ));
+
+        let two = vec![github_account("alice"), github_account("bob")];
+        assert!(!auto_provider_selection_is_ambiguous(
+            &two,
+            "github.com",
+            Some("bob")
+        ));
+    }
+
+    #[test]
     fn upstream_remote_name_extracts_remote() {
         assert_eq!(upstream_remote_name("tradeosx/main"), Some("tradeosx"));
         assert_eq!(upstream_remote_name("origin/feature/foo"), Some("origin"));
@@ -5179,6 +5347,13 @@ mod tests {
     fn default_remote_ignores_missing_preference_and_uses_first_available() {
         let remotes = vec!["tradeosx".to_string()];
         let selected = select_default_remote_name(Some("origin"), Some("origin"), &remotes);
+        assert_eq!(selected.as_deref(), Some("tradeosx"));
+    }
+
+    #[test]
+    fn default_remote_uses_upstream_when_remote_cache_is_empty() {
+        let remotes = Vec::new();
+        let selected = select_default_remote_name(None, Some("tradeosx"), &remotes);
         assert_eq!(selected.as_deref(), Some("tradeosx"));
     }
 }

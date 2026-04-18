@@ -100,11 +100,26 @@ pub struct NewRemoteDraft {
 
 #[derive(Debug, Clone)]
 pub enum ConfirmKind {
-    DeleteBranch { name: String, is_remote: bool },
-    HardReset { branch: String, target: Oid },
-    DropCommit { oid: Oid },
-    DropStash { index: usize, message: String },
-    ForcePush { remote: String, branch: String },
+    DeleteBranch {
+        name: String,
+        is_remote: bool,
+        force: bool,
+    },
+    HardReset {
+        branch: String,
+        target: Oid,
+    },
+    DropCommit {
+        oid: Oid,
+    },
+    DropStash {
+        index: usize,
+        message: String,
+    },
+    ForcePush {
+        remote: String,
+        branch: String,
+    },
 }
 
 impl ConfirmKind {
@@ -124,10 +139,21 @@ impl ConfirmKind {
         // the body itself purely descriptive so it doesn't duplicate
         // what the preflight lines already show.
         match self {
-            Self::DeleteBranch { name, is_remote } => format!(
-                "Delete {} branch `{name}`?\n\nRecoverable via the reflog (⌘⇧R) for a few weeks.",
-                if *is_remote { "remote-tracking" } else { "local" }
-            ),
+            Self::DeleteBranch {
+                name,
+                is_remote,
+                force: _,
+            } => {
+                if *is_remote {
+                    format!(
+                        "Delete remote-tracking branch `{name}`?\n\nRecoverable via the reflog (⌘⇧R) for a few weeks."
+                    )
+                } else {
+                    format!(
+                        "Delete local branch `{name}`?\n\nDelete safely refuses branches that are not fully merged. Force delete removes the ref anyway.\n\nRecoverable via the reflog (⌘⇧R) for a few weeks."
+                    )
+                }
+            }
             Self::HardReset { branch, target } => format!(
                 "Hard-reset `{branch}` to {}?\n\nDirty files are auto-stashed first. Use ⌘⇧R to restore from the reflog if needed.",
                 short_sha(target)
@@ -474,20 +500,43 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         if ui.button("Cancel").clicked() {
                             close = true;
                         }
-                        let confirm_label = match kind {
-                            ConfirmKind::DeleteBranch { .. } => "Delete",
-                            ConfirmKind::HardReset { .. } => "Hard reset",
-                            ConfirmKind::DropCommit { .. } => "Drop",
-                            ConfirmKind::DropStash { .. } => "Drop stash",
-                            ConfirmKind::ForcePush { .. } => "Force push",
-                        };
-                        if ui
-                            .button(
-                                egui::RichText::new(confirm_label).color(egui::Color32::LIGHT_RED),
-                            )
-                            .clicked()
-                        {
-                            submitted = true;
+                        match kind {
+                            ConfirmKind::DeleteBranch {
+                                is_remote, force, ..
+                            } if !*is_remote => {
+                                if ui.button("Delete safely").clicked() {
+                                    *force = false;
+                                    submitted = true;
+                                }
+                                if ui
+                                    .button(
+                                        egui::RichText::new("Force delete")
+                                            .color(egui::Color32::LIGHT_RED),
+                                    )
+                                    .clicked()
+                                {
+                                    *force = true;
+                                    submitted = true;
+                                }
+                            }
+                            _ => {
+                                let confirm_label = match kind {
+                                    ConfirmKind::DeleteBranch { .. } => "Delete",
+                                    ConfirmKind::HardReset { .. } => "Hard reset",
+                                    ConfirmKind::DropCommit { .. } => "Drop",
+                                    ConfirmKind::DropStash { .. } => "Drop stash",
+                                    ConfirmKind::ForcePush { .. } => "Force push",
+                                };
+                                if ui
+                                    .button(
+                                        egui::RichText::new(confirm_label)
+                                            .color(egui::Color32::LIGHT_RED),
+                                    )
+                                    .clicked()
+                                {
+                                    submitted = true;
+                                }
+                            }
                         }
                     });
                 }
@@ -597,6 +646,8 @@ pub fn set_upstream_prompt(
     current_upstream: Option<String>,
     remote_branches: Vec<String>,
 ) -> PendingPrompt {
+    let remotes =
+        merge_upstream_remote_names(remotes, current_upstream.as_deref(), &remote_branches);
     let current_remote = current_upstream.as_deref().and_then(|upstream| {
         upstream
             .split_once('/')
@@ -646,6 +697,31 @@ fn remote_branch_candidates(selected_remote: &str, remote_branches: &[String]) -
         .collect()
 }
 
+fn merge_upstream_remote_names(
+    mut remotes: Vec<String>,
+    current_upstream: Option<&str>,
+    remote_branches: &[String],
+) -> Vec<String> {
+    let mut push_unique = |name: &str| {
+        if !name.is_empty() && !remotes.iter().any(|existing| existing == name) {
+            remotes.push(name.to_string());
+        }
+    };
+
+    if let Some((remote, _branch)) = current_upstream.and_then(|upstream| upstream.split_once('/'))
+    {
+        push_unique(remote);
+    }
+
+    for remote_branch in remote_branches {
+        if let Some((remote, _branch)) = remote_branch.split_once('/') {
+            push_unique(remote);
+        }
+    }
+
+    remotes
+}
+
 pub fn amend_message_prompt(
     initial: String,
     current_author: Option<crate::git::ops::CommitAuthor>,
@@ -672,7 +748,11 @@ pub fn delete_branch_confirm(
     preflight: Option<crate::preflight::PreflightInfo>,
 ) -> PendingPrompt {
     PendingPrompt::Confirm {
-        kind: ConfirmKind::DeleteBranch { name, is_remote },
+        kind: ConfirmKind::DeleteBranch {
+            name,
+            is_remote,
+            force: false,
+        },
         confirmed: false,
         preflight,
     }
@@ -734,3 +814,55 @@ pub fn force_push_confirm(
 // reset-related prompts without the dispatcher needing an extra import.
 #[allow(dead_code)]
 const _RESET_MODE_MARKER: Option<ResetMode> = None;
+
+#[cfg(test)]
+mod tests {
+    use super::{set_upstream_prompt, PendingPrompt};
+
+    #[test]
+    fn set_upstream_prompt_seeds_remote_from_current_upstream() {
+        let prompt = set_upstream_prompt(
+            "main".to_string(),
+            Vec::new(),
+            Some("tradeosx/main".to_string()),
+            Vec::new(),
+        );
+
+        match prompt {
+            PendingPrompt::SetUpstream {
+                remotes,
+                selected_remote,
+                remote_branch,
+                new_remote,
+                ..
+            } => {
+                assert_eq!(remotes, vec!["tradeosx"]);
+                assert_eq!(selected_remote.as_deref(), Some("tradeosx"));
+                assert_eq!(remote_branch, "main");
+                assert!(new_remote.is_none());
+            }
+            other => panic!("expected SetUpstream prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_upstream_prompt_seeds_remote_names_from_remote_branches() {
+        let prompt = set_upstream_prompt(
+            "feature".to_string(),
+            Vec::new(),
+            None,
+            vec![
+                "tradeosx/main".to_string(),
+                "backup/feature".to_string(),
+                "tradeosx/release".to_string(),
+            ],
+        );
+
+        match prompt {
+            PendingPrompt::SetUpstream { remotes, .. } => {
+                assert_eq!(remotes, vec!["tradeosx", "backup"]);
+            }
+            other => panic!("expected SetUpstream prompt, got {other:?}"),
+        }
+    }
+}

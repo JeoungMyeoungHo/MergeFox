@@ -80,6 +80,7 @@ pub enum RefKind {
 pub struct GraphRow {
     pub oid: gix::ObjectId,
     pub summary: Box<str>,
+    pub body_preview: Box<str>,
     pub author: Box<str>,
     /// Author email, used only for deterministic avatar-colour hashing.
     pub author_email: Box<str>,
@@ -182,7 +183,7 @@ impl CommitGraph {
             // See `ui::graph` for the compression logic at paint time.
 
             let refs = refs_map.get(&oid).cloned().unwrap_or_default();
-            let (summary, _body, author_name, author_email, timestamp) = decode_for_graph(&commit)
+            let (summary, body, author_name, author_email, timestamp) = decode_for_graph(&commit)
                 .unwrap_or_else(|| {
                     (
                         String::new(),
@@ -195,6 +196,7 @@ impl CommitGraph {
             rows.push(GraphRow {
                 oid,
                 summary: summary.into(),
+                body_preview: first_body_preview_line(&body).into(),
                 author: author_name.into(),
                 author_email: author_email.into(),
                 timestamp,
@@ -362,4 +364,12 @@ fn decode_for_graph(commit: &gix::Commit<'_>) -> Option<(String, String, String,
     let author_email = author.email.to_string();
     let timestamp = author.time().map(|t| t.seconds).unwrap_or(0);
     Some((summary, body, author_name, author_email, timestamp))
+}
+
+fn first_body_preview_line(body: &str) -> String {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
 }

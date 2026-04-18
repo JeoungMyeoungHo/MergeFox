@@ -35,8 +35,8 @@ impl BlameTask {
         let (tx, rx) = mpsc::channel();
         let file_clone = file.clone();
         thread::spawn(move || {
-            let result = crate::git::blame_file(&repo_path, &file_clone)
-                .map_err(|e| format!("{e:#}"));
+            let result =
+                crate::git::blame_file(&repo_path, &file_clone).map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
         Self {
@@ -190,10 +190,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
 fn render_line(ui: &mut egui::Ui, line: &BlameLine, author_color: Color32) {
     ui.horizontal(|ui| {
-        ui.monospace(
-            RichText::new(short_sha(&line.commit.sha))
-                .color(Color32::from_gray(140)),
-        );
+        ui.monospace(RichText::new(short_sha(&line.commit.sha)).color(Color32::from_gray(140)));
         ui.add_sized(
             [110.0, 14.0],
             egui::Label::new(
@@ -211,9 +208,7 @@ fn render_line(ui: &mut egui::Ui, line: &BlameLine, author_color: Color32) {
                     .small(),
             ),
         );
-        ui.monospace(
-            RichText::new(format!("{:>5}", line.line_no)).color(Color32::from_gray(120)),
-        );
+        ui.monospace(RichText::new(format!("{:>5}", line.line_no)).color(Color32::from_gray(120)));
         ui.monospace(RichText::new(&line.content));
     })
     .response
@@ -255,7 +250,11 @@ fn format_ts(unix: i64) -> String {
 /// 1970…∞ without depending on chrono.
 fn civil_from_days(mut z: i64) -> (i32, u32, u32) {
     z += 719468;
-    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let era = if z >= 0 {
+        z / 146097
+    } else {
+        (z - 146096) / 146097
+    };
     let doe = (z - era * 146097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe as i64 + era * 400;

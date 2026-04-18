@@ -193,14 +193,14 @@ fn render_working_tree_panel(ui: &mut egui::Ui, ws: &mut WorkspaceState) {
 
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
-            ui.heading("Working Tree");
+            ui.heading("Changes");
             ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                 let close_button =
                     egui::Button::new(RichText::new("x").strong().size(16.0).monospace())
                         .frame(true);
                 if ui
                     .add_sized([30.0, 30.0], close_button)
-                    .on_hover_text("Close working tree panel")
+                    .on_hover_text("Close changes panel")
                     .clicked()
                 {
                     ws.selected_working_tree = false;
@@ -276,7 +276,7 @@ fn render_working_tree_summary(ui: &mut egui::Ui, entries: &[StatusEntry]) {
     }
 
     if parts.is_empty() {
-        ui.weak("Working tree is clean.");
+        ui.weak("No uncommitted changes.");
     } else {
         ui.weak(parts.join(" · "));
     }
@@ -583,7 +583,7 @@ fn render_working_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceState, path: 
     let path_str = path.display().to_string();
 
     ui.horizontal(|ui| {
-        if ui.button("← Working Tree").clicked() {
+        if ui.button("← Changes").clicked() {
             ws.selected_working_file = None;
             ws.set_image_cache(None);
             ws.working_file_diff = None;
@@ -605,7 +605,7 @@ fn render_working_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceState, path: 
             }
         });
     });
-    ui.small(format!("Working Tree · {}", working_tree_stats_str(&entry)));
+    ui.small(format!("Changes · {}", working_tree_stats_str(&entry)));
     ui.separator();
 
     if ws.working_file_diff.is_none() {

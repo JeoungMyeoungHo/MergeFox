@@ -6,6 +6,7 @@
 //! `config.json` MUST NOT contain credentials — only identity/metadata.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -178,6 +179,10 @@ pub struct ProviderAccount {
     pub avatar_url: Option<String>,
     pub method: AuthMethod,
     pub created_unix: i64,
+    /// Optional local private-key path MergeFox should use when git
+    /// network operations for this account go over SSH.
+    #[serde(default)]
+    pub ssh_key_path: Option<PathBuf>,
 }
 
 /// Minimal current-user profile fetched after a successful OAuth/PAT auth.

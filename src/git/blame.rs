@@ -63,10 +63,7 @@ pub struct BlameResult {
 /// this line").
 pub fn blame_file(repo_path: &Path, file: &Path) -> Result<BlameResult> {
     let file_str = file.to_string_lossy().into_owned();
-    let out = super::cli::run(
-        repo_path,
-        ["blame", "--porcelain", "-w", "--", &file_str],
-    )?;
+    let out = super::cli::run(repo_path, ["blame", "--porcelain", "-w", "--", &file_str])?;
     let text = out.stdout_str();
     Ok(BlameResult {
         lines: parse_porcelain(&text),
@@ -124,10 +121,7 @@ pub fn parse_porcelain(text: &str) -> Vec<BlameLine> {
             let mut it = line.split_whitespace();
             let sha = it.next().unwrap_or("").to_string();
             let _orig = it.next();
-            let final_line = it
-                .next()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0);
+            let final_line = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
             current_sha = Some(sha);
             current_final_line = final_line;
             pending_meta = BlameCommit::default();
@@ -140,8 +134,10 @@ pub fn parse_porcelain(text: &str) -> Vec<BlameLine> {
         match key {
             "author" => pending_meta.author = value.to_string(),
             "author-mail" => {
-                pending_meta.author_email =
-                    value.trim_start_matches('<').trim_end_matches('>').to_string();
+                pending_meta.author_email = value
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string();
             }
             "author-time" => {
                 pending_meta.author_time = value.parse::<i64>().unwrap_or(0);

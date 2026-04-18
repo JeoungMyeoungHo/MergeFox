@@ -80,7 +80,10 @@ pub fn probe(url: &str, accounts: &[ProviderAccount]) -> Option<AuthedClone> {
 }
 
 fn order_candidates<'a>(host: &str, accounts: &'a [ProviderAccount]) -> Vec<&'a ProviderAccount> {
-    let winner = winner_cache().lock().ok().and_then(|m| m.get(host).cloned());
+    let winner = winner_cache()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(host).cloned());
     let mut ordered: Vec<&ProviderAccount> = accounts
         .iter()
         .filter(|a| host_matches(&a.id.kind, host))

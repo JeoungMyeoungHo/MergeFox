@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use egui::{RichText, TextEdit};
+use egui::{ComboBox, RichText, TextEdit};
 use secrecy::SecretString;
 
 use super::{persist_config, Feedback};
@@ -264,6 +264,25 @@ impl ProviderTarget {
             Self::Generic => "generic",
         }
     }
+
+    fn ssh_settings_url(self, draft: &IntegrationsDraft) -> Option<String> {
+        match self {
+            Self::GitHub => Some("https://github.com/settings/keys".to_string()),
+            Self::GitLab => Some("https://gitlab.com/-/user_settings/ssh_keys".to_string()),
+            Self::Codeberg => Some("https://codeberg.org/user/settings/keys".to_string()),
+            Self::Bitbucket => Some("https://bitbucket.org/account/settings/ssh-keys/".to_string()),
+            Self::AzureDevOps => None,
+            Self::Gitea => {
+                let instance = draft.gitea_instance.trim().trim_end_matches('/');
+                if instance.is_empty() {
+                    None
+                } else {
+                    Some(format!("{instance}/user/settings/keys"))
+                }
+            }
+            Self::Generic => None,
+        }
+    }
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
@@ -410,6 +429,48 @@ fn render_provider_body(
                     labels.provider_label,
                     provider_host_label(&account.id.kind)
                 ));
+                ui.add_space(4.0);
+                let before_ssh_key = account.ssh_key_path.clone();
+                let mut selected_ssh_key = before_ssh_key.clone();
+                let selected_ssh_label = selected_ssh_key
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| labels.auto_ssh_key.to_string());
+                ui.horizontal(|ui| {
+                    ui.small(format!("{}:", labels.bound_ssh_key));
+                    ComboBox::from_id_salt(("settings_account_ssh_key", account.id.slug()))
+                        .selected_text(selected_ssh_label)
+                        .width(320.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut selected_ssh_key, None, labels.auto_ssh_key);
+                            ui.separator();
+                            for key_path in ssh_keys {
+                                ui.selectable_value(
+                                    &mut selected_ssh_key,
+                                    Some(key_path.clone()),
+                                    key_path.display().to_string(),
+                                );
+                            }
+                        });
+                    if let Some(path) = selected_ssh_key.as_ref() {
+                        if public_key_path(path).exists()
+                            && ui.small_button(labels.copy_public_key).clicked()
+                        {
+                            *intent = Some(Intent::CopyPublicKey(path.clone()));
+                        }
+                    }
+                });
+                if selected_ssh_key != before_ssh_key {
+                    *intent = Some(Intent::BindSshKey {
+                        account_id: account.id.clone(),
+                        ssh_key_path: selected_ssh_key,
+                    });
+                }
+                if let Some(path) = account.ssh_key_path.as_ref() {
+                    if !path.exists() {
+                        ui.colored_label(egui::Color32::YELLOW, labels.bound_ssh_key_missing);
+                    }
+                }
             });
             ui.add_space(6.0);
         }
@@ -580,10 +641,27 @@ fn render_provider_body(
             });
         }
     }
+    let ssh_settings_url = draft.selected.ssh_settings_url(draft);
     ui.add_space(6.0);
-    if ui.button(labels.generate_ssh_key).clicked() {
-        *intent = Some(Intent::GenerateSshKey(draft.selected));
-    }
+    ui.horizontal(|ui| {
+        if ui.button(labels.generate_ssh_key).clicked() {
+            *intent = Some(Intent::GenerateSshKey {
+                target: draft.selected,
+                open_settings_url: None,
+            });
+        }
+        if let Some(url) = ssh_settings_url.as_ref() {
+            if ui.button(labels.generate_ssh_key_and_open).clicked() {
+                *intent = Some(Intent::GenerateSshKey {
+                    target: draft.selected,
+                    open_settings_url: Some(url.clone()),
+                });
+            }
+            if ui.button(labels.open_ssh_settings).clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            }
+        }
+    });
     ui.weak(labels.ssh_hint);
 }
 
@@ -592,7 +670,14 @@ enum Intent {
     ConnectPat,
     CancelOauth,
     Disconnect(AccountId),
-    GenerateSshKey(ProviderTarget),
+    BindSshKey {
+        account_id: AccountId,
+        ssh_key_path: Option<PathBuf>,
+    },
+    GenerateSshKey {
+        target: ProviderTarget,
+        open_settings_url: Option<String>,
+    },
     CopyPublicKey(PathBuf),
 }
 
@@ -602,7 +687,14 @@ fn handle_intent(app: &mut MergeFoxApp, ctx: &egui::Context, intent: Intent, lab
         Intent::ConnectPat => connect_pat(app, labels),
         Intent::CancelOauth => cancel_oauth(app),
         Intent::Disconnect(id) => disconnect(app, &id, labels),
-        Intent::GenerateSshKey(target) => generate_ssh_key(app, target, labels),
+        Intent::BindSshKey {
+            account_id,
+            ssh_key_path,
+        } => bind_ssh_key(app, &account_id, ssh_key_path, labels),
+        Intent::GenerateSshKey {
+            target,
+            open_settings_url,
+        } => generate_ssh_key(app, ctx, target, open_settings_url.as_deref(), labels),
         Intent::CopyPublicKey(path) => copy_public_key(app, ctx, &path, labels),
     }
 }
@@ -712,6 +804,7 @@ fn start_oauth_poll(app: &mut MergeFoxApp, started: OAuthStartOutcome) {
                     avatar_url: profile.avatar_url,
                     method: AuthMethod::OAuth,
                     created_unix: unix_now() as i64,
+                    ssh_key_path: None,
                 },
                 access_token: token.access_token,
             })
@@ -805,6 +898,7 @@ fn connect_pat(app: &mut MergeFoxApp, labels: &Labels) {
         avatar_url: None,
         method: AuthMethod::Pat,
         created_unix: unix_now() as i64,
+        ssh_key_path: None,
     });
     persist_config(app, labels.connected_saved);
     if let Some(modal) = app.settings_modal.as_mut() {
@@ -823,7 +917,37 @@ fn disconnect(app: &mut MergeFoxApp, id: &AccountId, labels: &Labels) {
     persist_config(app, labels.disconnected_saved);
 }
 
-fn generate_ssh_key(app: &mut MergeFoxApp, target: ProviderTarget, labels: &Labels) {
+fn bind_ssh_key(
+    app: &mut MergeFoxApp,
+    id: &AccountId,
+    ssh_key_path: Option<PathBuf>,
+    labels: &Labels,
+) {
+    let Some(account) = app
+        .config
+        .provider_accounts
+        .iter_mut()
+        .find(|account| &account.id == id)
+    else {
+        if let Some(modal) = app.settings_modal.as_mut() {
+            modal.feedback = Some(Feedback::err(format!(
+                "provider account not found: {}",
+                id.slug()
+            )));
+        }
+        return;
+    };
+    account.ssh_key_path = ssh_key_path;
+    persist_config(app, labels.saved_ssh_binding);
+}
+
+fn generate_ssh_key(
+    app: &mut MergeFoxApp,
+    ctx: &egui::Context,
+    target: ProviderTarget,
+    open_settings_url: Option<&str>,
+    labels: &Labels,
+) {
     let path = allocate_ssh_key_path(target);
     let comment = format!("mergefox-{}-{}", target.ssh_slug(), unix_now());
     let generated = match providers::ssh::generate_ed25519(&comment) {
@@ -838,14 +962,26 @@ fn generate_ssh_key(app: &mut MergeFoxApp, target: ProviderTarget, labels: &Labe
 
     match providers::ssh::save_key_pair(&generated, &path) {
         Ok(()) => {
+            if open_settings_url.is_some() {
+                ctx.copy_text(generated.public_openssh.clone());
+            }
             if let Some(modal) = app.settings_modal.as_mut() {
-                modal.feedback = Some(Feedback::ok(format!(
-                    "{}: {}",
-                    labels.generated_ssh_key,
-                    path.display()
-                )));
+                let message = if open_settings_url.is_some() {
+                    format!(
+                        "{}: {} ({})",
+                        labels.generated_ssh_key,
+                        path.display(),
+                        labels.copied_public_key
+                    )
+                } else {
+                    format!("{}: {}", labels.generated_ssh_key, path.display())
+                };
+                modal.feedback = Some(Feedback::ok(message));
             }
             app.hud = Some(crate::app::Hud::new(labels.generated_ssh_key, 1600));
+            if let Some(url) = open_settings_url {
+                ctx.open_url(egui::OpenUrl::new_tab(url));
+            }
         }
         Err(err) => {
             if let Some(modal) = app.settings_modal.as_mut() {
@@ -992,13 +1128,19 @@ struct Labels {
     ssh_keys: &'static str,
     no_ssh_keys: &'static str,
     copy_public_key: &'static str,
+    bound_ssh_key: &'static str,
+    bound_ssh_key_missing: &'static str,
+    auto_ssh_key: &'static str,
     generate_ssh_key: &'static str,
+    generate_ssh_key_and_open: &'static str,
+    open_ssh_settings: &'static str,
     ssh_hint: &'static str,
     ssh_detected_note: &'static str,
     connected_saved: &'static str,
     disconnected_saved: &'static str,
     generated_ssh_key: &'static str,
     copied_public_key: &'static str,
+    saved_ssh_binding: &'static str,
     err_username: &'static str,
     err_pat: &'static str,
 }
@@ -1056,12 +1198,18 @@ fn labels(lang: UiLanguage) -> Labels {
             ssh_detected_note: "아래 목록은 이 컴퓨터의 ~/.ssh 디렉터리에서 실제로 발견한 키 경로입니다.",
             no_ssh_keys: "발견된 로컬 SSH 키가 없습니다.",
             copy_public_key: "공개키 복사",
+            bound_ssh_key: "바인딩된 SSH 키",
+            bound_ssh_key_missing: "바인딩된 SSH 키 파일을 찾을 수 없습니다. 다른 키를 고르거나 경로를 확인하세요.",
+            auto_ssh_key: "(바인딩 안 함)",
             generate_ssh_key: "mergeFox SSH 키 생성",
-            ssh_hint: "생성된 키는 ~/.ssh 아래에 저장됩니다. 공개키를 복사해서 Git provider에 등록하면 SSH push/pull에 사용할 수 있습니다.",
+            generate_ssh_key_and_open: "생성 후 브라우저 열기",
+            open_ssh_settings: "SSH 키 등록 페이지 열기",
+            ssh_hint: "SSH remote(`git@...`)는 연결된 PAT/OAuth 계정을 사용하지 않습니다. 생성된 키는 ~/.ssh 아래에 저장되며, 공개키를 Git provider의 SSH keys 페이지에 등록해야 SSH push/pull에 사용할 수 있습니다.",
             connected_saved: "계정을 저장했습니다",
             disconnected_saved: "계정을 제거했습니다",
             generated_ssh_key: "SSH 키를 생성했습니다",
             copied_public_key: "공개키를 복사했습니다",
+            saved_ssh_binding: "SSH 키 바인딩을 저장했습니다",
             err_username: "사용자명을 입력하세요.",
             err_pat: "PAT를 입력하세요.",
         },
@@ -1116,12 +1264,18 @@ fn labels(lang: UiLanguage) -> Labels {
             ssh_detected_note: "The paths below are detected from this machine's ~/.ssh directory.",
             no_ssh_keys: "No local SSH keys were found.",
             copy_public_key: "Copy public key",
+            bound_ssh_key: "Bound SSH key",
+            bound_ssh_key_missing: "The bound SSH key file is missing. Pick another key or fix the path.",
+            auto_ssh_key: "(no bound key)",
             generate_ssh_key: "Generate mergeFox SSH key",
-            ssh_hint: "Generated keys are saved under ~/.ssh. Copy the public key and add it to your Git provider for SSH pull/push.",
+            generate_ssh_key_and_open: "Generate + Open browser",
+            open_ssh_settings: "Open SSH key settings",
+            ssh_hint: "SSH remotes (`git@...`) do not use the connected PAT/OAuth accounts above. Generated keys are saved under ~/.ssh, and the public key must be added to your Git provider's SSH keys page before SSH pull/push will work.",
             connected_saved: "Saved provider account",
             disconnected_saved: "Removed provider account",
             generated_ssh_key: "Generated SSH key",
             copied_public_key: "Copied public key",
+            saved_ssh_binding: "Saved SSH key binding",
             err_username: "Enter a username first.",
             err_pat: "Enter a PAT first.",
         },

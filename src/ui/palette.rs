@@ -129,11 +129,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         );
                         let painter = ui.painter();
                         if selected {
-                            painter.rect_filled(
-                                row.rect,
-                                4.0,
-                                ui.visuals().selection.bg_fill,
-                            );
+                            painter.rect_filled(row.rect, 4.0, ui.visuals().selection.bg_fill);
                         } else if row.hovered() {
                             painter.rect_filled(
                                 row.rect,
@@ -458,7 +454,10 @@ fn execute(app: &mut MergeFoxApp, action: PaletteAction) {
             app.export_journal_to_file();
         }
         PaletteAction::PushTag(tag) => {
-            crate::ui::main_panel::dispatch_action(app, crate::actions::CommitAction::PushTag { tag });
+            crate::ui::main_panel::dispatch_action(
+                app,
+                crate::actions::CommitAction::PushTag { tag },
+            );
         }
         PaletteAction::PushAllTags => {
             crate::ui::main_panel::dispatch_action(app, crate::actions::CommitAction::PushAllTags);
@@ -508,6 +507,9 @@ mod tests {
         // bonuses.
         let prefix = fuzzy_score("Settings", "set").unwrap();
         let scattered = fuzzy_score("Activity log", "act").unwrap();
-        assert!(prefix >= scattered - 5, "prefix={prefix} scattered={scattered}");
+        assert!(
+            prefix >= scattered - 5,
+            "prefix={prefix} scattered={scattered}"
+        );
     }
 }

@@ -497,8 +497,31 @@ fn classify_status(status: u16, body: String) -> AiError {
     match status {
         401 | 403 => AiError::Auth,
         429 => AiError::RateLimited { retry_after: None },
+        // OpenAI-compat backends (LM Studio, llama.cpp, vLLM, …)
+        // surface context-window overflow as a 400 with a body text
+        // that reliably contains "context length" or "tokens to keep
+        // from the initial prompt". Map those to the typed variant so
+        // the UI can show an actionable "raise context window to N"
+        // message instead of a raw "http 400: …" string.
+        400 if body_looks_like_context_overflow(&body) => AiError::ContextOverflow {
+            // We don't have precise counts from the endpoint; leave
+            // them zero and let the caller's Display handler fall back
+            // to generic advice when preflight didn't catch it first.
+            used: 0,
+            budget: 0,
+        },
         _ => AiError::Http { status, body },
     }
+}
+
+fn body_looks_like_context_overflow(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("context length")
+        || lower.contains("context_length")
+        || lower.contains("tokens to keep")
+        || lower.contains("maximum context")
+        || lower.contains("context window")
+        || lower.contains("too many tokens")
 }
 
 /// Keep error bodies readable in logs and `AiError::Parse.raw` without
