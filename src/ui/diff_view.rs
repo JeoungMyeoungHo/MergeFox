@@ -801,6 +801,36 @@ fn path_looks_like_image(path: &std::path::Path) -> bool {
 }
 
 fn render_commit_summary(ui: &mut egui::Ui, diff: &RepoDiff) {
+    // Top header row: short commit hash + parent hashes. Matches the
+    // `commit: 9d3b…  parent: 3046af` shape of most other Git GUIs —
+    // puts identity information above the message so users can
+    // cross-reference with `git log` or `git show`.
+    if let Some(oid) = diff.commit_oid.as_ref() {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("commit:");
+            ui.add(
+                egui::Label::new(RichText::new(short_sha(oid)).monospace().strong())
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_text(oid.to_string());
+
+            if !diff.commit_parent_oids.is_empty() {
+                ui.add_space(8.0);
+                ui.weak(if diff.commit_parent_oids.len() == 1 {
+                    "parent:"
+                } else {
+                    "parents:"
+                });
+                for parent in &diff.commit_parent_oids {
+                    ui.add(egui::Label::new(
+                        RichText::new(short_sha(parent)).monospace(),
+                    ))
+                    .on_hover_text(parent.to_string());
+                }
+            }
+        });
+    }
+
     let message = diff
         .commit_message
         .as_deref()
@@ -825,13 +855,98 @@ fn render_commit_summary(ui: &mut egui::Ui, diff: &RepoDiff) {
             ui.add(egui::Label::new(RichText::new(message).strong()).wrap());
         });
 
-    if let Some(author) = diff
+    // Author + time row: `<name>  authored <absolute> (<relative>)`.
+    // Absolute time anchors the user in real history; relative time
+    // ("2h ago") gives the "how recent" glance. Both together avoids
+    // the "yesterday or last month?" re-check that a relative-only
+    // label forces.
+    let author = diff
         .commit_author
         .as_deref()
         .map(str::trim)
-        .filter(|author| !author.is_empty())
-    {
-        ui.weak(format!("Author: {author}"));
+        .filter(|a| !a.is_empty());
+    if author.is_some() || diff.commit_author_time.is_some() {
+        ui.horizontal_wrapped(|ui| {
+            if let Some(name) = author {
+                let hover = diff
+                    .commit_author_email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(|e| format!("{name} <{e}>"))
+                    .unwrap_or_else(|| name.to_string());
+                ui.add(egui::Label::new(RichText::new(name).weak()))
+                    .on_hover_text(hover);
+            }
+            if let Some(ts) = diff.commit_author_time {
+                if author.is_some() {
+                    ui.add_space(6.0);
+                    ui.weak("•");
+                    ui.add_space(6.0);
+                }
+                ui.weak(format!("authored {}", format_commit_time(ts)));
+                ui.add_space(6.0);
+                ui.weak(format!("({})", relative_time(ts)));
+            }
+        });
+    }
+}
+
+fn short_sha(oid: &gix::ObjectId) -> String {
+    let s = oid.to_string();
+    s[..7.min(s.len())].to_string()
+}
+
+/// Absolute timestamp formatter. Shows UTC to avoid depending on
+/// chrono / libc `localtime_r` for one label; the relative time
+/// ("3h ago") next to it gives the at-a-glance sense that a local
+/// conversion would add. Users who need a precise local reading can
+/// cross-check via their terminal.
+fn format_commit_time(unix: i64) -> String {
+    if unix <= 0 {
+        return "unknown".to_string();
+    }
+    let days = unix.div_euclid(86_400);
+    let tod = unix.rem_euclid(86_400) as u32;
+    let (year, month, day) = civil_from_days(days);
+    let hour = tod / 3600;
+    let minute = (tod % 3600) / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+/// Days since Unix epoch → civil (year, month, day). Same Howard
+/// Hinnant algorithm used in `blame.rs::civil_from_days`; duplicated
+/// here rather than re-exported to keep `blame.rs` private.
+fn civil_from_days(mut z: i64) -> (i32, u32, u32) {
+    z += 719468;
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i32 + era as i32 * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Coarse "N unit ago" label. Seconds granularity at the minute mark
+/// would look fussy next to the absolute YYYY-MM-DD; months and years
+/// are rounded because nobody needs day-precision at that scale.
+fn relative_time(ts: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let diff = (now - ts).max(0);
+    match diff {
+        d if d < 60 => "just now".into(),
+        d if d < 3600 => format!("{}m ago", d / 60),
+        d if d < 86_400 => format!("{}h ago", d / 3600),
+        d if d < 2_592_000 => format!("{}d ago", d / 86_400),
+        d if d < 31_536_000 => format!("{}mo ago", d / 2_592_000),
+        d => format!("{}y ago", d / 31_536_000),
     }
 }
 

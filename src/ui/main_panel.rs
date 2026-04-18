@@ -203,6 +203,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         }
         let mut clear_commit_selection = false;
         let mut clicked_commit_oid: Option<gix::ObjectId> = None;
+        let mut basket_toggle_oid: Option<gix::ObjectId> = None;
         if let Some(gv) = &mut ws.graph_view {
             // Get working tree entries for the virtual row
             let working_entries = ws.repo_ui_cache.as_ref().and_then(|c| c.working.as_deref());
@@ -214,6 +215,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 working_entries,
                 &mut ws.selected_working_tree,
                 &mut ws.working_tree_expanded,
+                &ws.commit_basket,
             );
             if let Some(action) = result.action {
                 intent.action = Some(action);
@@ -224,6 +226,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             clear_commit_selection = result.clear_commit_selection;
             if let Some(idx) = result.clicked {
                 clicked_commit_oid = gv.graph.rows.get(idx).map(|row| row.oid);
+            }
+            if let Some(idx) = result.toggle_basket {
+                basket_toggle_oid = gv.graph.rows.get(idx).map(|row| row.oid);
             }
         } else {
             ui.vertical_centered(|ui| {
@@ -248,6 +253,14 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             ws.working_file_diff = None;
             ws.working_tree_expanded = false;
             commit_clicked = Some(oid);
+        }
+        if let Some(oid) = basket_toggle_oid {
+            // Cmd/Ctrl-click toggled basket membership. Does NOT touch
+            // `selected_commit` / `current_diff` — the user can still
+            // be viewing one commit's diff while building a basket.
+            if !ws.commit_basket.insert(oid) {
+                ws.commit_basket.remove(&oid);
+            }
         }
     });
 

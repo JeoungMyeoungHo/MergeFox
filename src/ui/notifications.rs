@@ -36,11 +36,14 @@ use egui::{Align2, Color32, RichText, Stroke};
 use crate::app::MergeFoxApp;
 
 const MAX_VISIBLE: usize = 8;
-const INFO_DURATION_MS: u64 = 3000;
-const SUCCESS_DURATION_MS: u64 = 2500;
-const WARNING_DURATION_MS: u64 = 6000;
-/// Errors never auto-dismiss — user must click the close button.
-const ERROR_DURATION_MS: Option<u64> = None;
+/// All toasts are sticky: the user explicitly dismisses each via `×`.
+/// Rationale: the toast is the primary surface for "something
+/// happened, you probably need to know" — auto-fading even a
+/// successful operation meant users who glanced away missed the
+/// outcome. The × button + a hard cap on stack size is the right
+/// trade-off. Still exposed per-severity so a future caller can
+/// override via `NotificationCenter::push_with_duration` if needed.
+const DEFAULT_DURATION: Option<u64> = None;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifSeverity {
@@ -52,12 +55,7 @@ pub enum NotifSeverity {
 
 impl NotifSeverity {
     fn default_duration_ms(self) -> Option<u64> {
-        match self {
-            Self::Info => Some(INFO_DURATION_MS),
-            Self::Success => Some(SUCCESS_DURATION_MS),
-            Self::Warning => Some(WARNING_DURATION_MS),
-            Self::Error => ERROR_DURATION_MS,
-        }
+        DEFAULT_DURATION
     }
 
     fn accent(self) -> Color32 {
@@ -169,9 +167,13 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let items: Vec<Notification> = app.notifications.items.iter().cloned().collect();
     let mut to_dismiss: Vec<u64> = Vec::new();
 
+    // Bottom-right stack: newest on top of the stack, growing upward.
+    // The 16px margin keeps toasts clear of the window edge / status
+    // bar; the negative Y leaves room for the macOS traffic-light
+    // buttons equivalent on our custom window chrome.
     egui::Area::new(egui::Id::new("mergefox-notifications"))
         .order(egui::Order::Foreground)
-        .anchor(Align2::RIGHT_TOP, [-16.0, 56.0])
+        .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0])
         .show(ctx, |ui| {
             ui.vertical(|ui| {
                 for notif in &items {
