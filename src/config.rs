@@ -535,6 +535,29 @@ pub fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("mergefox").join("config.json"))
 }
 
+/// Diagnostic entry point: try to load the user's config and report
+/// what (if anything) went wrong. `Config::load` swallows errors by
+/// design, so this is the only way to see a parse failure short of
+/// adding tracing throughout.
+#[doc(hidden)]
+pub fn diagnose_load() -> String {
+    let Some(path) = config_path() else {
+        return "no config dir available".into();
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => match load_from_bytes(&path, &bytes) {
+            Ok(cfg) => format!(
+                "ok: {} recents, {} repo_settings, schema {}",
+                cfg.recents.len(),
+                cfg.repo_settings.len(),
+                cfg.schema
+            ),
+            Err(e) => format!("parse error on {}: {e:#}", path.display()),
+        },
+        Err(e) => format!("read error on {}: {e}", path.display()),
+    }
+}
+
 fn load_from(path: &Path) -> Result<Config> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     load_from_bytes(path, &bytes)

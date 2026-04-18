@@ -129,6 +129,10 @@ pub struct CommitModal {
     /// Separate from `last_error` because a failed commit and a failed
     /// AI call mean different things to the user.
     pub ai_error: Option<String>,
+    /// Non-error guidance from the AI generator — most importantly,
+    /// "this diff looks like N separate commits; consider splitting".
+    /// Rendered as a muted info banner, not an error.
+    pub ai_advice: Option<String>,
     /// User-selected paths (for bulk stage / unstage). Keyed by the
     /// path's display string so we don't have to re-key whenever the
     /// entries list rebuilds. Selection survives across `status` polls.
@@ -319,6 +323,21 @@ pub struct WelcomeState {
     /// above the configured threshold. Rendering this modal pauses the
     /// welcome flow until the user picks Shallow / Full / Cancel.
     pub clone_size_prompt: Option<CloneSizePrompt>,
+    /// After `git init` on a folder, if the user has two or more
+    /// connected accounts we pause before opening the new repo and ask
+    /// which account to treat as the default upstream identity. Cleared
+    /// once the user picks or skips.
+    pub pending_init_pick: Option<PendingInitPick>,
+}
+
+/// "We just ran `git init` on this path; waiting on the user to tell us
+/// which connected account to associate as the default upstream."
+#[derive(Debug, Clone)]
+pub struct PendingInitPick {
+    pub path: PathBuf,
+    /// Pre-selected account slug. Defaults to the first connected
+    /// account so Enter / "Confirm" picks something sensible.
+    pub selected_slug: Option<String>,
 }
 
 /// "We looked up the repo size and it's big enough to ask you."
@@ -1006,7 +1025,56 @@ impl MergeFoxApp {
             self.set_git_error("Initializing a repository", e);
             return;
         }
-        self.open_repo(path);
+        // Choose an upstream identity before opening the workspace:
+        //   * 0 accounts  → nothing to associate; open immediately.
+        //   * 1 account   → auto-select it (no point asking).
+        //   * ≥2 accounts → park a picker on the welcome state; the
+        //                   user confirms before we open the repo.
+        let accounts = &self.config.provider_accounts;
+        match accounts.len() {
+            0 => self.open_repo(path),
+            1 => {
+                let slug = accounts[0].id.slug();
+                let mut settings = self.config.repo_settings_for(path);
+                settings.provider_account = Some(slug);
+                self.config.set_repo_settings(path, settings);
+                let _ = self.config.save();
+                self.open_repo(path);
+            }
+            _ => {
+                let default_slug = accounts.first().map(|a| a.id.slug());
+                if let Some(state) = self.active_welcome_state_mut() {
+                    state.pending_init_pick = Some(PendingInitPick {
+                        path: path.to_path_buf(),
+                        selected_slug: default_slug,
+                    });
+                } else {
+                    // No welcome state active (shouldn't happen from
+                    // current call sites) — fall through to opening
+                    // without picking; user can change in repo settings.
+                    self.open_repo(path);
+                }
+            }
+        }
+    }
+
+    /// Commit the user's pick from the init-time account picker. Pass
+    /// `None` to skip without associating any account.
+    pub fn apply_init_account_pick(&mut self, slug: Option<String>) {
+        let pick = match self.active_welcome_state_mut() {
+            Some(state) => state.pending_init_pick.take(),
+            None => None,
+        };
+        let Some(pick) = pick else {
+            return;
+        };
+        if let Some(slug) = slug {
+            let mut settings = self.config.repo_settings_for(&pick.path);
+            settings.provider_account = Some(slug);
+            self.config.set_repo_settings(&pick.path, settings);
+            let _ = self.config.save();
+        }
+        self.open_repo(&pick.path);
     }
 
     pub fn open_repo(&mut self, path: &Path) {
@@ -1714,7 +1782,17 @@ impl MergeFoxApp {
         };
 
         match result {
-            Ok(path) => self.open_repo(&path),
+            Ok(outcome) => {
+                // Probe picked an account — lock it in as the repo's
+                // default so push / pull don't re-ask.
+                if let Some(slug) = outcome.account_slug {
+                    let mut settings = self.config.repo_settings_for(&outcome.path);
+                    settings.provider_account = Some(slug);
+                    self.config.set_repo_settings(&outcome.path, settings);
+                    let _ = self.config.save();
+                }
+                self.open_repo(&outcome.path);
+            }
             Err(err) => self.set_git_error("Cloning a repository", err),
         }
     }

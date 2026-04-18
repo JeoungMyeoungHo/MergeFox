@@ -39,11 +39,23 @@ pub struct CloneHandle {
     /// defeat the point of going shallow.
     pub depth: Option<u32>,
     pub progress: Arc<Mutex<CloneProgress>>,
-    pub rx: Receiver<Result<PathBuf, String>>,
+    pub rx: Receiver<Result<CloneOutcome, String>>,
+}
+
+/// What a completed clone tells the caller.
+///
+/// `account_slug` is `Some` when the background probe picked a
+/// connected provider account to authenticate with — the caller stores
+/// it in `RepoSettings` so subsequent push / pull on this repo defaults
+/// to the same account without re-asking.
+#[derive(Debug, Clone)]
+pub struct CloneOutcome {
+    pub path: PathBuf,
+    pub account_slug: Option<String>,
 }
 
 impl CloneHandle {
-    pub fn poll(&self) -> Option<Result<PathBuf, String>> {
+    pub fn poll(&self) -> Option<Result<CloneOutcome, String>> {
         self.rx.try_recv().ok()
     }
 
@@ -52,7 +64,12 @@ impl CloneHandle {
     }
 }
 
-pub fn spawn(url: String, dest: PathBuf, depth: Option<u32>) -> CloneHandle {
+pub fn spawn(
+    url: String,
+    dest: PathBuf,
+    depth: Option<u32>,
+    accounts: Vec<crate::providers::ProviderAccount>,
+) -> CloneHandle {
     let progress = Arc::new(Mutex::new(CloneProgress::default()));
     let (tx, rx) = mpsc::channel();
 
@@ -61,9 +78,37 @@ pub fn spawn(url: String, dest: PathBuf, depth: Option<u32>) -> CloneHandle {
     let progress_thread = progress.clone();
 
     thread::spawn(move || {
-        let result = do_clone_dispatched(&url_thread, &dest_thread, depth, progress_thread)
-            .map(|_| dest_thread.clone())
-            .map_err(|e| format!("{e:#}"));
+        // Probe connected accounts for a PAT that authenticates against
+        // this URL. The winner's token is embedded in `fetch_url` so
+        // the one-shot `git clone` / `gix` pull below runs as that
+        // account; on success we rewrite `origin` to the clean URL so
+        // no credential lands in `.git/config`.
+        let authed = crate::clone_auth::probe(&url_thread, &accounts);
+        let (fetch_url, account_slug) = match authed.as_ref() {
+            Some(a) => (a.authed_url.clone(), Some(a.account.slug())),
+            None => (url_thread.clone(), None),
+        };
+
+        let result = (|| -> Result<()> {
+            do_clone_dispatched(&fetch_url, &dest_thread, depth, progress_thread)?;
+            if authed.is_some() {
+                // Scrub the PAT out of the persisted remote URL. A
+                // failure here is noisy in the log but not fatal — the
+                // clone itself succeeded.
+                if let Err(e) = crate::git::cli::run(
+                    &dest_thread,
+                    ["remote", "set-url", "origin", url_thread.as_str()],
+                ) {
+                    tracing::warn!(error = %format!("{e:#}"), "failed to scrub token from origin URL");
+                }
+            }
+            Ok(())
+        })()
+        .map(|_| CloneOutcome {
+            path: dest_thread.clone(),
+            account_slug,
+        })
+        .map_err(|e| format!("{e:#}"));
         let _ = tx.send(result);
     });
 

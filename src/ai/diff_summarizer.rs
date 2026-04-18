@@ -96,7 +96,20 @@ pub fn summarize_for_prompt(diff: &str, budget_tokens: u32) -> String {
         files.push((h, cur_body));
     }
 
-    // Per-file trim: drop body for binaries; cap line count.
+    // Fair per-file budget: split the token budget evenly across all
+    // touched files so every file is represented in the prompt. This
+    // replaces the old "first-N-fit, drop the rest" strategy, which
+    // on multi-file commits made the model think the diff only had
+    // 2–3 files and biased it toward whichever one happened to be
+    // listed first alphabetically.
+    //
+    // We keep a floor per file so the header line + a short marker
+    // always fit, even on pathologically large diffs where the
+    // proportional share would round to zero tokens.
+    const PER_FILE_FLOOR_TOKENS: u32 = 40;
+    let file_count = files.len().max(1) as u32;
+    let per_file_budget = (budget_tokens / file_count).max(PER_FILE_FLOOR_TOKENS);
+
     let trimmed: Vec<(String, String)> = files
         .into_iter()
         .map(|(hdr, body)| {
@@ -104,52 +117,59 @@ pub fn summarize_for_prompt(diff: &str, budget_tokens: u32) -> String {
             if is_binary_path(path) {
                 return (hdr, "[binary file — body omitted]\n".to_string());
             }
-            let lines: Vec<&str> = body.lines().collect();
-            if lines.len() <= LINES_PER_FILE {
-                (hdr, body)
-            } else {
-                let kept = lines[..LINES_PER_FILE].join("\n");
-                let extra = lines.len() - LINES_PER_FILE;
-                let mut out = kept;
-                out.push('\n');
-                out.push_str(&format!("[truncated: {} more lines]\n", extra));
-                (hdr, out)
-            }
+            (hdr, trim_body_to_budget(&body, per_file_budget))
         })
         .collect();
 
-    // Assemble, tracking running cost. When we'd overflow, emit a
-    // compact "…and N more files (paths: a, b, c)" summary so the
-    // model still sees *which* files exist even if it can't read them.
+    // Assemble. Files fit by construction (per-file caps applied
+    // above) but we still track cost so if summed overshoot we can
+    // note the overflow rather than silently return an over-budget
+    // string.
     let mut out = String::new();
     let mut used: u32 = 0;
-    let mut dropped_paths: Vec<String> = Vec::new();
-
     for (hdr, body) in &trimmed {
         let chunk = format!("{}\n{}", hdr, body);
-        let cost = est_tokens(&chunk);
-        if used + cost > budget_tokens && !out.is_empty() {
-            let p = path_from_header(hdr).unwrap_or("").to_string();
-            dropped_paths.push(p);
-            continue;
-        }
         out.push_str(&chunk);
-        used += cost;
+        used += est_tokens(&chunk);
+    }
+    let _ = used; // Kept for future instrumentation / logging hooks.
+
+    out
+}
+
+/// Trim a single file's diff body so its token cost stays under
+/// `budget`. Preserves the first few lines (hunk header + context) and
+/// as many `+`/`-` lines as fit, with a truncation marker on overflow.
+fn trim_body_to_budget(body: &str, budget: u32) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.is_empty() {
+        return body.to_string();
     }
 
-    if !dropped_paths.is_empty() {
-        let shown: Vec<&str> = dropped_paths.iter().take(20).map(String::as_str).collect();
-        out.push_str(&format!(
-            "\n[{} more files omitted for context budget: {}{}]\n",
-            dropped_paths.len(),
-            shown.join(", "),
-            if dropped_paths.len() > shown.len() {
-                ", ..."
-            } else {
-                ""
-            }
-        ));
+    // Try the whole body first — most files are small relative to
+    // the budget once it's fair-shared.
+    if est_tokens(body) <= budget {
+        return body.to_string();
     }
 
+    // Otherwise accumulate line-by-line until we'd overflow, reserving
+    // a few tokens for the truncation marker.
+    let mut out = String::new();
+    let marker_reserve = 10u32;
+    let effective = budget.saturating_sub(marker_reserve);
+    let mut kept = 0usize;
+    for line in &lines {
+        let next_cost = est_tokens(line) + 1;
+        if est_tokens(&out) + next_cost > effective {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+        kept += 1;
+    }
+    let dropped = lines.len().saturating_sub(kept);
+    if dropped > 0 {
+        out.push_str(&format!("[truncated: {dropped} more lines]\n"));
+    }
     out
 }

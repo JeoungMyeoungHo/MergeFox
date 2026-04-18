@@ -21,11 +21,13 @@
 //! `async fn` that the UI dispatches via `runtime::block_on` or via a
 //! background task whose result drops back into app state.
 
+pub mod change_signals;
 pub mod client;
 pub mod config;
 pub mod diff_summarizer;
 pub mod error;
 pub mod grammars;
+pub mod repo_conventions;
 pub mod runtime;
 pub mod tasks;
 
