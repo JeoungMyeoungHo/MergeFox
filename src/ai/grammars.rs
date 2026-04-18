@@ -17,8 +17,10 @@
 /// `<type>(<scope>)?: <subject>\n\n<body>?`
 ///
 /// - Type drawn from the Conventional Commits vocabulary.
-/// - Scope optional, alphanum+dash only (no spaces — keeps parsing
-///   trivial downstream).
+/// - Scope optional — a SINGLE lowercase token (letters, digits, dash,
+///   underscore). No commas, slashes, or spaces: the parser accepts
+///   those via tolerant normalisation, but grammar-capable endpoints
+///   can just block them outright at decode time.
 /// - Subject: up to 72 printable ASCII chars, no newline. We cap at
 ///   72 via rule repetition rather than a lookahead because GBNF has
 ///   no lookahead.
@@ -28,7 +30,7 @@ pub const GRAMMAR_COMMIT_MSG: &str = r#"
 root ::= header ("\n\n" body)?
 header ::= commit-type scope? ": " subject
 commit-type ::= "feat" | "fix" | "docs" | "style" | "refactor" | "perf" | "test" | "build" | "ci" | "chore" | "revert"
-scope ::= "(" [a-zA-Z0-9_-]+ ")"
+scope ::= "(" [a-z0-9_-]+ ")"
 subject ::= subject-char subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char? subject-char?
 subject-char ::= [A-Za-z0-9 ._,'\"()\-!?/]
 body ::= body-line ("\n" body-line)*

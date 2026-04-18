@@ -32,6 +32,10 @@ struct Intent {
     refresh_remote_repos: Option<AccountId>,
     load_remote_repo_owners: Option<AccountId>,
     create_remote_repo: Option<(AccountId, CreateRepositoryDraft)>,
+    /// User resolved the post-init account picker. `Some(Some(slug))` =
+    /// associate that account; `Some(None)` = skip; `None` = still
+    /// waiting on the user this frame.
+    init_pick_decision: Option<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -178,6 +182,12 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             render_clone_progress(ui, handle);
         }
 
+        if state.pending_init_pick.is_some() {
+            ui.add_space(16.0);
+            ui.separator();
+            render_init_account_pick(ui, state, &connected_accounts, &mut intent, &labels);
+        }
+
         // ---------- error banner ----------
         if let Some(err) = &app.last_error {
             ui.add_space(12.0);
@@ -227,9 +237,62 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     if let Some(path) = intent.init_path {
         app.init_repo(&path);
     }
+    if let Some(decision) = intent.init_pick_decision {
+        app.apply_init_account_pick(decision);
+    }
     if intent.open_settings {
         app.open_settings();
     }
+}
+
+fn render_init_account_pick(
+    ui: &mut egui::Ui,
+    state: &mut crate::app::WelcomeState,
+    accounts: &[ProviderAccount],
+    intent: &mut Intent,
+    labels: &Labels,
+) {
+    let Some(pick) = state.pending_init_pick.as_mut() else {
+        return;
+    };
+    ui.heading(labels.init_pick_title);
+    ui.weak(labels.init_pick_hint);
+
+    let selected_slug = pick.selected_slug.clone();
+    let selected_label = selected_slug
+        .as_ref()
+        .and_then(|slug| accounts.iter().find(|a| a.id.slug() == *slug))
+        .map(account_label)
+        .unwrap_or_else(|| labels.choose_account.to_string());
+
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("welcome_init_account_pick")
+            .selected_text(selected_label)
+            .width(280.0)
+            .show_ui(ui, |ui| {
+                for account in accounts {
+                    let slug = account.id.slug();
+                    let is_selected = selected_slug.as_deref() == Some(slug.as_str());
+                    if ui
+                        .selectable_label(is_selected, account_label(account))
+                        .clicked()
+                    {
+                        pick.selected_slug = Some(slug);
+                    }
+                }
+            });
+
+        let can_confirm = pick.selected_slug.is_some();
+        if ui
+            .add_enabled(can_confirm, egui::Button::new(labels.init_pick_confirm))
+            .clicked()
+        {
+            intent.init_pick_decision = Some(pick.selected_slug.clone());
+        }
+        if ui.button(labels.init_pick_skip).clicked() {
+            intent.init_pick_decision = Some(None);
+        }
+    });
 }
 
 // ---------------- helpers ----------------
@@ -741,6 +804,12 @@ struct Labels {
     clone_cancel_btn: &'static str,
     /// Suffix shown after the "Shallow clone (depth N)" button tooltip.
     clone_shallow_hint: &'static str,
+    /// Heading of the post-`git init` account picker.
+    init_pick_title: &'static str,
+    /// Subtext under the picker heading explaining why we're asking.
+    init_pick_hint: &'static str,
+    init_pick_confirm: &'static str,
+    init_pick_skip: &'static str,
 }
 
 fn labels(language: UiLanguage) -> Labels {
@@ -790,6 +859,10 @@ fn labels(language: UiLanguage) -> Labels {
             clone_full_btn: "전체 클론",
             clone_cancel_btn: "취소",
             clone_shallow_hint: "최근 커밋만 받습니다. 나중에 전체 히스토리를 받아올 수 있습니다.",
+            init_pick_title: "업스트림 계정 선택",
+            init_pick_hint: "새 저장소의 기본 업스트림으로 사용할 연결된 계정을 선택하세요. 나중에 저장소 설정에서 바꿀 수 있습니다.",
+            init_pick_confirm: "이 계정 사용",
+            init_pick_skip: "건너뛰기",
         },
         UiLanguage::Japanese => Labels {
             tagline: "軽量な Git クライアント",
@@ -837,6 +910,10 @@ fn labels(language: UiLanguage) -> Labels {
             clone_full_btn: "フルクローン",
             clone_cancel_btn: "キャンセル",
             clone_shallow_hint: "直近のコミットのみ取得します。あとで完全な履歴を取得できます。",
+            init_pick_title: "アップストリームアカウントを選択",
+            init_pick_hint: "この新しいリポジトリの既定アップストリームとして使用する接続済みアカウントを選択してください。後でリポジトリ設定から変更できます。",
+            init_pick_confirm: "このアカウントを使用",
+            init_pick_skip: "スキップ",
         },
         UiLanguage::Chinese => Labels {
             tagline: "轻量级 Git 客户端",
@@ -883,6 +960,10 @@ fn labels(language: UiLanguage) -> Labels {
             clone_full_btn: "完整克隆",
             clone_cancel_btn: "取消",
             clone_shallow_hint: "仅获取最近的提交。之后可再获取完整历史。",
+            init_pick_title: "选择上游账号",
+            init_pick_hint: "选择一个已连接账号作为此新仓库的默认上游。之后可在仓库设置中修改。",
+            init_pick_confirm: "使用此账号",
+            init_pick_skip: "跳过",
         },
         UiLanguage::French => Labels {
             tagline: "client Git léger",
@@ -929,6 +1010,10 @@ fn labels(language: UiLanguage) -> Labels {
             clone_full_btn: "Clone complet",
             clone_cancel_btn: "Annuler",
             clone_shallow_hint: "Ne récupère que les derniers commits. Vous pourrez récupérer tout l'historique plus tard.",
+            init_pick_title: "Choisir un compte amont",
+            init_pick_hint: "Choisissez un compte connecté à utiliser comme amont par défaut pour ce nouveau dépôt. Vous pourrez le changer plus tard dans les paramètres du dépôt.",
+            init_pick_confirm: "Utiliser ce compte",
+            init_pick_skip: "Ignorer",
         },
         UiLanguage::Spanish => Labels {
             tagline: "cliente Git ligero",
@@ -975,6 +1060,10 @@ fn labels(language: UiLanguage) -> Labels {
             clone_full_btn: "Clon completo",
             clone_cancel_btn: "Cancelar",
             clone_shallow_hint: "Solo descarga los commits recientes. Puedes obtener el historial completo después.",
+            init_pick_title: "Elegir cuenta upstream",
+            init_pick_hint: "Elige una cuenta conectada como upstream predeterminado para este nuevo repositorio. Podrás cambiarlo después en los ajustes del repositorio.",
+            init_pick_confirm: "Usar esta cuenta",
+            init_pick_skip: "Omitir",
         },
         _ => Labels {
             tagline: "lightweight git client",
@@ -1022,6 +1111,10 @@ fn labels(language: UiLanguage) -> Labels {
             clone_full_btn: "Full clone",
             clone_cancel_btn: "Cancel",
             clone_shallow_hint: "Download recent commits only. You can fetch the full history later.",
+            init_pick_title: "Choose upstream account",
+            init_pick_hint: "Pick a connected account to use as this new repository's default upstream. You can change this later in repo settings.",
+            init_pick_confirm: "Use this account",
+            init_pick_skip: "Skip",
         },
     }
 }
@@ -1077,6 +1170,7 @@ fn start_clone_with_policy(app: &mut MergeFoxApp, url: String, dest: PathBuf) {
     let policy = app.config.clone_defaults.size_policy;
     let shallow_depth = app.config.clone_defaults.shallow_depth;
     let threshold_mb = app.config.clone_defaults.prompt_threshold_mb;
+    let accounts = app.config.provider_accounts.clone();
 
     let Some(state) = app.active_welcome_state_mut() else {
         return;
@@ -1087,10 +1181,10 @@ fn start_clone_with_policy(app: &mut MergeFoxApp, url: String, dest: PathBuf) {
 
     match policy {
         CloneSizePolicy::AlwaysFull => {
-            state.clone = Some(clone::spawn(url, dest, None));
+            state.clone = Some(clone::spawn(url, dest, None, accounts));
         }
         CloneSizePolicy::AlwaysShallow => {
-            state.clone = Some(clone::spawn(url, dest, Some(shallow_depth)));
+            state.clone = Some(clone::spawn(url, dest, Some(shallow_depth), accounts));
         }
         CloneSizePolicy::Prompt => {
             // Only meaningful to preflight for hosts where we know how
@@ -1118,7 +1212,7 @@ fn start_clone_with_policy(app: &mut MergeFoxApp, url: String, dest: PathBuf) {
                 let _ = threshold_mb;
                 let _ = shallow_depth;
             } else {
-                state.clone = Some(clone::spawn(url, dest, None));
+                state.clone = Some(clone::spawn(url, dest, None, accounts));
             }
         }
     }
@@ -1127,6 +1221,7 @@ fn start_clone_with_policy(app: &mut MergeFoxApp, url: String, dest: PathBuf) {
 /// Apply the user's choice in the large-repo prompt.
 fn apply_clone_decision(app: &mut MergeFoxApp, decision: CloneDecision) {
     let shallow_depth = app.config.clone_defaults.shallow_depth;
+    let accounts = app.config.provider_accounts.clone();
     let Some(state) = app.active_welcome_state_mut() else {
         return;
     };
@@ -1135,10 +1230,15 @@ fn apply_clone_decision(app: &mut MergeFoxApp, decision: CloneDecision) {
     };
     match decision {
         CloneDecision::Full => {
-            state.clone = Some(clone::spawn(prompt.url, prompt.dest, None));
+            state.clone = Some(clone::spawn(prompt.url, prompt.dest, None, accounts));
         }
         CloneDecision::Shallow => {
-            state.clone = Some(clone::spawn(prompt.url, prompt.dest, Some(shallow_depth)));
+            state.clone = Some(clone::spawn(
+                prompt.url,
+                prompt.dest,
+                Some(shallow_depth),
+                accounts,
+            ));
         }
         CloneDecision::Cancel => {
             // Just dropping the prompt above is enough.
@@ -1152,6 +1252,7 @@ fn apply_clone_decision(app: &mut MergeFoxApp, decision: CloneDecision) {
 fn drain_clone_preflight(app: &mut MergeFoxApp) {
     let threshold_bytes = (app.config.clone_defaults.prompt_threshold_mb as u64) * 1024 * 1024;
     let shallow_depth = app.config.clone_defaults.shallow_depth;
+    let accounts = app.config.provider_accounts.clone();
     let Some(state) = app.active_welcome_state_mut() else {
         return;
     };
@@ -1176,7 +1277,7 @@ fn drain_clone_preflight(app: &mut MergeFoxApp) {
         // "Unknown" + "Prompt policy" is a deliberate no-prompt path: if
         // we can't back the warning with a real number we don't ask.
         _ => {
-            state.clone = Some(clone::spawn(preflight.url, preflight.dest, None));
+            state.clone = Some(clone::spawn(preflight.url, preflight.dest, None, accounts));
         }
     }
 }

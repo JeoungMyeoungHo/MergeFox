@@ -53,6 +53,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let app_has_ai_endpoint_snapshot = app.config.ai_endpoint.is_some();
     let ai_in_flight_snapshot = app.commit_ai_task.is_some();
     let ai_error_snapshot = app.commit_modal.as_ref().and_then(|m| m.ai_error.clone());
+    let ai_advice_snapshot = app.commit_modal.as_ref().and_then(|m| m.ai_advice.clone());
 
     let staged_count = entries.iter().filter(|e| e.staged).count();
     let unstaged_count = entries
@@ -220,6 +221,22 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     ui.colored_label(Color32::LIGHT_RED, format!("AI: {err}"));
                 }
             });
+
+            // Multi-concern advice banner — muted, sits below the AI
+            // row so the user can read it without it feeling like an
+            // error. Rendered as selectable multi-line label so they
+            // can copy the file list when splitting the commit manually.
+            if let Some(advice) = &ai_advice_snapshot {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(advice)
+                            .monospace()
+                            .color(Color32::from_rgb(210, 180, 80)),
+                    )
+                    .wrap(),
+                );
+            }
 
             ui.add_space(6.0);
 
@@ -750,12 +767,13 @@ fn start_ai_generation(app: &mut MergeFoxApp) {
         }
     };
 
-    let diff = {
+    let (diff, repo_path) = {
         let View::Workspace(tabs) = &app.view else {
             return;
         };
         let ws = tabs.current();
-        match ws.repo.staged_diff_text(COMMIT_AI_DIFF_BYTES) {
+        let repo_path = ws.repo.path().to_path_buf();
+        let diff = match ws.repo.staged_diff_text(COMMIT_AI_DIFF_BYTES) {
             Ok(d) if d.trim().is_empty() => {
                 if let Some(m) = app.commit_modal.as_mut() {
                     m.ai_error =
@@ -770,16 +788,33 @@ fn start_ai_generation(app: &mut MergeFoxApp) {
                 }
                 return;
             }
-        }
+        };
+        (diff, repo_path)
     };
 
     if let Some(m) = app.commit_modal.as_mut() {
         m.ai_error = None;
+        m.ai_advice = None;
     }
 
+    // Load repo commit conventions synchronously on this thread —
+    // it's git log + a little parsing, cached so the second click is
+    // free. Doing it before the task spawn means the generator thread
+    // gets a self-contained `opts` with no borrow back into `app`.
+    let conventions = crate::ai::repo_conventions::load(&repo_path);
+
+    let context_window = endpoint.context_window;
     let task = crate::ai::AiTask::spawn(async move {
         let client = crate::ai::build_client(endpoint);
-        let opts = crate::ai::tasks::commit_message::CommitMessageOpts::default();
+        let opts = crate::ai::tasks::commit_message::CommitMessageOpts {
+            conventions: Some(conventions),
+            // Two-phase is the default for hosted frontier models. If
+            // users on sub-1B local models find the extra round-trip
+            // too slow, a future setting can flip this off.
+            two_phase: true,
+            context_window_tokens: context_window,
+            ..Default::default()
+        };
         crate::ai::tasks::commit_message::gen_commit_message(client.as_ref(), &diff, opts).await
     });
     app.commit_ai_task = Some(task);
@@ -807,11 +842,29 @@ fn poll_ai_task(app: &mut MergeFoxApp) {
                     format!("{}\n\n--- AI suggestion ---\n{}", modal.message, suggestion);
             }
             modal.ai_error = None;
+            modal.ai_advice = sugg.segmentation_advice.as_ref().map(format_advice);
         }
         Err(e) => {
             modal.ai_error = Some(format!("{e}"));
+            modal.ai_advice = None;
         }
     }
+}
+
+fn format_advice(advice: &crate::ai::change_signals::SegmentationAdvice) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "⚠ Multi-concern diff — {}", advice.reason);
+    for g in &advice.groups {
+        let sample: Vec<&str> = g.paths.iter().take(3).map(String::as_str).collect();
+        let more = if g.paths.len() > sample.len() {
+            format!(", (+{} more)", g.paths.len() - sample.len())
+        } else {
+            String::new()
+        };
+        let _ = writeln!(out, "  [{}] {}{}", g.label, sample.join(", "), more);
+    }
+    out.trim_end().to_string()
 }
 
 fn format_suggestion(sugg: &crate::ai::tasks::commit_message::CommitSuggestion) -> String {
@@ -923,6 +976,7 @@ fn handle_commit_intent(app: &mut MergeFoxApp, intent: CommitIntent) {
             cm.message.clear();
             cm.last_error = None;
             cm.ai_error = None;
+            cm.ai_advice = None;
             cm.selection.clear();
             cm.selection_anchor = None;
             reset_amend_author_state(cm);

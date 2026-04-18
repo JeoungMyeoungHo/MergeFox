@@ -4,6 +4,7 @@ mod actions;
 mod ai;
 mod app;
 mod clone;
+mod clone_auth;
 mod config;
 mod forge;
 mod git;
