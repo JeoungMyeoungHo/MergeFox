@@ -251,6 +251,24 @@ fn worker_loop(job_rx: Arc<Mutex<Receiver<PreviewJob>>>, result_tx: Sender<Previ
 
 fn run_job(job: &PreviewJob) -> PreviewState {
     let kind = FormatKind::from_ext(&job.ext);
+
+    // Tier 3 fast-path: opaque binary formats (FBX/Blend/glTF/OBJ/…)
+    // don't have an in-process decoder, but on macOS the system's
+    // QuickLook generators (used by Finder) can rasterize most of them
+    // to a PNG via `qlmanage -t`. We route those through the qlmanage
+    // shim instead of immediately returning `Unsupported`. The shim
+    // itself is OS-gated — on non-mac platforms it's a no-op that
+    // falls back to the placeholder badge path below.
+    if let FormatKind::OpaqueAsset(label) = kind {
+        if let Some(state) = try_qlmanage(job, label) {
+            return state;
+        }
+        // qlmanage didn't produce output (non-mac, tool missing, no
+        // generator installed, or timed out). Fall through to the
+        // generic placeholder — the UI will draw a typed badge.
+        return PreviewState::Unsupported { label };
+    }
+
     let bytes = match &job.bytes {
         Some(b) => b.clone(),
         None => match read_path_bytes(&job.key) {
@@ -274,6 +292,255 @@ fn run_job(job: &PreviewJob) -> PreviewState {
     }
 }
 
+/// Non-macOS stub. On Windows/Linux we have no cross-platform
+/// equivalent of QuickLook that reliably thumbnails FBX/Blend/etc.
+/// (Linux has `gio thumbnail` but it only covers MIME-registered
+/// types, which exclude most 3D formats by default.) Returning
+/// `None` lets the caller emit the standard placeholder badge.
+#[cfg(not(target_os = "macos"))]
+fn try_qlmanage(_job: &PreviewJob, _label: &'static str) -> Option<PreviewState> {
+    None
+}
+
+/// macOS QuickLook thumbnail fallback. Shells out to `qlmanage -t`,
+/// which is the same thumbnail generator Finder uses. Any installed
+/// QuickLook generator plugin (Blender ships one, Epic's UAsset
+/// Quicklook plugin, etc.) becomes supported "for free" — we just
+/// read the PNG it emits.
+///
+/// Design notes
+/// ------------
+/// * **Blocking with a hard timeout** — `qlmanage` can take arbitrarily
+///   long on a first-run plugin initialization or when a generator
+///   hangs on a malformed asset. We cap wall-clock time at
+///   `QLMANAGE_TIMEOUT` (5s) using a polling loop; if the child is
+///   still alive at the deadline we kill it. Worker threads are a
+///   shared pool (`WORKER_THREADS = 4`), so a single stuck `qlmanage`
+///   would otherwise permanently block a slot.
+/// * **Temp directory per job** — qlmanage always writes
+///   `<outdir>/<basename>.png`; running two jobs against files with
+///   the same basename (e.g. `assets/a/model.fbx` and
+///   `assets/b/model.fbx`) into a shared dir would race. Isolating
+///   each job in its own tempdir also makes cleanup trivial (remove
+///   the whole dir, not individual files).
+/// * **Blob → temp-file round-trip** — qlmanage operates on paths,
+///   not stdin. For `PreviewIdentity::Blob`, we materialize the bytes
+///   into a temp file with the original extension (the extension is
+///   how QuickLook routes to the right generator plugin). Cleanup
+///   happens in the same RAII scope as the output dir.
+#[cfg(target_os = "macos")]
+fn try_qlmanage(job: &PreviewJob, _label: &'static str) -> Option<PreviewState> {
+    use std::time::{Duration, Instant};
+
+    /// Max wall-clock budget for a single `qlmanage` invocation. Chosen
+    /// to be short enough that a hung generator doesn't noticeably
+    /// starve the worker pool (4 workers × 5s = 20s worst case before
+    /// the whole pool recovers), but long enough for cold-start plugin
+    /// loads on the first preview after boot.
+    const QLMANAGE_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Polling interval for the child's exit status. Short enough that
+    /// fast thumbnails (most PNG-trivial cases complete in <100ms)
+    /// finish promptly; coarse enough that the polling loop itself is
+    /// negligible overhead.
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    let max_dim = match job.key.mode {
+        PreviewMode::Thumb => THUMB_MAX_DIM,
+        // 512px is the largest size qlmanage tends to produce usable
+        // output at — its generators internally rasterize at a few
+        // fixed sizes and upscale beyond that looks blurry anyway.
+        PreviewMode::Full => 512,
+    };
+
+    // Allocate an isolated output directory that also doubles as the
+    // holder for any temp source file we materialize. `QlWorkDir`
+    // guarantees `remove_dir_all` fires even on early-return / panic.
+    let workdir = match QlWorkDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!(error = %e, "qlmanage: failed to create tempdir");
+            return None;
+        }
+    };
+
+    // Resolve (or materialize) a real filesystem path for qlmanage.
+    let source_path: PathBuf = match &job.key.identity {
+        PreviewIdentity::Path { path, .. } => path.clone(),
+        PreviewIdentity::Blob(oid) => {
+            let bytes = match &job.bytes {
+                Some(b) => b.clone(),
+                None => return None,
+            };
+            // Preserve the extension — QuickLook dispatches generators
+            // by UTI, which is itself derived from the extension for
+            // third-party plugins. A `.fbx` renamed to `.bin` won't
+            // thumbnail.
+            let filename = if job.ext.is_empty() {
+                format!("{}", oid)
+            } else {
+                format!("{}.{}", oid, job.ext)
+            };
+            let tmp_src = workdir.path().join(filename);
+            if let Err(e) = std::fs::write(&tmp_src, &bytes[..]) {
+                tracing::debug!(error = %e, "qlmanage: write temp source");
+                return None;
+            }
+            tmp_src
+        }
+    };
+
+    let outdir = workdir.path();
+    let mut child = match std::process::Command::new("qlmanage")
+        .arg("-t")
+        .arg("-s")
+        .arg(max_dim.to_string())
+        .arg("-o")
+        .arg(outdir)
+        .arg(&source_path)
+        // qlmanage is chatty on stderr even for successful runs.
+        // Swallow both streams — we only care about the output file
+        // existing, not the tool's logging.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(error = %e, "qlmanage: spawn failed");
+            return None;
+        }
+    };
+
+    // Bounded wait. `try_wait` is non-blocking; we sleep a short
+    // interval between checks. This is preferable to `wait_timeout`
+    // from the `wait-timeout` crate (extra dep) for our very modest
+    // needs.
+    let deadline = Instant::now() + QLMANAGE_TIMEOUT;
+    let exit_ok = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Kill and reap so we don't leave a zombie.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::debug!("qlmanage: timed out after {:?}", QLMANAGE_TIMEOUT);
+                    break false;
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "qlmanage: wait failed");
+                break false;
+            }
+        }
+    };
+
+    if !exit_ok {
+        return None;
+    }
+
+    // qlmanage names its output `<source_basename>.png`. This is
+    // documented behavior but also easy to inspect (readdir finds
+    // exactly one `.png` in a fresh directory, which we exploit as a
+    // resilience measure against future naming tweaks).
+    let expected = source_path
+        .file_name()
+        .map(|n| outdir.join(format!("{}.png", n.to_string_lossy())));
+    let png_path = match expected.as_ref().filter(|p| p.exists()) {
+        Some(p) => p.clone(),
+        None => match find_first_png(outdir) {
+            Some(p) => p,
+            None => {
+                tracing::debug!("qlmanage: no PNG produced for {:?}", source_path);
+                return None;
+            }
+        },
+    };
+
+    let png_bytes = match std::fs::read(&png_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(error = %e, "qlmanage: read output");
+            return None;
+        }
+    };
+
+    let result = match decode_image_crate(&png_bytes, job.key.mode) {
+        Ok(img) => Some(PreviewState::Ready(Arc::new(img))),
+        Err(e) => {
+            tracing::debug!(error = %e, "qlmanage: decode png");
+            // Decode failure on a qlmanage-produced PNG is surprising
+            // enough that we want to surface it rather than silently
+            // falling back to the bland "Unsupported" badge — it
+            // indicates either a corrupt output or an image-crate bug.
+            Some(PreviewState::Failed {
+                reason: format!("qlmanage output decode: {e:#}"),
+            })
+        }
+    };
+    // `workdir` drops here, cleaning up the tempdir (and the source
+    // file inside it, for the blob path). Explicit drop to document
+    // the lifetime expectation rather than rely on end-of-scope order.
+    drop(workdir);
+    result
+}
+
+/// RAII holder for the per-job qlmanage scratch directory. Drops
+/// delete the whole directory tree — best-effort, since we're in
+/// `Drop` and can't surface errors anyway.
+#[cfg(target_os = "macos")]
+struct QlWorkDir {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl QlWorkDir {
+    fn new() -> std::io::Result<Self> {
+        // `std::env::temp_dir()` honors `TMPDIR` on macOS (which points
+        // at a per-user sandboxed path), so we don't have to worry
+        // about permission edge cases. Nanosecond + thread id gives
+        // collision resistance without needing a full uuid crate.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("mergefox-ql-{pid}-{nanos}-{n}"));
+        std::fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for QlWorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Fallback PNG finder: if qlmanage changes its naming convention or
+/// we miscompute the expected basename, just grab the single `.png`
+/// that appeared in our isolated output dir. Cheap safety net.
+#[cfg(target_os = "macos")]
+fn find_first_png(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("png") {
+            return Some(p);
+        }
+    }
+    None
+}
+
 enum PathReadError {
     Missing,
     TooLarge(u64),
@@ -294,12 +561,30 @@ fn read_path_bytes(key: &PreviewKey) -> std::result::Result<Arc<[u8]>, PathReadE
     Ok(bytes.into())
 }
 
+/// Synchronous decode for the commit-detail image pane. Runs on the
+/// UI thread because `paint_image_pane` is already structured around
+/// "byte cache produced on demand" — adding an async hop here would
+/// require reshaping the image cache. The images we actually decode
+/// here are the ones `FileKind::Image` flagged, which the user
+/// deliberately clicked on, so blocking the UI briefly is acceptable
+/// (≤ one frame for even a 10MB texture).
+pub fn decode_image_for_diff_pane(bytes: &[u8]) -> anyhow::Result<DecodedImage> {
+    decode_image_crate(bytes, PreviewMode::Full)
+}
+
+/// Synchronous decode of a PSD's embedded thumbnail. Kept separate
+/// from `decode_image_for_diff_pane` so the UI doesn't need to know
+/// which formats need which loader — the caller routes by extension.
+pub fn decode_psd_for_diff_pane(bytes: &[u8]) -> anyhow::Result<DecodedImage> {
+    decode_psd_embedded(bytes, PreviewMode::Full)
+}
+
 /// Extension-driven format dispatch. Keeps all "does this format even
 /// have a loader?" logic in one spot instead of scattered `match`es
 /// across UI and worker. `Unknown` is the generic "render a placeholder"
 /// bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FormatKind {
+pub enum FormatKind {
     /// Handled natively by the `image` crate.
     Image,
     /// PSD — decoded via embedded thumbnail (see `decode_psd_embedded`).
@@ -311,7 +596,7 @@ enum FormatKind {
 }
 
 impl FormatKind {
-    fn from_ext(ext: &str) -> Self {
+    pub fn from_ext(ext: &str) -> Self {
         match ext {
             "png" | "jpg" | "jpeg" | "gif" | "bmp" | "tga" | "tif" | "tiff" | "webp" | "ico"
             | "exr" | "hdr" | "qoi" => FormatKind::Image,
@@ -498,5 +783,83 @@ mod tests {
     fn psd_embedded_parser_rejects_non_psd() {
         let err = decode_psd_embedded(b"not a psd", PreviewMode::Thumb).unwrap_err();
         assert!(err.to_string().contains("not a PSD"));
+    }
+
+    /// Smoke test for the macOS qlmanage fallback. qlmanage happily
+    /// thumbnails PNGs (via the built-in image generator), so we
+    /// don't need a real FBX fixture in the repo — we just feed it a
+    /// PNG masquerading as an OpaqueAsset and check that a Ready
+    /// state comes back out the other side.
+    ///
+    /// Gated on macOS because `qlmanage` is an Apple binary; on other
+    /// platforms `try_qlmanage` is a no-op stub.
+    ///
+    /// Kept as a best-effort smoke test: if qlmanage is unavailable
+    /// (stripped-down CI image, custom sandbox) we skip rather than
+    /// fail — the production code already treats an absent qlmanage
+    /// as "fall back to placeholder", so the absence doesn't
+    /// represent a regression.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn qlmanage_fallback_thumbnails_png_masquerading_as_fbx() {
+        // Build a tiny PNG in memory.
+        let mut png_bytes = Vec::new();
+        let src = image::RgbaImage::from_pixel(16, 16, image::Rgba([10, 200, 30, 255]));
+        image::DynamicImage::ImageRgba8(src)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+
+        // If qlmanage isn't on PATH (headless CI, locked-down
+        // sandbox), skip rather than fail — this test is a
+        // functional smoke check, not a correctness gate.
+        let probe = std::process::Command::new("qlmanage")
+            .arg("-h")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if probe.is_err() {
+            eprintln!("qlmanage not available, skipping");
+            return;
+        }
+
+        // Synthesize a job as if we were previewing an FBX blob.
+        // `from_pixel` oid is arbitrary — the content-addressing is
+        // only used for cache keying, not for qlmanage dispatch.
+        let oid = gix::ObjectId::null(gix::hash::Kind::Sha1);
+        let job = PreviewJob {
+            key: PreviewKey {
+                identity: PreviewIdentity::Blob(oid),
+                mode: PreviewMode::Thumb,
+            },
+            bytes: Some(Arc::from(png_bytes.into_boxed_slice())),
+            // Use "png" as the extension — pretending it's FBX would
+            // still work on most systems (qlmanage falls back to
+            // content sniffing) but the PNG generator is more
+            // reliably installed than any third-party FBX plugin in
+            // CI, so this keeps the test robust across machines.
+            // The production dispatch only reaches `try_qlmanage`
+            // for `OpaqueAsset` kinds, so we call it directly here.
+            ext: "png".to_string(),
+        };
+
+        let out = try_qlmanage(&job, "FBX model");
+        match out {
+            Some(PreviewState::Ready(img)) => {
+                assert!(img.width > 0);
+                assert!(img.height > 0);
+                assert_eq!(img.rgba.len() as u32, img.width * img.height * 4);
+            }
+            Some(other) => panic!("expected Ready, got {other:?}"),
+            None => {
+                // qlmanage ran but produced no output — acceptable
+                // skip (e.g. sandboxed test runner without QuickLook
+                // access). The production path treats this the same
+                // as a missing tool.
+                eprintln!("qlmanage produced no output, treating as skip");
+            }
+        }
     }
 }

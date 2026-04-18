@@ -1,3 +1,4 @@
+pub mod basket_ops;
 pub mod blame;
 pub mod cli;
 pub mod diff;
@@ -12,8 +13,9 @@ pub use cli::{
     classify_git_error, probe_git_capability, recent_git_log, GitCapability, GitErrorKind,
 };
 pub use diff::{
-    diff_for_commit, diff_text_for_working_entry, file_diff_for_working_entry, DeltaStatus,
-    DiffLine, FileDiff, FileKind, Hunk, LineKind, RepoDiff,
+    diff_for_commit, diff_for_commit_in, diff_text_for_working_entry,
+    file_diff_for_working_entry, DeltaStatus, DiffLine, FileDiff, FileKind, Hunk, LineKind,
+    RepoDiff,
 };
 pub use graph::{CommitGraph, GraphRow, GraphScope, RefKind, RefLabel};
 pub use jobs::{GitJob, GitJobKind, JobProgress, PullStrategy};

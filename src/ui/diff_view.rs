@@ -72,12 +72,21 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     // the diff panel snap-shake each time the diff hop-scotched between
     // these two ids.
     let diff = ws.current_diff.clone();
+    // Snapshot combined-diff metadata too — the panel renders the
+    // synthetic "N commits combined" banner in place of the usual
+    // single-commit summary when this is set.
+    let combined_diff_sources = ws.combined_diff_source.clone();
+    // And the active focus-file filter, if any. Presence of a focus
+    // path decorates the banner with "Focused on: <path>" plus a
+    // chip to clear the filter and restore the full combined diff.
+    let combined_diff_focus = ws.combined_diff_focus_path.clone();
     if !show_working_tree_panel && diff.is_none() && ws.diff_task.is_none() {
         // Nothing to show and nothing computing — don't render the panel.
         return;
     }
 
     let mut close = false;
+    let mut clear_focus = false;
 
     egui::SidePanel::right("diff_panel")
         .resizable(true)
@@ -130,7 +139,17 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         }
                     });
                 });
-                render_commit_summary(ui, &diff);
+                if let Some(sources) = combined_diff_sources {
+                    if render_combined_diff_banner(
+                        ui,
+                        &sources,
+                        combined_diff_focus.as_deref(),
+                    ) {
+                        clear_focus = true;
+                    }
+                } else {
+                    render_commit_summary(ui, &diff);
+                }
                 ui.separator();
 
                 // File list header: count + flat/tree toggle.
@@ -177,6 +196,18 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         ws.set_image_cache(None);
         // Preserve the graph selection visually even after closing the diff:
         // we only clear the diff pane, not the row highlight.
+    }
+    // Restore the unfiltered combined diff in-place. We intentionally
+    // keep `combined_diff_full` populated — the user can re-open the
+    // picker and pick a different path without recomputing the
+    // cherry-pick chain.
+    if clear_focus && ws.combined_diff_focus_path.is_some() {
+        ws.combined_diff_focus_path = None;
+        if let Some(full) = ws.combined_diff_full.clone() {
+            ws.current_diff = Some(full);
+        }
+        ws.selected_file_idx = None;
+        ws.set_image_cache(None);
     }
 }
 
@@ -800,6 +831,70 @@ fn path_looks_like_image(path: &std::path::Path) -> bool {
     )
 }
 
+/// Top-of-panel banner for a synthetic combined diff (produced by
+/// `basket_ops::compute_combined_diff`). Shows the cumulative count
+/// and the topo-sorted SHAs so the user can tell "which commits got
+/// collapsed into this diff" at a glance.
+///
+/// When `focus_path` is set, the banner additionally renders a
+/// "Focused on: <path>" row with a "Clear filter" chip; returning
+/// `true` signals the caller to drop the focus filter this frame.
+/// We funnel the click through a return value rather than mutating
+/// `WorkspaceState` here because this function is deliberately
+/// UI-only — keeping side-effects at the call site mirrors the
+/// `close = true` pattern already used for the panel's x-button.
+fn render_combined_diff_banner(
+    ui: &mut egui::Ui,
+    sources: &[gix::ObjectId],
+    focus_path: Option<&str>,
+) -> bool {
+    let mut clear_focus = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(format!("✦ Combined diff of {} commits", sources.len()))
+                .strong()
+                .color(Color32::from_rgb(210, 180, 100)),
+        );
+    });
+    if !sources.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("order:");
+            for (idx, oid) in sources.iter().enumerate() {
+                if idx > 0 {
+                    ui.weak("→");
+                }
+                ui.add(egui::Label::new(
+                    RichText::new(short_sha(oid)).monospace(),
+                ))
+                .on_hover_text(oid.to_string());
+            }
+        });
+    }
+    ui.weak("Cherry-pick apply order (oldest → newest). Read-only synthetic diff.");
+    if let Some(path) = focus_path {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("Focused on:")
+                    .color(Color32::from_rgb(210, 180, 100))
+                    .strong(),
+            );
+            ui.add(egui::Label::new(RichText::new(path).monospace()))
+                .on_hover_text(path);
+            if ui
+                .small_button("✕ Clear filter")
+                .on_hover_text(
+                    "Show all files in the combined diff again. The file \
+                     picker can be re-opened from the basket bar.",
+                )
+                .clicked()
+            {
+                clear_focus = true;
+            }
+        });
+    }
+    clear_focus
+}
+
 fn render_commit_summary(ui: &mut egui::Ui, diff: &RepoDiff) {
     // Top header row: short commit hash + parent hashes. Matches the
     // `commit: 9d3b…  parent: 3046af` shape of most other Git GUIs —
@@ -1190,15 +1285,59 @@ fn selected_image_cache(ws: &mut WorkspaceState, file: &FileDiff) -> Option<Sele
         })
         .unwrap_or(false);
     if !cache_matches {
+        let old_bytes_raw = crate::git::diff::load_blob_bytes(ws.repo.gix(), file.old_oid);
+        let new_bytes_raw = crate::git::diff::load_blob_bytes(ws.repo.gix(), file.new_oid);
+        // Extended formats (TGA / PSD / EXR / HDR / QOI) aren't served
+        // by egui_extras's built-in loaders. We decode them with the
+        // `image` crate (or the PSD embedded-thumbnail parser) and
+        // re-encode as PNG so the cached bytes are always in a format
+        // the loader can render. PNG stored here is the canonical
+        // "preview" representation; the user still sees file size/ext
+        // from the original blob further down.
+        let (old_bytes, new_bytes, stored_ext) =
+            if matches!(ext.as_str(), "tga" | "psd" | "exr" | "hdr" | "qoi") {
+                let old_converted = old_bytes_raw
+                    .as_ref()
+                    .and_then(|b| convert_extended_to_png(b, &ext));
+                let new_converted = new_bytes_raw
+                    .as_ref()
+                    .and_then(|b| convert_extended_to_png(b, &ext));
+                (old_converted, new_converted, "png".to_string())
+            } else {
+                (old_bytes_raw, new_bytes_raw, ext.clone())
+            };
         ws.set_image_cache(Some(SelectedImageCache {
             old_oid: file.old_oid,
             new_oid: file.new_oid,
-            old_bytes: crate::git::diff::load_blob_bytes(ws.repo.gix(), file.old_oid),
-            new_bytes: crate::git::diff::load_blob_bytes(ws.repo.gix(), file.new_oid),
-            ext,
+            old_bytes,
+            new_bytes,
+            ext: stored_ext,
         }));
     }
     ws.selected_image_cache.clone()
+}
+
+/// Decode an extended image format to an in-memory PNG. Returns
+/// `None` on decode failure so the caller can gracefully fall back to
+/// the "image unavailable" placeholder instead of propagating the
+/// error up the frame loop.
+fn convert_extended_to_png(bytes: &[u8], ext: &str) -> Option<std::sync::Arc<[u8]>> {
+    use crate::ui::file_preview::{DecodedImage, FormatKind, PreviewMode};
+    let decoded: Option<DecodedImage> = match ext {
+        "psd" => crate::ui::file_preview::decode_psd_for_diff_pane(bytes).ok(),
+        _ => crate::ui::file_preview::decode_image_for_diff_pane(bytes).ok(),
+    };
+    let _ = (FormatKind::from_ext(ext), PreviewMode::Full);
+    let decoded = decoded?;
+    let img = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)?;
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut out),
+            image::ImageFormat::Png,
+        )
+        .ok()?;
+    Some(out.into())
 }
 
 /// One row in the virtualized diff list. Every row has the same fixed
