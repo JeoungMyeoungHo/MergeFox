@@ -80,6 +80,39 @@ const MAX_SUBJECT_CHARS: usize = 72;
 /// nicer than another round-trip; past this bound we regenerate.
 const OVERLENGTH_TOLERANCE: usize = 8;
 
+/// Rough token estimate for a string — 4 chars ≈ 1 token on average
+/// for English + code mix, matching the byte/token heuristic used by
+/// `diff_summarizer`. We use this for preflight context checks only;
+/// callers that need precise counts should ask the endpoint.
+fn estimate_tokens(s: &str) -> u32 {
+    if s.is_empty() {
+        0
+    } else {
+        ((s.len() / 4).max(1)) as u32
+    }
+}
+
+/// Tokens consumed by everything in the prompt that doesn't depend on
+/// the diff summary — conventions block, signals block, per-file
+/// block, segmentation advice, plus a baked-in estimate for the
+/// fixed system prompt template. Intent block is excluded because
+/// it's produced mid-run; we bake a reserve for it into the caller's
+/// `SAFETY_MARGIN`.
+fn estimate_prompt_fixed_cost(
+    conventions_block: &str,
+    signals_block: &str,
+    per_file_block: &str,
+    segmentation_block: &str,
+) -> u32 {
+    // System prompt is ~450 English chars → ~110 tokens.
+    const SYSTEM_BASE_TOKENS: u32 = 120;
+    SYSTEM_BASE_TOKENS
+        + estimate_tokens(conventions_block)
+        + estimate_tokens(signals_block)
+        + estimate_tokens(per_file_block)
+        + estimate_tokens(segmentation_block)
+}
+
 /// Trim `s` to at most `max` characters, attempting to cut at the
 /// nearest word boundary so we don't leave a subject ending mid-word.
 fn truncate_subject(s: &str, max: usize) -> String {
@@ -128,7 +161,11 @@ pub async fn gen_commit_message(
     let budget = if opts.diff_budget_tokens != 0 {
         opts.diff_budget_tokens
     } else if opts.context_window_tokens > 0 {
-        const RESERVED_OVERHEAD: u32 = 1500;
+        // Raised from 1500 after adding per-file + segmentation blocks
+        // to the user message; on a 4K model those plus the intent +
+        // retry-history can easily hit 2K tokens before the diff even
+        // starts.
+        const RESERVED_OVERHEAD: u32 = 2600;
         opts.context_window_tokens
             .saturating_sub(RESERVED_OVERHEAD)
             .min(3000)
@@ -145,6 +182,8 @@ pub async fn gen_commit_message(
     // here is negligible.
     let signals = change_signals::analyze(diff);
     let signals_block = signals.render_for_prompt();
+    let per_file_block = signals.render_per_file_changes();
+    let segmentation_block = signals.render_segmentation_tail();
 
     // Project conventions block — empty string if caller didn't pass
     // `opts.conventions` or if sample size is below the reliability
@@ -154,6 +193,32 @@ pub async fn gen_commit_message(
         .as_ref()
         .map(|c| c.render_for_prompt())
         .unwrap_or_default();
+
+    // Preflight token estimate. If we can see we'll overflow BEFORE
+    // calling the endpoint, surface a ContextOverflow error with a
+    // concrete "needs at least N tokens" number so the UI can point
+    // the user at Settings → AI → Context window. Trying to call
+    // anyway wastes a round-trip and yields an opaque 400 from the
+    // backend.
+    if opts.context_window_tokens > 0 {
+        let fixed_cost = estimate_prompt_fixed_cost(
+            &conventions_block,
+            &signals_block,
+            &per_file_block,
+            &segmentation_block,
+        );
+        // Conservative output reserve: the body phase can take ~260
+        // tokens and we want retries not to re-trip this check.
+        const OUTPUT_RESERVE: u32 = 400;
+        const SAFETY_MARGIN: u32 = 200;
+        let required = fixed_cost + budget + OUTPUT_RESERVE + SAFETY_MARGIN;
+        if required > opts.context_window_tokens {
+            return Err(AiError::ContextOverflow {
+                used: required,
+                budget: opts.context_window_tokens,
+            });
+        }
+    }
 
     // If the caller didn't hint at a scope, derive one. Preference:
     //   1) explicit caller hint,
@@ -235,7 +300,16 @@ pub async fn gen_commit_message(
     // fall back to the single-phase flow — we never surface a Phase-1
     // error to the user, since the phase is an optimisation.
     let intent_block = if opts.two_phase {
-        match extract_intent_bullets(client, &signals_block, &conventions_block, &trimmed).await {
+        match extract_intent_bullets(
+            client,
+            &signals_block,
+            &conventions_block,
+            &segmentation_block,
+            &per_file_block,
+            &trimmed,
+        )
+        .await
+        {
             Ok(bullets) if !bullets.trim().is_empty() => {
                 format!("INTENT (plain-English goals of this diff):\n{bullets}\n")
             }
@@ -245,9 +319,8 @@ pub async fn gen_commit_message(
         String::new()
     };
 
-    let base_user = format!(
-        "{conventions_block}{signals_block}{intent_block}\nStaged diff:\n\n{trimmed}"
-    );
+    let base_user =
+        format!("{conventions_block}{signals_block}{segmentation_block}{per_file_block}{intent_block}\nStaged diff:\n\n{trimmed}");
 
     let mut last_raw: Option<String> = None;
     let mut last_parse_err: Option<AiError> = None;
@@ -316,6 +389,8 @@ pub async fn gen_commit_message(
                         &sugg.title,
                         &signals_block,
                         &conventions_block,
+                        &segmentation_block,
+                        &per_file_block,
                         &intent_block,
                         &trimmed,
                     )
@@ -360,10 +435,7 @@ fn needs_shrink(sugg: &CommitSuggestion) -> bool {
 /// cap, preserving meaning. Returns the new subject on success or
 /// `None` if the model's reply can't be used (empty, still too long,
 /// injected formatting, etc.) — the caller falls back to truncation.
-async fn shrink_subject(
-    client: &dyn AiClient,
-    sugg: &CommitSuggestion,
-) -> Option<String> {
+async fn shrink_subject(client: &dyn AiClient, sugg: &CommitSuggestion) -> Option<String> {
     let current_subject = sugg
         .title
         .rsplit(':')
@@ -402,12 +474,7 @@ async fn shrink_subject(
     let resp = client.complete(req).await.ok()?;
     debug_log_response("phase3-shrink", &resp.text);
 
-    let candidate = resp
-        .text
-        .trim()
-        .trim_matches('"')
-        .trim_matches('`')
-        .trim();
+    let candidate = resp.text.trim().trim_matches('"').trim_matches('`').trim();
     // Strip a type-prefix if the model re-added one ("feat: add x").
     let candidate = candidate
         .splitn(2, ':')
@@ -449,22 +516,35 @@ async fn generate_body(
     header: &str,
     signals_block: &str,
     conventions_block: &str,
+    segmentation_block: &str,
+    per_file_block: &str,
     intent_block: &str,
     trimmed_diff: &str,
 ) -> Option<String> {
-    let system = "You write the body paragraph of a git commit message. The header is already \
-                  decided and shown to you; your job is to explain WHY this change was made and \
-                  WHAT it accomplishes, in 2-6 short lines wrapped at ~72 characters. Do not \
-                  repeat the header's subject verbatim. Do not restate the Conventional Commits \
-                  type or scope. Do not use markdown, code fences, bullet points unless the \
-                  change is a list of independent items. Plain prose. Reply with ONLY the body \
-                  text — no prefix, no surrounding blank lines, no quotes.";
+    let system = "You write the body of a git commit message. The header is already decided; \
+                  your job is to explain WHAT changed and WHY, using specific names from the \
+                  signals.\n\
+                  Rules:\n\
+                  (1) Reference at least 2 specific symbols or files from NEW PUBLIC SYMBOLS / \
+                  PER-FILE CHANGES by name (e.g. `Phase 2b body generation`, `SegmentationAdvice`, \
+                  `diagnose_load`).\n\
+                  (2) If the CLASSIFICATION SIGNALS show multiple distinct concerns, cover each \
+                  briefly — one sentence per concern. Do not collapse them.\n\
+                  (3) 2-8 lines, each wrapped at ~72 characters. Plain prose (or a short \
+                  bulleted list when the change is itself a list of independent items).\n\
+                  (4) FORBIDDEN: vague verbs such as 'improve', 'refactor', 'enhance', 'update', \
+                  'clean up', 'polish', 'various changes' used without a named symbol. Also \
+                  forbidden: repeating the header's subject verbatim, restating the Conventional \
+                  Commits type/scope, markdown headings, code fences.\n\
+                  Reply with ONLY the body text — no prefix, no surrounding blank lines, no quotes.";
 
     let user = format!(
-        "{conventions_block}{signals_block}{intent_block}\n\
+        "{conventions_block}{signals_block}{segmentation_block}{per_file_block}{intent_block}\n\
          Header (already decided):\n{header}\n\n\
          Diff:\n\n{trimmed_diff}\n\n\
-         Write the body paragraph now. 2-6 lines, ~72 chars each."
+         Write the body now. Cover every distinct concern from the signals, reference \
+         specific symbol names from NEW PUBLIC SYMBOLS / PER-FILE CHANGES. Avoid vague \
+         verbs. 2-8 lines, ~72 chars each."
     );
 
     let req = CompletionRequest {
@@ -575,17 +655,30 @@ async fn extract_intent_bullets(
     client: &dyn AiClient,
     signals_block: &str,
     conventions_block: &str,
+    segmentation_block: &str,
+    per_file_block: &str,
     trimmed_diff: &str,
 ) -> Result<String> {
-    let system = "You summarise git diffs in 1 to 3 short, verb-led bullets. \
-                  Each bullet is a single sentence describing what the change accomplishes \
-                  (not HOW it is implemented). Do not use Conventional Commits format, \
-                  types, scopes, or code fences. Lead each bullet with `- `.";
+    let system = "You summarise git diffs as a bulleted list of DISTINCT concerns. \
+                  Rules: \
+                  (1) One bullet per distinct concern — never merge two concerns into one bullet. \
+                  (2) Each bullet MUST name a specific symbol, function, file, or pipeline stage \
+                  from the PER-FILE CHANGES / NEW PUBLIC SYMBOLS sections. \
+                  (3) Start each bullet with a strong imperative verb (`- Add X`, `- Tighten Y`, \
+                  `- Extract Z`) followed by the named object. \
+                  (4) FORBIDDEN as the sole content of a bullet: generic verbs like 'improve', \
+                  'refactor', 'enhance', 'update', 'clean up', 'polish', 'various changes' \
+                  when not followed by a concrete named subject. \
+                  (5) Produce 3 to 6 bullets for multi-file diffs; 1-2 suffice only for a \
+                  single-file change. \
+                  (6) Do not use Conventional Commits format, types, scopes, or code fences. \
+                  Lead each bullet with `- `.";
 
     let user = format!(
-        "{conventions_block}{signals_block}\n\
-         Using the signals above as hints, write 1-3 bullets describing what this diff does. \
-         Then STOP.\n\nDiff:\n\n{trimmed_diff}"
+        "{conventions_block}{signals_block}{segmentation_block}{per_file_block}\n\
+         Using the signals above, list EVERY distinct concern this diff addresses — one \
+         bullet per concern, reference specific symbols from NEW PUBLIC SYMBOLS / \
+         PER-FILE CHANGES. Then STOP.\n\nDiff:\n\n{trimmed_diff}"
     );
 
     let req = CompletionRequest {
@@ -594,7 +687,9 @@ async fn extract_intent_bullets(
             role: Role::User,
             content: user,
         }],
-        max_tokens: 200,
+        // Room for up to ~6 bullets of concrete prose. Past this the
+        // model starts inventing concerns rather than summarising.
+        max_tokens: 400,
         temperature: 0.2,
         // Intent extraction is free-form — grammars would fight us.
         grammar: None,
@@ -643,7 +738,12 @@ fn tidy_bullets(raw: &str) -> String {
             rest.to_string()
         } else if let Some(rest) = t.strip_prefix("* ") {
             rest.to_string()
-        } else if t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        } else if t
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             // "1. …" / "1) …" numbered output → drop the numeric prefix.
             let after_digits: String = t.chars().skip_while(|c| c.is_ascii_digit()).collect();
             after_digits
@@ -653,7 +753,10 @@ fn tidy_bullets(raw: &str) -> String {
             continue;
         };
         out.push(format!("- {}", content.trim()));
-        if out.len() >= 3 {
+        // Up to 6 bullets — wide enough for a multi-concern commit
+        // (which is why Phase 1's system prompt now explicitly asks
+        // for "3 to 6 bullets for multi-file diffs").
+        if out.len() >= 6 {
             break;
         }
     }
@@ -783,9 +886,8 @@ fn try_parse_header(line: &str) -> Option<ParsedHeader> {
 /// whitespace that `normalize_scope` then collapses.
 fn raw_scope_recognisable(s: &str) -> bool {
     !s.is_empty()
-        && s.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ',' | '/' | ' ' | '\t')
-        })
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ',' | '/' | ' ' | '\t'))
 }
 
 /// Collapse a tolerated raw scope into the canonical single-token
@@ -868,11 +970,11 @@ mod tests {
             eprintln!("HARNESS_PROBE not set; skipping.");
             return;
         }
-        let endpoint_url = std::env::var("HARNESS_ENDPOINT")
-            .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into());
+        let endpoint_url =
+            std::env::var("HARNESS_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into());
         let model = std::env::var("HARNESS_MODEL").unwrap_or_else(|_| "qwen3.5-2b".into());
-        let diff_file = std::env::var("HARNESS_DIFF_FILE")
-            .unwrap_or_else(|_| "/tmp/mergefox_diff.txt".into());
+        let diff_file =
+            std::env::var("HARNESS_DIFF_FILE").unwrap_or_else(|_| "/tmp/mergefox_diff.txt".into());
         let repo_path = std::env::var("HARNESS_REPO_PATH").ok();
 
         let diff = std::fs::read_to_string(&diff_file)
@@ -933,7 +1035,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn parses_plain_header() {
         let r = parse_commit_message("feat(ui): add dark mode toggle").unwrap();
@@ -966,8 +1067,7 @@ mod tests {
         // Real failure seen in the wild — the AI emitted a comma-
         // separated scope. Parser takes the first segment, drops the
         // rest, and rebuilds a canonical title.
-        let r = parse_commit_message("feat(app, clone): add upstream identity selection")
-            .unwrap();
+        let r = parse_commit_message("feat(app, clone): add upstream identity selection").unwrap();
         assert_eq!(r.commit_type, "feat");
         assert_eq!(r.scope.as_deref(), Some("app"));
         assert_eq!(r.title, "feat(app): add upstream identity selection");

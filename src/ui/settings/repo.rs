@@ -335,10 +335,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
                 if packs == 1 { "" } else { "s" }
             ));
             if summary.suggests_repack() {
-                ui.colored_label(
-                    Color32::from_rgb(240, 180, 96),
-                    labels.repack_recommended,
-                );
+                ui.colored_label(Color32::from_rgb(240, 180, 96), labels.repack_recommended);
             }
             ui.add_space(4.0);
         }
@@ -387,10 +384,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
         }
         if let Some(status) = modal.sparse_checkout.clone() {
             if status.enabled && !status.cone {
-                ui.colored_label(
-                    Color32::from_rgb(240, 180, 96),
-                    labels.sparse_classic_mode,
-                );
+                ui.colored_label(Color32::from_rgb(240, 180, 96), labels.sparse_classic_mode);
                 ui.weak(labels.sparse_classic_hint);
                 for p in &status.patterns {
                     ui.label(egui::RichText::new(p).monospace());
@@ -454,22 +448,18 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&sm.path).strong().monospace());
                             let (badge_color, badge_text) = match sm.state {
-                                SubmoduleState::InSync => (
-                                    Color32::from_rgb(116, 192, 136),
-                                    labels.submodule_in_sync,
-                                ),
-                                SubmoduleState::NotInitialised => (
-                                    Color32::from_rgb(148, 170, 210),
-                                    labels.submodule_not_init,
-                                ),
-                                SubmoduleState::Modified => (
-                                    Color32::from_rgb(240, 180, 96),
-                                    labels.submodule_modified,
-                                ),
-                                SubmoduleState::Conflict => (
-                                    Color32::from_rgb(235, 108, 108),
-                                    labels.submodule_conflict,
-                                ),
+                                SubmoduleState::InSync => {
+                                    (Color32::from_rgb(116, 192, 136), labels.submodule_in_sync)
+                                }
+                                SubmoduleState::NotInitialised => {
+                                    (Color32::from_rgb(148, 170, 210), labels.submodule_not_init)
+                                }
+                                SubmoduleState::Modified => {
+                                    (Color32::from_rgb(240, 180, 96), labels.submodule_modified)
+                                }
+                                SubmoduleState::Conflict => {
+                                    (Color32::from_rgb(235, 108, 108), labels.submodule_conflict)
+                                }
                             };
                             ui.colored_label(badge_color, badge_text);
                         });
@@ -653,8 +643,7 @@ fn refresh_sparse_checkout(app: &mut MergeFoxApp) {
 }
 
 fn apply_sparse_checkout(app: &mut MergeFoxApp, patterns: Vec<String>, labels: &Labels) {
-    let result =
-        with_settings_repo(app, |repo| repo.sparse_checkout_enable_cone(&patterns));
+    let result = with_settings_repo(app, |repo| repo.sparse_checkout_enable_cone(&patterns));
     match result {
         Ok(()) => {
             app.notify_ok(labels.sparse_applied);
@@ -1021,7 +1010,7 @@ fn labels(lang: UiLanguage) -> Labels {
             remote_name: "원격 이름",
             add_remote_button: "추가",
             provider_account: "Push/Pull 계정",
-            provider_account_hint: "이 저장소에서 push/pull/fetch 시 사용할 계정입니다. 여러 GitHub 계정이 있을 때 유용합니다.",
+            provider_account_hint: "이 저장소에서 push/pull/fetch 시 사용할 계정입니다. HTTPS는 저장된 토큰을, SSH remote는 그 계정에 바인딩된 SSH 키를 사용합니다.",
             auto_account: "(원격 URL에서 자동 감지)",
             saved_prefs: "저장소 기본값을 저장했습니다",
             updated_remote: "원격 URL을 업데이트했습니다",
@@ -1030,14 +1019,14 @@ fn labels(lang: UiLanguage) -> Labels {
             rename_to: "새 이름",
             rename_remote: "이름 변경",
             renamed_remote: "원격 이름을 변경했습니다",
-            worktrees: "워크트리",
-            no_worktrees: "연결된 워크트리가 없습니다.\n워크트리는 같은 저장소에서 여러 브랜치를 동시에 체크아웃할 수 있게 해줍니다. 터미널에서 `git worktree add <경로> <브랜치>`로 추가할 수 있습니다.",
-            main_badge: "메인",
-            locked_badge: "잠금",
-            prunable_badge: "정리 대상",
-            remove_worktree: "삭제",
-            remove_worktree_force: "강제 삭제",
-            removed_worktree: "워크트리를 삭제했습니다",
+            worktrees: "Worktrees",
+            no_worktrees: "No linked worktrees.\nWorktrees let you have multiple branches checked out at once from the same repo. Add one from a terminal: `git worktree add <path> <branch>`.",
+            main_badge: "main",
+            locked_badge: "locked",
+            prunable_badge: "prunable",
+            remove_worktree: "Remove",
+            remove_worktree_force: "Force remove",
+            removed_worktree: "Removed worktree",
             loading: "불러오는 중…",
             maintenance: "유지보수",
             repack_recommended: "⚠ 느슨한 객체가 많습니다 — repack을 권장합니다.",
@@ -1110,7 +1099,7 @@ fn labels(lang: UiLanguage) -> Labels {
             remote_name: "Remote name",
             add_remote_button: "Add",
             provider_account: "Push/Pull account",
-            provider_account_hint: "Which connected account to use for push/pull/fetch on this repo. Useful when you have multiple GitHub accounts (personal + work).",
+            provider_account_hint: "Which connected account to use for push/pull/fetch on this repo. HTTPS uses that account's stored token; SSH remotes use the SSH key bound to that account.",
             auto_account: "(auto-detect from remote URL)",
             saved_prefs: "Saved repository defaults",
             updated_remote: "Updated remote URLs",

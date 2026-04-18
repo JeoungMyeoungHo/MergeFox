@@ -95,16 +95,8 @@ enum Intent {
     Reset,
 }
 
-fn render_start_form(
-    ui: &mut egui::Ui,
-    state: &mut BisectUiState,
-    intent: &mut Option<Intent>,
-) {
-    ui.label(
-        RichText::new("Start a bisect")
-            .strong()
-            .size(14.0),
-    );
+fn render_start_form(ui: &mut egui::Ui, state: &mut BisectUiState, intent: &mut Option<Intent>) {
+    ui.label(RichText::new("Start a bisect").strong().size(14.0));
     ui.weak(
         "Mark a known-broken commit as `bad` and a known-working commit as `good`. \
          Git will narrow the range by checking out the midpoint for each round.",
@@ -143,10 +135,7 @@ fn render_active(ui: &mut egui::Ui, state: &BisectUiState, intent: &mut Option<I
                 Color32::from_rgb(235, 108, 108),
                 RichText::new(format!(
                     "First bad commit: {}",
-                    status
-                        .conclusion_sha
-                        .as_deref()
-                        .unwrap_or("(unknown SHA)")
+                    status.conclusion_sha.as_deref().unwrap_or("(unknown SHA)")
                 ))
                 .strong()
                 .size(13.0),
@@ -202,7 +191,11 @@ fn run(app: &mut MergeFoxApp, action: Intent) {
         let repo = &tabs.current().repo;
         match action {
             Intent::Start { bad, good } => {
-                let b = if bad.is_empty() { None } else { Some(bad.as_str()) };
+                let b = if bad.is_empty() {
+                    None
+                } else {
+                    Some(bad.as_str())
+                };
                 let g = Some(good.as_str());
                 repo.bisect_start(b, g)
             }
@@ -218,7 +211,7 @@ fn run(app: &mut MergeFoxApp, action: Intent) {
                 tracing::info!(target: "mergefox::bisect", output = %output);
             }
             app.bisect_ui.status = None; // force refresh
-            // HEAD likely moved — rebuild the graph so the user sees it.
+                                         // HEAD likely moved — rebuild the graph so the user sees it.
             if let View::Workspace(tabs) = &app.view {
                 let scope = tabs.current().graph_scope;
                 app.rebuild_graph(scope);

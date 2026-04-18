@@ -492,11 +492,15 @@ impl Config {
     }
 
     pub fn upsert_provider_account(&mut self, account: crate::providers::ProviderAccount) {
+        let mut account = account;
         if let Some(existing) = self
             .provider_accounts
             .iter_mut()
             .find(|existing| existing.id == account.id)
         {
+            if account.ssh_key_path.is_none() {
+                account.ssh_key_path = existing.ssh_key_path.clone();
+            }
             *existing = account;
         } else {
             self.provider_accounts.push(account);

@@ -288,8 +288,10 @@ fn branch_row(
                                 ));
                             }
                             for (text, color) in parts {
-                                ui.label(egui::RichText::new(text).color(color).small().monospace())
-                                    .on_hover_text(ahead_behind_tooltip(ahead, behind));
+                                ui.label(
+                                    egui::RichText::new(text).color(color).small().monospace(),
+                                )
+                                .on_hover_text(ahead_behind_tooltip(ahead, behind));
                             }
                         }
                     }

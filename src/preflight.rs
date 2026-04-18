@@ -98,9 +98,8 @@ pub fn hard_reset(repo_path: &Path, branch: &str, target: Oid) -> PreflightInfo 
     info
 }
 
-/// Delete-branch preview. Reports unmerged commit count — git won't let a
-/// plain `-d` delete an unmerged branch, but `-D` (which mergefox uses)
-/// forces it. We want users to know what's being forced.
+/// Delete-branch preview. Reports unmerged commit count so the user can
+/// decide between safe delete (`git branch -d`) and force delete (`-D`).
 pub fn delete_branch(repo_path: &Path, name: &str, is_remote: bool) -> PreflightInfo {
     let mut info = PreflightInfo::default();
     if is_remote {
@@ -135,6 +134,10 @@ pub fn delete_branch(repo_path: &Path, name: &str, is_remote: bool) -> Preflight
                     "{n} commit{} exist only on `{name}` — they become unreachable once deleted.",
                     if n == 1 { "" } else { "s" }
                 ),
+            );
+            info.push(
+                Severity::Warning,
+                "Delete safely will refuse this branch until it is merged; force delete removes the ref anyway.",
             );
         } else {
             info.push(

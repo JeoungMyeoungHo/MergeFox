@@ -152,7 +152,11 @@ impl ChangeSignals {
             "- New public API surface: {} ({} new symbol{})",
             yn(self.new_public_api),
             self.new_public_symbols.len(),
-            if self.new_public_symbols.len() == 1 { "" } else { "s" }
+            if self.new_public_symbols.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         );
         if !self.new_public_symbols.is_empty() {
             let sample: Vec<&str> = self
@@ -169,13 +173,13 @@ impl ChangeSignals {
             "- Bug/error context (fix-like): {}",
             yn(self.bug_error_context)
         );
+        let _ = writeln!(out, "- Documentation/comments only: {}", yn(self.docs_only));
+        let _ = writeln!(out, "- Test-only change: {}", yn(self.tests_only));
         let _ = writeln!(
             out,
-            "- Documentation/comments only: {}",
-            yn(self.docs_only)
+            "- Refactor-like (rename/reorganise): {}",
+            yn(self.refactor_like)
         );
-        let _ = writeln!(out, "- Test-only change: {}", yn(self.tests_only));
-        let _ = writeln!(out, "- Refactor-like (rename/reorganise): {}", yn(self.refactor_like));
 
         if let Some(module) = &self.dominant_module {
             let _ = writeln!(out, "- Dominant module: {module}");
@@ -195,32 +199,133 @@ impl ChangeSignals {
             "- Touched files ({}): {}{}",
             self.files.len(),
             paths.join(", "),
-            if self.files.len() > paths.len() { ", …" } else { "" }
+            if self.files.len() > paths.len() {
+                ", …"
+            } else {
+                ""
+            }
         );
 
         let _ = writeln!(out, "- Suggested type: {}", self.suggested_type());
 
-        if let Some(advice) = &self.segmentation_advice {
+        out
+    }
+
+    /// Render a deterministic per-file changelog block — one line per
+    /// file, including line counts, new-file flag, and the exact public
+    /// symbols that file contributed. The model is told to produce one
+    /// bullet per DISTINCT concern; giving it this list forces it to
+    /// actually enumerate every file's story rather than picking a
+    /// handful based on which hunks happened to survive summarisation.
+    ///
+    /// Output shape:
+    /// ```text
+    /// PER-FILE CHANGES:
+    /// - src/ai/repo_conventions.rs [NEW +441/-0]: pub: RepoConventions, load, …
+    /// - src/ai/tasks/commit_message.rs [+395/-52]: pub: (none)
+    /// - src/config.rs [+5/-0]: pub: diagnose_load
+    /// ```
+    pub fn render_per_file_changes(&self) -> String {
+        use std::fmt::Write;
+
+        // Group each file's contributed pub symbols by its path, keyed
+        // by the same `short_module(path)` qualifier `collect_new_public_symbols`
+        // emits so we can reunite them here.
+        let mut per_file_syms: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for sym in &self.new_public_symbols {
+            let (module_tag, name) = match sym.split_once("::") {
+                Some(p) => p,
+                None => continue,
+            };
+            per_file_syms
+                .entry(module_tag.to_string())
+                .or_default()
+                .push(name.to_string());
+        }
+
+        // Cap rendered rows so a big diff doesn't eat the whole
+        // prompt budget. Prioritise (a) files that add public API
+        // and (b) new files; everything else rolls into a
+        // final `+N more` summary so the model still sees the count.
+        const MAX_ROWS: usize = 14;
+        let mut ranked: Vec<&FileChange> = self.files.iter().collect();
+        ranked.sort_by_key(|f| {
+            let tag = short_module(&f.path);
+            let has_new_sym = per_file_syms.get(&tag).is_some_and(|v| !v.is_empty());
+            match (has_new_sym, f.is_new) {
+                (true, _) => 0,
+                (false, true) => 1,
+                (false, false) => 2,
+            }
+        });
+
+        let mut out = String::new();
+        out.push_str("PER-FILE CHANGES:\n");
+        for file in ranked.iter().take(MAX_ROWS) {
+            let added_count = file
+                .added
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .count();
+            let removed_count = file
+                .removed
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .count();
+
+            let flags: String = if file.is_new {
+                format!("NEW +{added_count}/-{removed_count}")
+            } else if file.is_deleted {
+                format!("DELETED +{added_count}/-{removed_count}")
+            } else {
+                format!("+{added_count}/-{removed_count}")
+            };
+
+            let tag = short_module(&file.path);
+            let syms = per_file_syms.get(&tag);
+            let sym_part = match syms {
+                Some(list) if !list.is_empty() => {
+                    let shown: Vec<&str> =
+                        list.iter().take(6).map(String::as_str).collect();
+                    let more = if list.len() > shown.len() {
+                        format!(", +{} more", list.len() - shown.len())
+                    } else {
+                        String::new()
+                    };
+                    format!("pub: {}{}", shown.join(", "), more)
+                }
+                _ => "pub: (none)".to_string(),
+            };
+
+            let _ = writeln!(out, "- {} [{}]: {}", file.path, flags, sym_part);
+        }
+        if ranked.len() > MAX_ROWS {
             let _ = writeln!(
                 out,
-                "- WARNING — multi-concern diff: {}",
-                advice.reason
+                "- (+{} more files not listed individually)",
+                ranked.len() - MAX_ROWS
             );
+        }
+        out
+    }
+
+    /// Compatibility shim kept to preserve the original `render_for_prompt`
+    /// shape when callers want the combined block. Currently only used
+    /// by tests — production callers render the two blocks separately
+    /// so the prompt can order them however it likes.
+    pub fn render_segmentation_tail(&self) -> String {
+        let mut out = String::new();
+        if let Some(advice) = &self.segmentation_advice {
+            use std::fmt::Write;
+            let _ = writeln!(out, "- WARNING — multi-concern diff: {}", advice.reason);
             for g in &advice.groups {
-                let sample: Vec<&str> =
-                    g.paths.iter().take(4).map(String::as_str).collect();
+                let sample: Vec<&str> = g.paths.iter().take(4).map(String::as_str).collect();
                 let more = if g.paths.len() > sample.len() {
                     format!(", (+{} more)", g.paths.len() - sample.len())
                 } else {
                     String::new()
                 };
-                let _ = writeln!(
-                    out,
-                    "    [{}] {}{}",
-                    g.label,
-                    sample.join(", "),
-                    more
-                );
+                let _ = writeln!(out, "    [{}] {}{}", g.label, sample.join(", "), more);
             }
             let _ = writeln!(
                 out,
@@ -233,7 +338,11 @@ impl ChangeSignals {
 }
 
 fn yn(b: bool) -> &'static str {
-    if b { "YES" } else { "NO" }
+    if b {
+        "YES"
+    } else {
+        "NO"
+    }
 }
 
 /// Entry point: parse a unified diff and compute all signals.
@@ -257,12 +366,8 @@ pub fn analyze(diff: &str) -> ChangeSignals {
     );
     let intent_hint = extract_intent_hint(&files);
     let dominant_module = compute_dominant_module(&files);
-    let segmentation_advice = compute_segmentation_advice(
-        &files,
-        &new_public_symbols,
-        docs_only,
-        tests_only,
-    );
+    let segmentation_advice =
+        compute_segmentation_advice(&files, &new_public_symbols, docs_only, tests_only);
 
     ChangeSignals {
         new_public_api: !new_public_symbols.is_empty(),
@@ -361,7 +466,10 @@ fn is_test_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let segments: Vec<&str> = lower.split('/').collect();
 
-    if segments.iter().any(|s| matches!(*s, "tests" | "test" | "__tests__" | "spec" | "specs")) {
+    if segments
+        .iter()
+        .any(|s| matches!(*s, "tests" | "test" | "__tests__" | "spec" | "specs"))
+    {
         return true;
     }
     let file = segments.last().copied().unwrap_or("");
@@ -499,7 +607,9 @@ fn extract_pub_symbol(raw: &str) -> Option<String> {
     // surface within the crate. Strip the visibility qualifier.
     let rest = strip_pub_prefix(line)?;
     // Kinds that introduce a named item. Excludes `use`.
-    for kw in ["fn ", "struct ", "enum ", "trait ", "mod ", "const ", "static ", "type "] {
+    for kw in [
+        "fn ", "struct ", "enum ", "trait ", "mod ", "const ", "static ", "type ",
+    ] {
         if let Some(after) = rest.strip_prefix(kw) {
             let name: String = after
                 .chars()
@@ -572,8 +682,8 @@ fn line_is_behavioural(line: &str) -> bool {
 
     // Rust / general control flow tokens.
     const FLOW_TOKENS: &[&str] = &[
-        "if ", "else", "match ", "for ", "while ", "loop", "return",
-        "break", "continue", "await", "?", "yield", "throw",
+        "if ", "else", "match ", "for ", "while ", "loop", "return", "break", "continue", "await",
+        "?", "yield", "throw",
     ];
     if FLOW_TOKENS.iter().any(|tok| trimmed.contains(tok)) {
         return true;
@@ -583,11 +693,29 @@ fn line_is_behavioural(line: &str) -> bool {
     // to miss some; a false negative here just fails to flip the
     // signal, it doesn't corrupt the prompt.
     const SIDE_EFFECT: &[&str] = &[
-        "panic!", "unreachable!", "todo!", "unimplemented!",
-        "bail!", "ensure!", ".expect(", ".unwrap(", ".unwrap_or",
-        ".map_err", ".ok_or", "Err(", "Some(", "None",
-        "Command::", "spawn(", "send(", "write!", "writeln!", "println!",
-        "fs::", "std::thread", "std::sync",
+        "panic!",
+        "unreachable!",
+        "todo!",
+        "unimplemented!",
+        "bail!",
+        "ensure!",
+        ".expect(",
+        ".unwrap(",
+        ".unwrap_or",
+        ".map_err",
+        ".ok_or",
+        "Err(",
+        "Some(",
+        "None",
+        "Command::",
+        "spawn(",
+        "send(",
+        "write!",
+        "writeln!",
+        "println!",
+        "fs::",
+        "std::thread",
+        "std::sync",
     ];
     if SIDE_EFFECT.iter().any(|tok| trimmed.contains(tok)) {
         return true;
@@ -624,7 +752,11 @@ fn compute_behavior_change(files: &[FileChange]) -> bool {
             continue;
         }
         let added = file.added.iter().filter(|l| line_is_behavioural(l)).count() as i64;
-        let removed = file.removed.iter().filter(|l| line_is_behavioural(l)).count() as i64;
+        let removed = file
+            .removed
+            .iter()
+            .filter(|l| line_is_behavioural(l))
+            .count() as i64;
         if file.is_new {
             net += added;
         } else {
@@ -650,9 +782,18 @@ fn compute_bug_error_context(files: &[FileChange]) -> bool {
     //     identifier names or log messages. Weaker signal; we need
     //     multiple hits or corroborating error-path growth.
     const CODE_KEYWORDS: &[&str] = &[
-        "fixes #", "fix #", "bugfix", "regression in ", "panicked",
-        "off-by-one", "race condition in ", "deadlock in ", "crash when ",
-        "segfault", "use-after-free", "double free",
+        "fixes #",
+        "fix #",
+        "bugfix",
+        "regression in ",
+        "panicked",
+        "off-by-one",
+        "race condition in ",
+        "deadlock in ",
+        "crash when ",
+        "segfault",
+        "use-after-free",
+        "double free",
     ];
 
     let mut inline_annotations = 0usize;
@@ -711,7 +852,10 @@ fn compute_bug_error_context(files: &[FileChange]) -> bool {
             .iter()
             .filter(|l| {
                 let t = l.trim_start();
-                t.starts_with("Err(") || t.starts_with("return Err(") || t.contains("bail!(") || t.contains("anyhow!(")
+                t.starts_with("Err(")
+                    || t.starts_with("return Err(")
+                    || t.contains("bail!(")
+                    || t.contains("anyhow!(")
             })
             .count() as i64;
         let removed_err_sites = file
@@ -774,7 +918,9 @@ fn strip_string_literals(line: &str) -> String {
 fn is_inline_fix_annotation(trimmed: &str) -> bool {
     let stripped = match () {
         _ if trimmed.starts_with("//") => trimmed.trim_start_matches('/'),
-        _ if trimmed.starts_with('#') && !trimmed.starts_with("#[") => trimmed.trim_start_matches('#'),
+        _ if trimmed.starts_with('#') && !trimmed.starts_with("#[") => {
+            trimmed.trim_start_matches('#')
+        }
         _ => return false,
     };
     let s = stripped.trim_start().to_ascii_lowercase();

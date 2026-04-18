@@ -329,8 +329,7 @@ fn destructive_allowed() -> bool {
 
 fn action_execute_tool(repo_path: &Path, arguments: Value) -> Result<Value> {
     use crate::mcp::action_preview::ActionRisk;
-    let action: ActionRequest =
-        serde_json::from_value(arguments).context("action execute args")?;
+    let action: ActionRequest = serde_json::from_value(arguments).context("action execute args")?;
     let preview_info = preview(repo_path, action.clone())?;
 
     let tier = auto_approve_tier();
@@ -352,8 +351,10 @@ fn action_execute_tool(repo_path: &Path, arguments: Value) -> Result<Value> {
                 "This server is preview-only. Set `MERGEFOX_MCP_AUTO_APPROVE=safe` (or \
                  `recoverable` / `all`) in the client config to opt into execution."
             }
-            _ => "Risk tier exceeds the configured auto-approve level. Raise it via \
-                  `MERGEFOX_MCP_AUTO_APPROVE=recoverable` or `all`.",
+            _ => {
+                "Risk tier exceeds the configured auto-approve level. Raise it via \
+                  `MERGEFOX_MCP_AUTO_APPROVE=recoverable` or `all`."
+            }
         };
         return Ok(tool_result(json!({
             "executed": false,

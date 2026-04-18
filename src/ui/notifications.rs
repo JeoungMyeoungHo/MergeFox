@@ -179,15 +179,10 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     if alpha == 0 {
                         continue;
                     }
-                    let bg = visuals
-                        .window_fill()
-                        .gamma_multiply(alpha as f32 / 255.0);
+                    let bg = visuals.window_fill().gamma_multiply(alpha as f32 / 255.0);
                     let stroke = Stroke::new(
                         1.0,
-                        notif
-                            .severity
-                            .accent()
-                            .gamma_multiply(alpha as f32 / 255.0),
+                        notif.severity.accent().gamma_multiply(alpha as f32 / 255.0),
                     );
                     egui::Frame::window(ui.style())
                         .fill(bg)
@@ -275,11 +270,7 @@ impl MergeFoxApp {
     pub fn notify_err(&mut self, msg: impl Into<String>) {
         self.notifications.push(NotifSeverity::Error, msg);
     }
-    pub fn notify_err_with_detail(
-        &mut self,
-        msg: impl Into<String>,
-        detail: impl Into<String>,
-    ) {
+    pub fn notify_err_with_detail(&mut self, msg: impl Into<String>, detail: impl Into<String>) {
         self.notifications
             .push_with_detail(NotifSeverity::Error, msg, Some(detail.into()));
     }

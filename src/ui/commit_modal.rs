@@ -845,10 +845,55 @@ fn poll_ai_task(app: &mut MergeFoxApp) {
             modal.ai_advice = sugg.segmentation_advice.as_ref().map(format_advice);
         }
         Err(e) => {
-            modal.ai_error = Some(format!("{e}"));
+            modal.ai_error = Some(format_ai_error(&e));
             modal.ai_advice = None;
         }
     }
+}
+
+/// Humanise an AI error. The most actionable case is
+/// `ContextOverflow` — when the diff + overhead wouldn't fit inside
+/// the endpoint's configured context window, we tell the user exactly
+/// how much room is needed and where to change it, instead of showing
+/// the raw `context overflow: used X, budget Y` text.
+fn format_ai_error(e: &crate::ai::AiError) -> String {
+    use crate::ai::AiError;
+    match e {
+        AiError::ContextOverflow { used, budget } if *used > 0 => {
+            let recommended = round_up_to_context_size(*used);
+            format!(
+                "diff too large for this model's context ({used} tokens needed, \
+                 {budget} available). Raise the endpoint's Context window to at \
+                 least {recommended} in Settings → AI, or reload the model with \
+                 a larger context."
+            )
+        }
+        AiError::ContextOverflow { .. } => {
+            // `used`/`budget` unknown — the endpoint rejected the
+            // prompt mid-call (e.g. LM Studio's "tokens to keep from
+            // the initial prompt is greater than the context length").
+            // No precise number to recommend; nudge the user generically.
+            "diff too large for this model's context. Raise the endpoint's \
+             Context window in Settings → AI (try 8192 or 16384) or reload \
+             the model with a larger context."
+                .to_string()
+        }
+        _ => format!("{e}"),
+    }
+}
+
+/// Snap an estimated "needed" token count to the next common context
+/// size (4K / 8K / 16K / 32K / 64K / 128K) so our recommendation lines
+/// up with the dropdown / model-load presets users typically see.
+fn round_up_to_context_size(needed: u32) -> u32 {
+    for size in [4096, 8192, 16384, 32768, 65536, 131072] {
+        if size >= needed {
+            return size;
+        }
+    }
+    // Past 128K — just round up to the next 64K boundary.
+    let step = 65536;
+    (needed + step - 1) / step * step
 }
 
 fn format_advice(advice: &crate::ai::change_signals::SegmentationAdvice) -> String {

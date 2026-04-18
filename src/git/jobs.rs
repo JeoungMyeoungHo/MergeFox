@@ -87,6 +87,7 @@ pub enum GitJobKind {
         /// `-c credential.helper=!…` so git doesn't try to read a
         /// username from a TTY that doesn't exist.
         credentials: Option<HttpsCredentials>,
+        ssh_key_path: Option<PathBuf>,
     },
     Push {
         remote: String,
@@ -95,12 +96,14 @@ pub enum GitJobKind {
         force: bool,
         set_upstream: bool,
         credentials: Option<HttpsCredentials>,
+        ssh_key_path: Option<PathBuf>,
     },
     Pull {
         remote: String,
         branch: String,
         strategy: PullStrategy,
         credentials: Option<HttpsCredentials>,
+        ssh_key_path: Option<PathBuf>,
     },
     /// Push one or more tags. Separate from `Push` because tag push
     /// has different semantics (no upstream, no force-with-lease
@@ -111,6 +114,7 @@ pub enum GitJobKind {
         tags: Vec<String>,
         all: bool,
         credentials: Option<HttpsCredentials>,
+        ssh_key_path: Option<PathBuf>,
     },
 }
 
@@ -248,10 +252,12 @@ fn run_job(
         GitJobKind::Fetch {
             remote,
             credentials,
+            ssh_key_path,
         } => do_fetch(
             path,
             &remote,
             credentials.as_ref(),
+            ssh_key_path.as_deref(),
             progress,
             cancel_requested.as_ref(),
         ),
@@ -261,6 +267,7 @@ fn run_job(
             force,
             set_upstream,
             credentials,
+            ssh_key_path,
         } => do_push(
             path,
             &remote,
@@ -268,6 +275,7 @@ fn run_job(
             force,
             set_upstream,
             credentials.as_ref(),
+            ssh_key_path.as_deref(),
             progress,
             cancel_requested.as_ref(),
         ),
@@ -276,12 +284,14 @@ fn run_job(
             branch,
             strategy,
             credentials,
+            ssh_key_path,
         } => do_pull(
             path,
             &remote,
             &branch,
             strategy,
             credentials.as_ref(),
+            ssh_key_path.as_deref(),
             progress,
             cancel_requested.as_ref(),
         ),
@@ -290,12 +300,14 @@ fn run_job(
             tags,
             all,
             credentials,
+            ssh_key_path,
         } => do_push_tag(
             path,
             &remote,
             &tags,
             all,
             credentials.as_ref(),
+            ssh_key_path.as_deref(),
             progress,
             cancel_requested.as_ref(),
         ),
@@ -319,6 +331,7 @@ const INLINE_CRED_HELPER: &str =
 fn build_cmd_with_creds(
     path: &std::path::Path,
     creds: Option<&HttpsCredentials>,
+    ssh_key_path: Option<&std::path::Path>,
 ) -> super::cli::GitCommand {
     let mut cmd = super::cli::GitCommand::new(path);
     if let Some(c) = creds {
@@ -341,18 +354,48 @@ fn build_cmd_with_creds(
             .env("MERGEFOX_HTTP_USER", &c.username)
             .env("MERGEFOX_HTTP_PASS", &c.password);
     }
+    if let Some(path) = ssh_key_path {
+        cmd = cmd
+            .arg("-c")
+            .arg(format!("core.sshCommand={}", ssh_command_for_key(path)));
+    }
     cmd
+}
+
+fn ssh_command_for_key(path: &std::path::Path) -> String {
+    [
+        "ssh".to_string(),
+        "-i".to_string(),
+        path.to_string_lossy().into_owned(),
+        "-o".to_string(),
+        "IdentitiesOnly=yes".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+    ]
+    .into_iter()
+    .map(|arg| posix_shell_quote(&arg))
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+fn posix_shell_quote(arg: &str) -> String {
+    if arg.is_empty() {
+        "''".to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\"'\"'"))
+    }
 }
 
 fn do_fetch(
     path: &std::path::Path,
     remote_name: &str,
     credentials: Option<&HttpsCredentials>,
+    ssh_key_path: Option<&std::path::Path>,
     progress: Arc<Mutex<JobProgress>>,
     cancel_requested: &AtomicBool,
 ) -> Result<()> {
     mark(&progress, "fetching");
-    build_cmd_with_creds(path, credentials)
+    build_cmd_with_creds(path, credentials, ssh_key_path)
         .args(["fetch", "--prune", remote_name])
         .run_with_control(Some(cancel_requested), Some(git_job_timeout()))?;
     mark(&progress, "done");
@@ -366,6 +409,7 @@ fn do_push(
     force: bool,
     set_upstream: bool,
     credentials: Option<&HttpsCredentials>,
+    ssh_key_path: Option<&std::path::Path>,
     progress: Arc<Mutex<JobProgress>>,
     cancel_requested: &AtomicBool,
 ) -> Result<()> {
@@ -379,7 +423,7 @@ fn do_push(
     } else {
         refspec.to_owned()
     };
-    let mut cmd = build_cmd_with_creds(path, credentials);
+    let mut cmd = build_cmd_with_creds(path, credentials, ssh_key_path);
     cmd = cmd.arg("push");
     if set_upstream {
         cmd = cmd.arg("-u");
@@ -394,7 +438,7 @@ fn do_push(
             .and_then(|target| target.strip_prefix("refs/heads/"))
             .unwrap_or_default();
         if !branch.is_empty() {
-            build_cmd_with_creds(path, credentials)
+            build_cmd_with_creds(path, credentials, ssh_key_path)
                 .args(["fetch", remote_name, branch])
                 .run_with_control(Some(cancel_requested), Some(git_job_timeout()))?;
         }
@@ -413,11 +457,12 @@ fn do_push_tag(
     tags: &[String],
     all: bool,
     credentials: Option<&HttpsCredentials>,
+    ssh_key_path: Option<&std::path::Path>,
     progress: Arc<Mutex<JobProgress>>,
     cancel_requested: &AtomicBool,
 ) -> Result<()> {
     mark(&progress, "pushing tags");
-    let mut cmd = build_cmd_with_creds(path, credentials);
+    let mut cmd = build_cmd_with_creds(path, credentials, ssh_key_path);
     cmd = cmd.arg("push").arg(remote_name);
     if all {
         cmd = cmd.arg("--tags");
@@ -442,6 +487,7 @@ fn do_pull(
     branch: &str,
     strategy: PullStrategy,
     credentials: Option<&HttpsCredentials>,
+    ssh_key_path: Option<&std::path::Path>,
     progress: Arc<Mutex<JobProgress>>,
     cancel_requested: &AtomicBool,
 ) -> Result<()> {
@@ -450,7 +496,7 @@ fn do_pull(
     check_repo_not_locked(path)?;
     mark(&progress, "fetching");
     // First fetch so we have the latest remote state.
-    build_cmd_with_creds(path, credentials)
+    build_cmd_with_creds(path, credentials, ssh_key_path)
         .args(["fetch", remote_name])
         .run_with_control(Some(cancel_requested), Some(git_job_timeout()))?;
 
@@ -474,5 +520,25 @@ fn do_pull(
 fn mark(p: &Arc<Mutex<JobProgress>>, stage: &str) {
     if let Ok(mut g) = p.lock() {
         g.stage = stage.to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{posix_shell_quote, ssh_command_for_key};
+
+    #[test]
+    fn posix_shell_quote_escapes_single_quotes() {
+        assert_eq!(posix_shell_quote("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    fn ssh_command_for_key_quotes_key_paths() {
+        let cmd = ssh_command_for_key(Path::new("/tmp/key with space"));
+        assert!(cmd.contains("'/tmp/key with space'"));
+        assert!(cmd.contains("'IdentitiesOnly=yes'"));
+        assert!(cmd.contains("'BatchMode=yes'"));
     }
 }

@@ -694,15 +694,26 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
             out.prompt = Some(prompt::delete_branch_confirm(name, is_remote, preflight));
         }
         CommitAction::SetUpstreamPrompt { branch } => {
-            // Pull the remotes from the cached snapshot — no subprocess
-            // on the UI thread. Falls back to an empty list if the
-            // cache hasn't been populated yet, which gates the prompt
-            // into its "add a remote first" empty state.
-            let remotes = ws
+            // Prefer the cached snapshot, but if it is empty/stale
+            // re-read the configured remotes once when the user opens
+            // the prompt so existing upstreams don't collapse into the
+            // "add a remote first" empty state.
+            let mut remotes = ws
                 .repo_ui_cache
                 .as_ref()
                 .map(|c| c.remotes.clone())
                 .unwrap_or_default();
+            if remotes.is_empty() {
+                remotes = ws
+                    .repo
+                    .list_remotes()
+                    .ok()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|remote| remote.fetch_url.is_some() || remote.push_url.is_some())
+                    .map(|remote| remote.name)
+                    .collect();
+            }
             let current_upstream = ws.repo_ui_cache.as_ref().and_then(|c| {
                 c.branches
                     .iter()
@@ -1074,10 +1085,14 @@ fn run_prompt(app: &mut MergeFoxApp, prompt: PendingPrompt) -> DispatchOutcome {
             }
         }
         PendingPrompt::Confirm { kind, .. } => match kind {
-            crate::ui::prompt::ConfirmKind::DeleteBranch { name, is_remote } => {
+            crate::ui::prompt::ConfirmKind::DeleteBranch {
+                name,
+                is_remote,
+                force,
+            } => {
                 let before = journal::capture(ws.repo.path()).ok();
                 let tip = ws.repo.tip_of(&name, is_remote).ok();
-                match ws.repo.delete_branch(&name, is_remote) {
+                match ws.repo.delete_branch(&name, is_remote, force) {
                     Ok(()) => {
                         if let (Some(b), Ok(a)) = (before, journal::capture(ws.repo.path())) {
                             out.journal_entry = Some((
@@ -1089,10 +1104,16 @@ fn run_prompt(app: &mut MergeFoxApp, prompt: PendingPrompt) -> DispatchOutcome {
                                 a,
                             ));
                         }
-                        out.hud = Some(format!("Deleted branch {name}"));
+                        out.hud = Some(if force {
+                            format!("Force-deleted branch {name}")
+                        } else {
+                            format!("Deleted branch {name}")
+                        });
                         out.rebuild = Some(scope);
                     }
-                    Err(e) => out.error = Some(format!("delete branch: {e:#}")),
+                    Err(e) => {
+                        out.error = Some(format_delete_branch_error(&name, force, &e));
+                    }
                 }
             }
             crate::ui::prompt::ConfirmKind::HardReset { branch, target } => {
@@ -1324,4 +1345,15 @@ fn style_for_working_entry(
         egui::Color32::from_rgba_unmultiplied(base_color.r(), base_color.g(), base_color.b(), 160)
     };
     (color, kind.glyph())
+}
+
+fn format_delete_branch_error(name: &str, force: bool, err: &anyhow::Error) -> String {
+    let raw = format!("{err:#}");
+    let lower = raw.to_ascii_lowercase();
+    if !force && lower.contains("not fully merged") {
+        return format!(
+            "delete branch: `{name}` is not fully merged, so safe delete was refused. Re-run the prompt and choose `Force delete` if you really want to remove it."
+        );
+    }
+    format!("delete branch: {raw}")
 }

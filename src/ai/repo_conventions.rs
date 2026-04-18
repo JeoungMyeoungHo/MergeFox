@@ -91,11 +91,7 @@ impl RepoConventions {
                 .take(10)
                 .map(|s| format!("{} ({}×)", s.scope, s.count))
                 .collect();
-            let _ = writeln!(
-                out,
-                "- Scopes in active use: {}",
-                sample.join(", ")
-            );
+            let _ = writeln!(out, "- Scopes in active use: {}", sample.join(", "));
             let _ = writeln!(
                 out,
                 "  Prefer one of these over inventing a new scope; introduce a new scope \
@@ -156,7 +152,9 @@ fn cache() -> &'static Mutex<HashMap<PathBuf, RepoConventions>> {
 /// conventions change glacially (new scope appears every few dozen
 /// commits) and we're fine showing a slightly stale snapshot.
 pub fn load(repo_path: &Path) -> RepoConventions {
-    let key = repo_path.canonicalize().unwrap_or_else(|_| repo_path.to_path_buf());
+    let key = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
     if let Some(hit) = cache().lock().ok().and_then(|g| g.get(&key).cloned()) {
         return hit;
     }
@@ -386,8 +384,14 @@ mod tests {
 
     #[test]
     fn classify_tense_imperative() {
-        assert_eq!(classify_subject_tense("add dark mode"), SubjectStyle::Imperative);
-        assert_eq!(classify_subject_tense("fix race condition"), SubjectStyle::Imperative);
+        assert_eq!(
+            classify_subject_tense("add dark mode"),
+            SubjectStyle::Imperative
+        );
+        assert_eq!(
+            classify_subject_tense("fix race condition"),
+            SubjectStyle::Imperative
+        );
     }
 
     #[test]
@@ -424,8 +428,14 @@ mod tests {
     fn prompt_block_lists_scopes_and_style() {
         let c = RepoConventions {
             common_scopes: vec![
-                ScopeStat { scope: "git".into(), count: 8 },
-                ScopeStat { scope: "ui".into(), count: 5 },
+                ScopeStat {
+                    scope: "git".into(),
+                    count: 8,
+                },
+                ScopeStat {
+                    scope: "ui".into(),
+                    count: 5,
+                },
             ],
             example_headers: vec!["feat(git): add rebase".into()],
             subject_style: SubjectStyle::Imperative,

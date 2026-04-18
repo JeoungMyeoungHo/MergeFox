@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use gix::ObjectId as Oid;
 
@@ -816,7 +817,9 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
         }
         if ui
             .button("Push ALL tags to remote")
-            .on_hover_text("git push <remote> --tags — uploads every local tag not yet on the remote.")
+            .on_hover_text(
+                "git push <remote> --tags — uploads every local tag not yet on the remote.",
+            )
             .clicked()
         {
             action = Some(CommitAction::PushAllTags);
@@ -1174,11 +1177,37 @@ fn paint_message_cell(ui: &mut Ui, rect: Rect, row: &GraphRow) {
     // had to aim at the empty gap between summary and author to select a
     // commit. These cells should never "own" a click; the whole row is
     // the click target.
-    child.add(
-        egui::Label::new(row.summary.as_ref())
-            .truncate()
-            .selectable(false),
+    let mut job = LayoutJob::default();
+    job.append(
+        row.summary.as_ref(),
+        0.0,
+        TextFormat {
+            font_id: FontId::proportional(14.0),
+            color: child.visuals().text_color(),
+            ..Default::default()
+        },
     );
+    if !row.body_preview.is_empty() {
+        job.append(
+            "  ",
+            0.0,
+            TextFormat {
+                font_id: FontId::proportional(14.0),
+                color: child.visuals().text_color(),
+                ..Default::default()
+            },
+        );
+        job.append(
+            row.body_preview.as_ref(),
+            0.0,
+            TextFormat {
+                font_id: FontId::proportional(13.0),
+                color: child.visuals().weak_text_color(),
+                ..Default::default()
+            },
+        );
+    }
+    child.add(egui::Label::new(job).truncate().selectable(false));
 }
 
 fn paint_author_cell(ui: &mut Ui, rect: Rect, row: &GraphRow) {
@@ -1431,7 +1460,7 @@ fn paint_working_tree_refs_cell(ui: &mut Ui, rect: Rect, summary: &WorkingTreeSu
 
     paint_ref_chip(
         &mut child,
-        "WORKTREE",
+        "CHANGES",
         Color32::from_rgb(98, 124, 186),
         Color32::WHITE,
     );
@@ -1455,7 +1484,7 @@ fn paint_working_tree_message_cell(ui: &mut Ui, rect: Rect, summary: &WorkingTre
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     child.set_clip_rect(rect);
-    child.add(egui::Label::new(egui::RichText::new("Working tree").strong()).selectable(false));
+    child.add(egui::Label::new(egui::RichText::new("Changes").strong()).selectable(false));
     child.add_space(8.0);
     child.add(
         egui::Label::new(egui::RichText::new(summary.message()).weak())

@@ -117,7 +117,13 @@ pub fn summarize_for_prompt(diff: &str, budget_tokens: u32) -> String {
             if is_binary_path(path) {
                 return (hdr, "[binary file — body omitted]\n".to_string());
             }
-            (hdr, trim_body_to_budget(&body, per_file_budget))
+            // Compress whitespace-only `-X`/`+X` pairs before budgeting
+            // so a `cargo fmt` pass doesn't eat the diff quota. The
+            // compressed body preserves the shape of real changes; the
+            // model sees `[N whitespace-only changes]` markers where
+            // the fluff was.
+            let compressed = compress_whitespace_only_pairs(&body);
+            (hdr, trim_body_to_budget(&compressed, per_file_budget))
         })
         .collect();
 
@@ -135,6 +141,75 @@ pub fn summarize_for_prompt(diff: &str, budget_tokens: u32) -> String {
     let _ = used; // Kept for future instrumentation / logging hooks.
 
     out
+}
+
+/// Collapse pairs of adjacent `-X` / `+Y` lines where `X` and `Y`
+/// differ only in whitespace (indent, trailing spaces, internal
+/// runs). Emits a short `[N whitespace-only changes]` marker wherever
+/// a run of such pairs was squashed.
+///
+/// Why this matters: after a `cargo fmt` / linter pass a diff can be
+/// hundreds of lines of trivial `-    old()` / `+    old()` pairs that
+/// drown out the 20 real lines of logic the user actually wrote. Those
+/// trivial lines would happily eat the per-file budget and push real
+/// changes over the truncation cliff, biasing every downstream signal
+/// and LLM summary toward "this is a formatting commit".
+fn compress_whitespace_only_pairs(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0usize;
+    let mut run_count = 0usize;
+
+    while i < lines.len() {
+        // Look for a `-X\n+Y` pair starting at `i` where `X` and `Y`
+        // are the same modulo whitespace. A `- ` line followed by any
+        // number of further `-` lines must be matched by an equal-
+        // count block of `+` lines; we only compress strictly 1:1
+        // pairs because that's where `cargo fmt` noise lives.
+        if i + 1 < lines.len() {
+            let a = lines[i];
+            let b = lines[i + 1];
+            if a.starts_with('-')
+                && !a.starts_with("---")
+                && b.starts_with('+')
+                && !b.starts_with("+++")
+                && collapse_whitespace(&a[1..]) == collapse_whitespace(&b[1..])
+            {
+                run_count += 1;
+                i += 2;
+                continue;
+            }
+        }
+
+        // Flush any pending run before emitting a normal line.
+        if run_count > 0 {
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!("[{run_count} whitespace-only changes]\n"),
+            );
+            run_count = 0;
+        }
+
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    // Trailing run at EOF.
+    if run_count > 0 {
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("[{run_count} whitespace-only changes]\n"),
+        );
+    }
+    out
+}
+
+/// Normalise a line for whitespace-insensitive comparison: strip
+/// leading / trailing whitespace and collapse internal runs of
+/// whitespace to a single space. Two lines that only differ in
+/// indentation or trailing spaces become equal.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Trim a single file's diff body so its token cost stays under
