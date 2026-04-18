@@ -143,6 +143,21 @@ pub enum LineKind {
 /// show --patch`), which was ~2× the per-click latency — most visible on
 /// macOS where `posix_spawn` plus libgit2's mmap setup dominate.
 pub fn diff_for_commit(repo_path: &Path, oid: gix::ObjectId) -> Result<RepoDiff> {
+    diff_for_commit_in(repo_path, oid, None)
+}
+
+/// Like `diff_for_commit` but lets the caller pin an explicit base
+/// commit. Used by the commit-basket "combined diff" flow: after
+/// cherry-picking the selection into a scratch worktree, we commit
+/// the result and ask for its diff vs the merge-base of the original
+/// selection — stock `git show <tip>` would compare against the tip's
+/// parent (also the merge-base in that case, but we don't want to rely
+/// on that coincidence).
+pub fn diff_for_commit_in(
+    repo_path: &Path,
+    oid: gix::ObjectId,
+    base_override: Option<gix::ObjectId>,
+) -> Result<RepoDiff> {
     let profile = std::env::var("MERGEFOX_PROFILE_DIFF").is_ok();
     let t0 = std::time::Instant::now();
 
@@ -163,24 +178,46 @@ pub fn diff_for_commit(repo_path: &Path, oid: gix::ObjectId) -> Result<RepoDiff>
     });
     let t_meta = t0.elapsed();
 
-    // Single `git show` that emits BOTH `--raw` (file OIDs + status) and
-    // `--patch` (hunks). `-M` turns on rename detection so the raw lines
-    // report `R80` instead of A+D pairs.
-    let out = super::cli::run(
-        repo_path,
-        [
-            "show",
-            "--no-commit-id",
-            "--format=",
-            "--raw",
-            "--patch",
-            "--unified=3",
-            "--no-abbrev",
-            "-M",
-            &oid.to_string(),
-        ],
-    )
-    .context("git show")?;
+    // Single git call that emits BOTH `--raw` (file OIDs + status) and
+    // the unified patch. `-M` turns on rename detection so the raw
+    // lines report `R80` instead of A+D pairs.
+    //
+    // When the caller supplies `base_override` we run `git diff
+    // <base>..<oid>` instead of `git show <oid>`; `git show` always
+    // diffs against the commit's first parent, which isn't what we
+    // want for the synthetic "combined-diff" commits produced by
+    // commit_basket where the parent is fine but the semantic base is
+    // the merge-base of the selection.
+    let out = match base_override {
+        None => super::cli::run(
+            repo_path,
+            [
+                "show",
+                "--no-commit-id",
+                "--format=",
+                "--raw",
+                "--patch",
+                "--unified=3",
+                "--no-abbrev",
+                "-M",
+                &oid.to_string(),
+            ],
+        )
+        .context("git show")?,
+        Some(base) => super::cli::run(
+            repo_path,
+            [
+                "diff",
+                "--raw",
+                "--patch",
+                "--unified=3",
+                "--no-abbrev",
+                "-M",
+                &format!("{base}..{oid}"),
+            ],
+        )
+        .context("git diff base..tip")?,
+    };
     let t_show = t0.elapsed();
     let bytes = out.stdout.len();
 
@@ -799,6 +836,10 @@ fn extension_of(path: Option<&PathBuf>) -> Option<String> {
 fn is_image_ext(ext: &str) -> bool {
     matches!(
         ext,
+        // Built-in egui loaders handle these directly.
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "tif"
+        // Extended formats we decode ourselves via `ui::file_preview`
+        // and convert to PNG before feeding to the image loader.
+        | "tga" | "psd" | "exr" | "hdr" | "qoi"
     )
 }

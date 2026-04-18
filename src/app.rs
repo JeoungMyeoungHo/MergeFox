@@ -80,6 +80,16 @@ pub struct MergeFoxApp {
     pub palette_open: bool,
     pub palette_query: String,
     pub palette_selected: usize,
+    /// Modal state for the basket "Focus file" picker. `Some` = open.
+    /// Lives on the app (not `WorkspaceState`) because we want the
+    /// modal to render once regardless of active tab — same pattern as
+    /// the command palette.
+    pub basket_focus_modal: Option<crate::ui::basket_focus::BasketFocusModalState>,
+    /// True when the user clicked "Focus file…" but the combined diff
+    /// wasn't ready yet — we kicked off a compute and will auto-open
+    /// the picker once `poll_combined_diff` lands a result. Cleared on
+    /// both success and failure so repeated clicks don't pile up.
+    pub basket_focus_pending: bool,
     /// True when the settings window should render.
     pub settings_open: bool,
     /// Persistent in-window edits for the settings modal.
@@ -423,6 +433,34 @@ pub struct WorkspaceState {
     /// is empty. Stored as a `BTreeSet` so membership lookup is log-N
     /// and iteration order is deterministic (for prompt snapshots, etc.).
     pub commit_basket: std::collections::BTreeSet<gix::ObjectId>,
+    /// Set while a combined-diff computation is running on a worker
+    /// thread. The floating basket bar shows a spinner during this
+    /// window; polled in the main app loop.
+    pub combined_diff_task: Option<
+        std::sync::mpsc::Receiver<
+            std::result::Result<
+                crate::git::basket_ops::CombinedDiff,
+                crate::git::basket_ops::CombineError,
+            >,
+        >,
+    >,
+    /// When `current_diff` was produced by a basket operation, the
+    /// topo-sorted OIDs that were applied. Used by the commit-detail
+    /// header to render "Combined diff of N commits" instead of
+    /// the usual single-commit OID + parents row.
+    pub combined_diff_source: Option<Vec<gix::ObjectId>>,
+    /// Unfiltered combined diff, stashed so the "Focus file" flow can
+    /// toggle between "all files" and "one file" without recomputing
+    /// the expensive cherry-pick chain. Populated alongside
+    /// `combined_diff_source`; cleared whenever the basket empties or
+    /// a non-combined diff replaces `current_diff`.
+    pub combined_diff_full: Option<Arc<RepoDiff>>,
+    /// When `Some`, `current_diff` is a path-filtered view of
+    /// `combined_diff_full`. The banner shows "Focused on: <path>"
+    /// and a "Clear filter" chip that restores the full combined
+    /// diff. Stored as a plain `String` (display path) so it
+    /// round-trips cleanly with `FileDiff::display_path`.
+    pub combined_diff_focus_path: Option<String>,
     /// Diff of `selected_commit` vs its first parent, if available.
     pub current_diff: Option<Arc<RepoDiff>>,
     /// Which file in `current_diff.files` the user is viewing in the
@@ -934,6 +972,8 @@ impl MergeFoxApp {
             palette_open: false,
             palette_query: String::new(),
             palette_selected: 0,
+            basket_focus_modal: None,
+            basket_focus_pending: false,
             settings_open: false,
             settings_modal: None,
             publish_remote_modal: None,
@@ -1011,19 +1051,287 @@ impl MergeFoxApp {
         match intent {
             BasketIntent::Clear => {
                 if let View::Workspace(tabs) = &mut self.view {
-                    tabs.current_mut().commit_basket.clear();
+                    let ws = tabs.current_mut();
+                    ws.commit_basket.clear();
+                    ws.combined_diff_source = None;
+                    ws.combined_diff_full = None;
+                    ws.combined_diff_focus_path = None;
                 }
+                self.basket_focus_modal = None;
+                self.basket_focus_pending = false;
             }
-            BasketIntent::ShowCombinedDiff
-            | BasketIntent::FocusFile
-            | BasketIntent::RevertToWorkingTree
-            | BasketIntent::SquashIntoOne => {
-                // Wired in subsequent phases. Surface a toast so the
-                // user gets feedback that the intent registered while
-                // the backend is in flight.
+            BasketIntent::ShowCombinedDiff => self.start_combined_diff(),
+            BasketIntent::FocusFile => self.start_basket_focus_picker(),
+            BasketIntent::RevertToWorkingTree | BasketIntent::SquashIntoOne => {
                 self.notify_info(format!("Basket: {intent:?} — not yet wired"));
             }
         }
+    }
+
+    /// Entry point for the basket "Focus file…" button. Two-phase:
+    ///
+    /// 1. If there's already a combined diff loaded for the current
+    ///    basket (i.e. the user previously clicked "Combined diff"),
+    ///    we open the picker immediately against that cached diff.
+    /// 2. Otherwise we kick off `start_combined_diff` and set
+    ///    `basket_focus_pending`; `poll_combined_diff` will flip
+    ///    open the picker as soon as the worker returns.
+    ///
+    /// WHY the two-phase approach instead of always recomputing: the
+    /// cherry-pick chain is expensive (1–10 s on realistic selections),
+    /// so re-running it when the user already paid for it once is a
+    /// pointless UX penalty. Conversely, forcing the user to click
+    /// "Combined diff" first before "Focus file" becomes available was
+    /// a UX foot-gun called out in the phase-4 design brief.
+    fn start_basket_focus_picker(&mut self) {
+        let has_full_diff = matches!(&self.view, View::Workspace(tabs)
+            if !tabs.launcher_active && tabs.current().combined_diff_full.is_some());
+
+        if has_full_diff {
+            self.basket_focus_modal =
+                Some(crate::ui::basket_focus::BasketFocusModalState::default());
+            self.basket_focus_pending = false;
+            return;
+        }
+
+        // Need to compute first. `start_combined_diff` is a no-op if
+        // a worker is already in flight — we rely on that idempotency
+        // so double-clicking "Focus file…" doesn't queue two jobs.
+        let basket_ok = matches!(&self.view, View::Workspace(tabs)
+            if !tabs.launcher_active && tabs.current().commit_basket.len() >= 2);
+        if !basket_ok {
+            return;
+        }
+        self.basket_focus_pending = true;
+        self.start_combined_diff();
+    }
+
+    /// Kick off the combined-diff computation on a worker thread.
+    /// Shows a toast once the result lands or the worker fails.
+    fn start_combined_diff(&mut self) {
+        let (repo_path, basket) = {
+            let View::Workspace(tabs) = &self.view else {
+                return;
+            };
+            if tabs.launcher_active {
+                return;
+            }
+            let ws = tabs.current();
+            if ws.combined_diff_task.is_some() {
+                self.notify_info("Combined diff already in flight — please wait");
+                return;
+            }
+            if ws.commit_basket.len() < 2 {
+                return;
+            }
+            (
+                ws.repo.path().to_path_buf(),
+                ws.commit_basket.iter().copied().collect::<Vec<_>>(),
+            )
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = crate::git::basket_ops::compute_combined_diff(&repo_path, &basket);
+            let _ = tx.send(result);
+        });
+        if let View::Workspace(tabs) = &mut self.view {
+            tabs.current_mut().combined_diff_task = Some(rx);
+        }
+        self.notify_info("Computing combined diff…");
+    }
+
+    /// Drain any completed combined-diff task. Safe to call every
+    /// frame — cheap no-op when no task is running.
+    pub fn poll_combined_diff(&mut self) {
+        let result_opt = match &mut self.view {
+            View::Workspace(tabs) if !tabs.launcher_active => {
+                let ws = tabs.current_mut();
+                let rx = match ws.combined_diff_task.as_ref() {
+                    Some(rx) => rx,
+                    None => return,
+                };
+                match rx.try_recv() {
+                    Ok(result) => {
+                        ws.combined_diff_task = None;
+                        Some(result)
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        ws.combined_diff_task = None;
+                        Some(Err(crate::git::basket_ops::CombineError::Other(
+                            "combined-diff worker disappeared".into(),
+                        )))
+                    }
+                }
+            }
+            _ => return,
+        };
+        let Some(result) = result_opt else { return };
+
+        match result {
+            Ok(combined) => {
+                // Install the synthetic diff on the active workspace
+                // and drop the single-commit selection so the existing
+                // diff panel renders our payload without thinking it's
+                // a real commit.
+                if let View::Workspace(tabs) = &mut self.view {
+                    let ws = tabs.current_mut();
+                    ws.selected_commit = None;
+                    ws.selected_file_idx = None;
+                    ws.set_image_cache(None);
+                    let full = std::sync::Arc::new(combined.diff);
+                    // Stash the unfiltered diff so Focus-file can
+                    // toggle back to "show all" without recomputing.
+                    ws.combined_diff_full = Some(full.clone());
+                    // On a fresh combined-diff run, clear any stale
+                    // focus filter from a previous basket selection.
+                    ws.combined_diff_focus_path = None;
+                    ws.current_diff = Some(full);
+                    ws.combined_diff_source = Some(combined.applied_order);
+                }
+                self.notify_ok("Combined diff ready");
+
+                // If the user clicked "Focus file…" while this worker
+                // was in flight, open the picker now that the data is
+                // ready. We flip the flag even on the early-return
+                // path below (error branch) so the flag never survives
+                // a completed task.
+                if self.basket_focus_pending {
+                    self.basket_focus_pending = false;
+                    self.basket_focus_modal =
+                        Some(crate::ui::basket_focus::BasketFocusModalState::default());
+                }
+            }
+            Err(e) => {
+                self.notify_err(format!("Combined diff failed: {e}"));
+                // Don't leave the pending flag dangling — otherwise
+                // the next combined-diff success (for a *different*
+                // basket) would auto-pop the picker when the user
+                // didn't ask for it this time around.
+                self.basket_focus_pending = false;
+            }
+        }
+    }
+
+    /// Apply the user's path selection to the current combined diff.
+    /// Called from the modal-handling code once the picker returns a
+    /// `Picked(path)` outcome. Keeps the combined-diff banner and
+    /// basket sources intact so the user stays anchored in the
+    /// "combined diff of N commits" mental model.
+    pub fn apply_basket_focus_path(&mut self, path: String) {
+        let View::Workspace(tabs) = &mut self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        let ws = tabs.current_mut();
+        let Some(full) = ws.combined_diff_full.clone() else {
+            return;
+        };
+        let filtered =
+            crate::git::basket_ops::filter_combined_diff_to_path(&full, &path);
+        // If the picker somehow supplied a path that's not in the
+        // diff (race with a basket mutation), fall back to the full
+        // diff instead of showing an empty file list — that empty
+        // state is confusing and looks like a bug.
+        if filtered.files.is_empty() {
+            ws.combined_diff_focus_path = None;
+            ws.current_diff = Some(full);
+            ws.selected_file_idx = None;
+            // Drop the `tabs` borrow before reaching for `self` again.
+            // Mutating `self.notifications` requires its own mutable
+            // borrow, so we finish the workspace-state update first
+            // and surface the warning after.
+            let msg = format!(
+                "No files in the combined diff match '{path}' — showing all files."
+            );
+            self.notify_warn(msg);
+            return;
+        }
+        ws.current_diff = Some(std::sync::Arc::new(filtered));
+        ws.combined_diff_focus_path = Some(path);
+        // Reset the file-view cursor because indices in the filtered
+        // file list don't line up with the old one.
+        ws.selected_file_idx = None;
+        ws.set_image_cache(None);
+    }
+
+    /// Render the basket focus-file modal (if open) and route the
+    /// outcome back into workspace state. Called once per frame from
+    /// the top-level update loop. Builds the candidate path list from
+    /// the current workspace's `combined_diff_full` — without that we
+    /// defensively close the modal rather than showing an empty list.
+    pub fn handle_basket_focus_modal(&mut self, ctx: &egui::Context) {
+        if self.basket_focus_modal.is_none() {
+            return;
+        }
+
+        // Collect candidates up front to avoid borrowing `self` across
+        // the modal closure (which takes `&mut self` via the picker).
+        let candidates: Vec<String> = match &self.view {
+            View::Workspace(tabs) if !tabs.launcher_active => tabs
+                .current()
+                .combined_diff_full
+                .as_ref()
+                .map(|diff| diff.files.iter().map(|f| f.display_path()).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+
+        // Defensive close: if the user cleared the basket or the full
+        // diff vanished while the modal was open, the modal is
+        // meaningless now. Just dismiss it instead of showing an
+        // empty picker (which a puzzled user would call a bug).
+        if candidates.is_empty() {
+            self.basket_focus_modal = None;
+            return;
+        }
+
+        let Some(state) = self.basket_focus_modal.as_mut() else {
+            return;
+        };
+        let outcome = crate::ui::basket_focus::show(ctx, state, &candidates);
+
+        match outcome {
+            Some(crate::ui::basket_focus::FocusPickerOutcome::Picked(path)) => {
+                self.basket_focus_modal = None;
+                self.apply_basket_focus_path(path);
+            }
+            Some(crate::ui::basket_focus::FocusPickerOutcome::Cancelled) => {
+                self.basket_focus_modal = None;
+            }
+            None => {}
+        }
+    }
+
+    /// Drop the focus filter and restore the unfiltered combined diff.
+    /// No-op if the workspace isn't currently focus-filtered.
+    ///
+    /// Kept as a reusable entry point even though the main "Clear
+    /// filter" click is handled inline in `diff_view` (to avoid a
+    /// borrow-checker conflict with the already-held `&mut ws`).
+    /// Future call sites — keyboard shortcuts, palette actions — should
+    /// route through here so the cache / index resets stay centralised.
+    #[allow(dead_code)]
+    pub fn clear_basket_focus_path(&mut self) {
+        let View::Workspace(tabs) = &mut self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        let ws = tabs.current_mut();
+        if ws.combined_diff_focus_path.is_none() {
+            return;
+        }
+        if let Some(full) = ws.combined_diff_full.clone() {
+            ws.current_diff = Some(full);
+        }
+        ws.combined_diff_focus_path = None;
+        ws.selected_file_idx = None;
+        ws.set_image_cache(None);
     }
 
     pub fn set_git_error(&mut self, action: &str, err: impl std::fmt::Display) {
@@ -1324,6 +1632,10 @@ impl MergeFoxApp {
             active_job: None,
             selected_commit: None,
             commit_basket: std::collections::BTreeSet::new(),
+            combined_diff_task: None,
+            combined_diff_source: None,
+            combined_diff_full: None,
+            combined_diff_focus_path: None,
             current_diff: None,
             selected_file_idx: None,
             selected_file_view: SelectedFileView::Diff,
@@ -4720,6 +5032,8 @@ impl eframe::App for MergeFoxApp {
         ui::rebase::show(ctx, self);
         ui::conflicts::show(ctx, self);
         self.handle_commit_basket_bar(ctx);
+        self.poll_combined_diff();
+        self.handle_basket_focus_modal(ctx);
 
         if self.clone_in_progress() {
             ctx.request_repaint_after(Duration::from_millis(100));
