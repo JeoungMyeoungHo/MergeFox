@@ -1,6 +1,7 @@
 pub mod basket_ops;
 pub mod blame;
 pub mod cli;
+pub mod conflict_hunks;
 pub mod diff;
 pub mod graph;
 pub mod jobs;
@@ -12,6 +13,10 @@ pub use basket_ops::{
     revert_to_working_tree, squash_basket_into_one, RevertOutcome, SquashOutcome,
 };
 pub use blame::{blame_file, BlameCommit, BlameLine, BlameResult};
+pub use conflict_hunks::{
+    compose_resolved_text, default_custom_seed, parse_conflict_markers, ConflictHunkKind,
+    HunkResolution, HunkResolutionState, ParsedConflict,
+};
 pub use cli::{
     classify_git_error, probe_git_capability, recent_git_log, GitCapability, GitErrorKind,
 };
