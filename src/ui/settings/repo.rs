@@ -15,7 +15,7 @@ use egui::{Color32, ComboBox, RichText, TextEdit};
 
 use super::{finish_repo_update, persist_config, with_settings_repo, Feedback};
 use crate::app::MergeFoxApp;
-use crate::config::{PullStrategyPref, RepoSettings, UiLanguage};
+use crate::config::{PullStrategyPref, RepoSettings, UiLanguage, WorkspaceProfile};
 
 pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
     let language = current_language(app);
@@ -505,6 +505,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
     if let Some(intent) = intent {
         handle_intent(app, intent, &labels);
     }
+
+    // Rendered after the modal's mut-borrow block closes so the
+    // section can freely mutate `app.config` + live workspace state.
+    render_workspace_profile_section(ui, app);
 }
 
 enum Intent {
@@ -1172,4 +1176,136 @@ fn labels(lang: UiLanguage) -> Labels {
             submodule_sync_failed: "Submodule URL sync failed",
         },
     }
+}
+
+/// Render the "Workspace profile" block — dropdown + detection
+/// diagnostic + "Switch to Game-dev mode?" banner when appropriate.
+/// Writes go straight to `config.repo_settings[path].profile_override`
+/// and mutate the live workspace so the change takes effect next
+/// frame; no settings-modal mirroring field needed.
+fn render_workspace_profile_section(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
+    use crate::app::View;
+    let (repo_path, detected) = {
+        let View::Workspace(tabs) = &app.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        let ws = tabs.current();
+        (ws.repo.path().to_path_buf(), ws.detected_project_kind)
+    };
+
+    let repo_key = repo_path.to_string_lossy().to_string();
+    let current_override = app
+        .config
+        .repo_settings
+        .get(&repo_key)
+        .and_then(|s| s.profile_override);
+    let team_profile =
+        crate::workspace_profile::load_team_profile(&repo_path).unwrap_or_default();
+    let effective = crate::workspace_profile::effective_profile(&team_profile, current_override);
+
+    ui.add_space(10.0);
+    ui.label(RichText::new("Workspace profile").strong());
+
+    // Dropdown: reads effective, writes user override.
+    let mut selection = current_override.unwrap_or(effective);
+    let before = selection;
+    ComboBox::from_id_salt("settings_workspace_profile")
+        .selected_text(selection.label())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut selection,
+                WorkspaceProfile::General,
+                WorkspaceProfile::General.label(),
+            );
+            ui.selectable_value(
+                &mut selection,
+                WorkspaceProfile::GameDev,
+                WorkspaceProfile::GameDev.label(),
+            );
+            // Minimal is reserved — render disabled so users can see
+            // it's on the roadmap without committing to its behaviour.
+            ui.add_enabled_ui(false, |ui| {
+                ui.selectable_value(
+                    &mut selection,
+                    WorkspaceProfile::Minimal,
+                    format!("{} (coming soon)", WorkspaceProfile::Minimal.label()),
+                );
+            });
+        });
+    if selection != before {
+        set_profile_override(app, &repo_path, Some(selection));
+    }
+
+    ui.weak(selection.description());
+
+    // Team default diagnostic — educates users when the override comes
+    // from a committed `.mergefox/workspace.toml`.
+    if let Some(team) = team_profile.profile {
+        ui.weak(format!(
+            "Team default (from .mergefox/workspace.toml): {}",
+            team.label()
+        ));
+    }
+
+    // Detection diagnostic.
+    match detected {
+        Some(kind) => {
+            ui.weak(format!("Detected: {}", kind.label()));
+        }
+        None => {
+            ui.weak("No game-engine markers found.");
+        }
+    }
+
+    // Suggestion banner: detected game engine + still on General + no
+    // explicit override. Clicking [Switch] writes the override + saves.
+    let show_suggest = detected.is_some()
+        && current_override.is_none()
+        && team_profile.profile.is_none()
+        && effective == WorkspaceProfile::General;
+    if show_suggest {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("⚡").color(Color32::from_rgb(240, 180, 96)));
+            ui.label("This looks like a game-engine project. Switch to Game-dev mode?");
+            if ui.button("Switch").clicked() {
+                set_profile_override(app, &repo_path, Some(WorkspaceProfile::GameDev));
+            }
+        });
+    }
+}
+
+fn set_profile_override(
+    app: &mut MergeFoxApp,
+    repo_path: &std::path::Path,
+    override_to: Option<WorkspaceProfile>,
+) {
+    let key = repo_path.to_string_lossy().to_string();
+    let mut settings = app
+        .config
+        .repo_settings
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    settings.profile_override = override_to;
+    app.config.set_repo_settings(repo_path, settings);
+    let _ = app.config.save();
+
+    // Refresh the live workspace's cached profile so subsequent frames
+    // use the new value.
+    if let crate::app::View::Workspace(tabs) = &mut app.view {
+        if !tabs.launcher_active {
+            let ws = tabs.current_mut();
+            if ws.repo.path() == repo_path {
+                let team = crate::workspace_profile::load_team_profile(repo_path)
+                    .unwrap_or_default();
+                ws.workspace_profile =
+                    crate::workspace_profile::effective_profile(&team, override_to);
+            }
+        }
+    }
+    app.notify_ok("Workspace profile updated.");
 }
