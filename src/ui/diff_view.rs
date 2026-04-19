@@ -32,7 +32,22 @@ use crate::git::{
 
 const PANEL_MIN_WIDTH: f32 = 280.0;
 const PANEL_DEFAULT_WIDTH: f32 = 340.0;
+/// Default row height for file list rows *without* a thumbnail slot.
+/// Matches the pre-thumbnail-era height so text-heavy file lists keep
+/// their dense layout and don't visibly expand when this feature lands.
 const FILE_ROW_HEIGHT: f32 = 20.0;
+/// Row height when at least one file in the batch has an inline
+/// thumbnail. We picked a single list-wide height (not per-row
+/// adaptive) because `ScrollArea::show_rows` assumes a uniform row
+/// height — mixed heights would force us off the fast virtualized
+/// renderer. 28 px fits a 22 px thumbnail + 3 px breathing room and
+/// reads well against the 12.5 px monospace path text.
+const FILE_ROW_HEIGHT_WITH_THUMB: f32 = 28.0;
+/// Rendered thumbnail size. Smaller than the decoded `THUMB_MAX_DIM`
+/// (64 px) so even a tall/narrow asset downscales cleanly when drawn
+/// at row height. We go slightly under the row height so a 1 px border
+/// doesn't push the text baseline around.
+const THUMB_DRAW_SIZE: f32 = 22.0;
 
 pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let needs_image_loaders = match &app.view {
@@ -728,30 +743,27 @@ fn render_working_file_snapshot(
             render_text_snapshot(ui, &file.display_path(), &text, &bounds);
         }
         FileKind::Image { ext } => {
-            ScrollArea::both()
-                .id_salt("working_snapshot_image")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let image = image_cache
-                        .and_then(|cache| cache.new_bytes.clone().or(cache.old_bytes.clone()));
-                    if let Some(bytes) = image {
-                        let caption = if file.new_path.is_some() {
-                            "Current working tree file"
-                        } else {
-                            "Deleted file (last committed contents)"
-                        };
-                        image_panel(
-                            ui,
-                            caption,
-                            bytes,
-                            file.new_size.max(file.old_size),
-                            ext,
-                            None,
-                        );
-                    } else {
-                        ui.weak("Could not load image contents for this working tree file.");
-                    }
-                });
+            // Working-tree case: the "current" bytes may come from disk
+            // (unstaged edit) — we don't always have an oid. The preview
+            // pipeline accepts anonymous blobs by caching against a
+            // pointer hash, so the thumbnail cache still dedupes across
+            // frames even without a content address.
+            let bytes = image_cache
+                .and_then(|cache| cache.new_bytes.clone().or(cache.old_bytes.clone()));
+            let caption = if file.new_path.is_some() {
+                "Current working tree file"
+            } else {
+                "Deleted file (last committed contents)"
+            };
+            render_single_image_preview(
+                ui,
+                "working_snapshot_image",
+                caption,
+                bytes,
+                None,
+                ext,
+                file.new_size.max(file.old_size),
+            );
         }
         FileKind::Binary => {
             ui.weak("Binary working tree file snapshot is not shown inline.");
@@ -1047,23 +1059,38 @@ fn relative_time(ts: i64) -> String {
 
 /// Flat file list — virtualized, left-aligned glyph + path, right-aligned stats.
 /// Full-width click target so selection highlight spans the whole row.
+///
+/// Row height is uniform across the list: if any file in the diff is an
+/// image/PSD asset we bump *every* row to [`FILE_ROW_HEIGHT_WITH_THUMB`]
+/// so the virtualized renderer (`show_rows`) can keep indexing by
+/// `row_idx * row_height`. Per-row adaptive heights would defeat
+/// virtualization on thousand-file diffs (Linux kernel merge commits)
+/// which is where the file list's scroll performance actually matters.
 fn render_file_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff) {
     let total_files = diff.files.len();
+    let has_any_thumb = diff
+        .files
+        .iter()
+        .any(|f| matches!(f.kind, FileKind::Image { .. }));
+    let row_height = if has_any_thumb {
+        FILE_ROW_HEIGHT_WITH_THUMB
+    } else {
+        FILE_ROW_HEIGHT
+    };
+    let repo = ws.repo.gix().clone();
     ScrollArea::vertical()
         .id_salt("diff_files_flat")
         .auto_shrink([false, false])
-        .show_rows(ui, FILE_ROW_HEIGHT, total_files, |ui, range| {
+        .show_rows(ui, row_height, total_files, |ui, range| {
             let row_width = ui.available_width();
             for i in range {
                 let file = &diff.files[i];
                 let selected = ws.selected_file_idx == Some(i);
                 let color = status_color(file.status);
-                // Allocate a full-width row for consistent click target + highlight.
                 let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(row_width, FILE_ROW_HEIGHT),
+                    egui::vec2(row_width, row_height),
                     egui::Sense::click(),
                 );
-                // Selection / hover background.
                 if selected {
                     ui.painter().rect_filled(
                         rect,
@@ -1074,7 +1101,6 @@ fn render_file_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
                     ui.painter()
                         .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
                 }
-                // Left: glyph + path.
                 let mut child = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(rect)
@@ -1087,12 +1113,15 @@ fn render_file_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
                         .strong(),
                 );
                 child.add_space(4.0);
+                if has_any_thumb {
+                    paint_inline_thumbnail(&mut child, &repo, file);
+                    child.add_space(6.0);
+                }
                 child.add(
                     egui::Label::new(RichText::new(file.display_path()).monospace())
                         .truncate()
                         .selectable(false),
                 );
-                // Right: stats.
                 let stats_text = file_stats_str(file);
                 let stats_galley = ui.painter().layout_no_wrap(
                     stats_text,
@@ -1116,10 +1145,12 @@ fn render_file_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
 }
 
 /// Tree view — files grouped by directory with collapsible headers.
+///
+/// Like [`render_file_flat`] we pick a single row height based on
+/// whether *any* file in the diff is an image; keeps tree-leaf rows
+/// visually aligned so path letters sit on the same baseline whether
+/// a row has a thumbnail or not.
 fn render_file_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff) {
-    // Build a simple directory → file-indices map. We preserve the
-    // original index so clicking a tree leaf sets the correct
-    // `selected_file_idx` into `diff.files`.
     let mut dirs: std::collections::BTreeMap<String, Vec<(usize, &FileDiff)>> =
         std::collections::BTreeMap::new();
     for (i, file) in diff.files.iter().enumerate() {
@@ -1130,6 +1161,17 @@ fn render_file_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
         };
         dirs.entry(dir.to_string()).or_default().push((i, file));
     }
+
+    let has_any_thumb = diff
+        .files
+        .iter()
+        .any(|f| matches!(f.kind, FileKind::Image { .. }));
+    let row_height = if has_any_thumb {
+        FILE_ROW_HEIGHT_WITH_THUMB
+    } else {
+        FILE_ROW_HEIGHT
+    };
+    let repo = ws.repo.gix().clone();
 
     ScrollArea::vertical()
         .id_salt("diff_files_tree")
@@ -1153,7 +1195,7 @@ fn render_file_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
                         let color = status_color(file.status);
                         let row_w = ui.available_width();
                         let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(row_w, FILE_ROW_HEIGHT),
+                            egui::vec2(row_w, row_height),
                             egui::Sense::click(),
                         );
                         if selected {
@@ -1178,6 +1220,10 @@ fn render_file_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
                                 .strong(),
                         );
                         child.add_space(4.0);
+                        if has_any_thumb {
+                            paint_inline_thumbnail(&mut child, &repo, file);
+                            child.add_space(6.0);
+                        }
                         child.add(
                             egui::Label::new(RichText::new(file_name).monospace())
                                 .truncate()
@@ -1206,6 +1252,101 @@ fn render_file_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
                 });
             }
         });
+}
+
+/// Draw the inline-thumbnail slot for a single file row, reserving the
+/// same layout footprint whether or not this specific file is an image.
+/// Non-image rows get a transparent spacer so the path text column is
+/// still aligned with the image rows above/below.
+///
+/// Behavior by state:
+///   * not an image → blank spacer of equal size
+///   * `Ready`      → the decoded texture, rendered fit-to-square
+///   * `Pending`    → a faint placeholder square so row width doesn't
+///                     reflow when the decode lands mid-frame
+///   * `Unsupported`/`TooLarge`/`Failed` → blank spacer; the typed
+///                     placeholder / error lives in the detail pane
+///                     where there's room to explain, not the 22px row
+fn paint_inline_thumbnail(ui: &mut egui::Ui, repo: &gix::Repository, file: &FileDiff) {
+    let size = egui::vec2(THUMB_DRAW_SIZE, THUMB_DRAW_SIZE);
+    let FileKind::Image { ext } = &file.kind else {
+        ui.allocate_exact_size(size, egui::Sense::hover());
+        return;
+    };
+    // Prefer `new_oid` (the state after the commit) so the thumbnail
+    // matches the "after" image in the diff pane. For pure deletions
+    // we still show the last-committed image from `old_oid` — the row
+    // is explicitly labelled with a 'D' glyph so there's no ambiguity.
+    let oid = match file.new_oid.or(file.old_oid) {
+        Some(o) => o,
+        None => {
+            ui.allocate_exact_size(size, egui::Sense::hover());
+            return;
+        }
+    };
+    let key = crate::ui::file_preview::PreviewKey {
+        identity: crate::ui::file_preview::PreviewIdentity::Blob(oid),
+        mode: crate::ui::file_preview::PreviewMode::Thumb,
+    };
+    let manager = crate::ui::file_preview::PreviewManager::global();
+    // Peek before reading the blob: `load_blob_bytes` copies into an
+    // `Arc<[u8]>` each call, and the row renders once per frame for
+    // every visible file. Cache-hit fast-path means we never touch the
+    // object DB beyond the first miss.
+    let state = match manager.peek(&key) {
+        Some(s) => s,
+        None => {
+            if let Some(bytes) = crate::git::diff::load_blob_bytes(repo, Some(oid)) {
+                manager.request_blob(
+                    oid,
+                    bytes,
+                    ext,
+                    crate::ui::file_preview::PreviewMode::Thumb,
+                )
+            } else {
+                // Missing blob (shouldn't happen on a well-formed diff):
+                // render a blank spacer, don't poison the cache.
+                ui.allocate_exact_size(size, egui::Sense::hover());
+                return;
+            }
+        }
+    };
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    match state {
+        crate::ui::file_preview::PreviewState::Ready(_) => {
+            if let Some(tex) = manager.texture_for(ui.ctx(), &key, &format!("thumb-{oid}")) {
+                let tex_size = tex.size_vec2();
+                // Fit-to-square while preserving aspect ratio.
+                let scale = (rect.width() / tex_size.x).min(rect.height() / tex_size.y);
+                let draw_size = tex_size * scale;
+                let draw_rect = egui::Rect::from_center_size(rect.center(), draw_size);
+                egui::Image::new(&tex).paint_at(ui, draw_rect);
+            } else {
+                // Transient (texture promotion race on the exact frame
+                // the Ready state landed): treat like Pending for one
+                // frame, then the next frame has the handle cached.
+                ui.painter().rect_filled(
+                    rect,
+                    2.0,
+                    ui.visuals().faint_bg_color.gamma_multiply(0.6),
+                );
+            }
+        }
+        crate::ui::file_preview::PreviewState::Pending => {
+            ui.painter()
+                .rect_filled(rect, 2.0, ui.visuals().faint_bg_color);
+            // Schedule a repaint so we don't have to wait for user
+            // input to re-check the pending state. 50 ms matches the
+            // upper end of a "feels instant" perceptual window.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        _ => {
+            // Failed / TooLarge / Unsupported: leave the slot blank.
+            // The full preview pane will surface the reason text when
+            // the user selects the row.
+        }
+    }
 }
 
 /// Short stats string like "+12 −3" for a file.
@@ -1512,30 +1653,29 @@ fn render_file_snapshot(
             render_highlighted_snapshot(ui, file, cache);
         }
         FileKind::Image { ext } => {
-            ScrollArea::both()
-                .id_salt("snapshot_image")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let image = image_cache
-                        .and_then(|cache| cache.new_bytes.clone().or(cache.old_bytes.clone()));
-                    if let Some(bytes) = image {
-                        let caption = if file.new_oid.is_some() {
-                            "File at selected commit"
-                        } else {
-                            "Deleted file (previous contents)"
-                        };
-                        image_panel(
-                            ui,
-                            caption,
-                            bytes,
-                            file.new_size.max(file.old_size),
-                            ext,
-                            file.new_oid.or(file.old_oid),
-                        );
-                    } else {
-                        ui.weak("Could not load image contents for this commit.");
-                    }
-                });
+            // The snapshot ("File View") is the natural home for a
+            // single-image preview: we're looking at *this file as of
+            // this commit*, not a before/after comparison. We route
+            // through the async preview pipeline (`PreviewManager`) so
+            // large textures don't block the UI thread on decode the
+            // way the raw `image_panel` loader does.
+            let bytes = image_cache
+                .and_then(|cache| cache.new_bytes.clone().or(cache.old_bytes.clone()));
+            let oid = file.new_oid.or(file.old_oid);
+            let caption = if file.new_oid.is_some() {
+                "File at selected commit"
+            } else {
+                "Deleted file (previous contents)"
+            };
+            render_single_image_preview(
+                ui,
+                "snapshot_image",
+                caption,
+                bytes,
+                oid,
+                ext,
+                file.new_size.max(file.old_size),
+            );
         }
         FileKind::Binary => {
             ui.weak("Binary file snapshot is not shown inline.");
@@ -1748,6 +1888,268 @@ fn image_panel(
             });
         ui.small(format!("{size} bytes · .{ext}"));
     });
+}
+
+/// Zoom/pan state for the single-image preview pane. Kept in egui's
+/// per-context memory keyed by the pane id so state survives frame-to-
+/// frame redraws but auto-resets when the user switches to a different
+/// file (different id = different entry).
+///
+/// `zoom = 0` is a sentinel for "not initialised yet; fit to pane on
+/// the next frame" — we can't compute fit during first paint because
+/// the pane rect isn't known until allocation.
+#[derive(Debug, Clone, Copy)]
+struct ImageZoomPan {
+    /// Absolute zoom: 1.0 = 1 image-pixel per screen-pixel. Lower =
+    /// image is smaller than native, higher = zoomed in.
+    zoom: f32,
+    /// Pan offset in screen pixels relative to the pane centre.
+    pan: egui::Vec2,
+    /// True if the user has manually zoomed — future frames should
+    /// NOT auto-fit on pane resize (they'd feel possessive otherwise).
+    user_zoomed: bool,
+}
+
+impl Default for ImageZoomPan {
+    fn default() -> Self {
+        Self {
+            zoom: 0.0,
+            pan: egui::Vec2::ZERO,
+            user_zoomed: false,
+        }
+    }
+}
+
+/// Single-image preview with mouse-wheel zoom + drag-to-pan + metadata.
+/// Feeds through `PreviewManager` so decode is async and large textures
+/// don't block the UI.
+///
+/// Design notes:
+/// * The pane is always rendered (even when the image is pending /
+///   failed) so the surrounding layout is stable across the decode
+///   lifecycle — no snap when the image lands.
+/// * Zoom uses the mouse position as the anchor: scrolling the wheel
+///   over a specific pixel keeps that pixel under the cursor. This is
+///   what every modern image viewer does and it's worth the small
+///   cost over naive centre-zoom.
+/// * Metadata row lives *below* the image with the caption on top so
+///   the eye falls through the image first, then reads context. Flips
+///   from the old side-by-side layout which led with the caption.
+fn render_single_image_preview(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    caption: &str,
+    bytes: Option<Arc<[u8]>>,
+    oid: Option<gix::ObjectId>,
+    ext: &str,
+    size_bytes: usize,
+) {
+    use crate::ui::file_preview::{
+        PreviewIdentity, PreviewKey, PreviewManager, PreviewMode, PreviewState,
+    };
+
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(caption).strong());
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Fit").on_hover_text("Fit to pane").clicked() {
+                    // Fit button resets both zoom and pan; clearing
+                    // user_zoomed re-enables auto-fit on resize.
+                    let id = ui.make_persistent_id((id_salt, "zoompan"));
+                    ui.ctx().memory_mut(|m| {
+                        m.data.insert_temp(id, ImageZoomPan::default());
+                    });
+                }
+            });
+        });
+
+        let Some(bytes) = bytes else {
+            ui.weak("Could not load image contents.");
+            return;
+        };
+
+        // Identity for the preview pipeline. Anonymous (no oid) paths
+        // hash the pointer so working-tree edits still dedupe within
+        // one edit session.
+        let identity = match oid {
+            Some(o) => PreviewIdentity::Blob(o),
+            None => PreviewIdentity::Blob(synthetic_oid_for_ptr(bytes.as_ptr() as usize)),
+        };
+        let key = PreviewKey {
+            identity,
+            mode: PreviewMode::Full,
+        };
+        let manager = PreviewManager::global();
+        let state = match manager.peek(&key) {
+            Some(s) => s,
+            None => {
+                let pseudo_oid = match oid {
+                    Some(o) => o,
+                    None => synthetic_oid_for_ptr(bytes.as_ptr() as usize),
+                };
+                manager.request_blob(pseudo_oid, bytes.clone(), ext, PreviewMode::Full)
+            }
+        };
+
+        // Reserve the remaining vertical space minus a small footer
+        // area for metadata. A fixed max keeps enormous 8k textures
+        // from eating the entire pane.
+        let avail = ui.available_size();
+        let pane_size = egui::vec2(avail.x.max(200.0), (avail.y - 36.0).max(200.0));
+        let (rect, resp) = ui.allocate_exact_size(pane_size, egui::Sense::click_and_drag());
+        ui.painter()
+            .rect_stroke(rect, 2.0, Stroke::new(1.0, Color32::from_gray(70)));
+
+        match state {
+            PreviewState::Ready(ref img) => {
+                let tex_name = format!(
+                    "preview-full-{}",
+                    oid.map(|o| o.to_string())
+                        .unwrap_or_else(|| "anon".to_string())
+                );
+                if let Some(tex) = manager.texture_for(ui.ctx(), &key, &tex_name) {
+                    draw_image_with_zoom_pan(ui, rect, &resp, &tex, id_salt);
+                }
+                ui.small(format!(
+                    "{w} × {h} · {size} bytes · .{ext}",
+                    w = img.width,
+                    h = img.height,
+                    size = size_bytes,
+                ));
+            }
+            PreviewState::Pending => {
+                ui.painter()
+                    .rect_filled(rect, 2.0, ui.visuals().faint_bg_color);
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Decoding…",
+                    egui::FontId::proportional(13.0),
+                    ui.visuals().weak_text_color(),
+                );
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(50));
+                ui.small(format!("{size_bytes} bytes · .{ext}"));
+            }
+            PreviewState::Failed { reason } => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("Preview failed: {reason}"),
+                    egui::FontId::proportional(13.0),
+                    Color32::from_rgb(220, 140, 120),
+                );
+                ui.small(format!("{size_bytes} bytes · .{ext}"));
+            }
+            PreviewState::TooLarge { bytes: n } => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!(
+                        "Image too large to preview ({n} bytes > {} MB cap)",
+                        crate::ui::file_preview::MAX_INPUT_BYTES / (1024 * 1024)
+                    ),
+                    egui::FontId::proportional(13.0),
+                    Color32::from_rgb(220, 180, 90),
+                );
+                ui.small(format!("{size_bytes} bytes · .{ext}"));
+            }
+            PreviewState::Unsupported { label } => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(13.0),
+                    ui.visuals().weak_text_color(),
+                );
+                ui.small(format!("{size_bytes} bytes · .{ext}"));
+            }
+        }
+    });
+}
+
+/// Build a deterministic synthetic `ObjectId` from a pointer. We only
+/// use this to feed `request_blob` — it doesn't have to be a real git
+/// object, just stable across frames for the same `Arc<[u8]>`.
+fn synthetic_oid_for_ptr(ptr: usize) -> gix::ObjectId {
+    let mut bytes = [0u8; 20];
+    let p = (ptr as u64).to_le_bytes();
+    bytes[..8].copy_from_slice(&p);
+    // Tag remaining bytes so a collision with a real SHA-1 is vanishingly
+    // unlikely. "MERGEFOXSYNT" fills 12 bytes.
+    bytes[8..20].copy_from_slice(b"MERGEFOXSYNT");
+    gix::ObjectId::from_bytes_or_panic(&bytes)
+}
+
+/// Actually draw the texture, applying the active zoom/pan and
+/// updating it from mouse events this frame. Called only when the
+/// preview is in the `Ready` state and we have a `TextureHandle`.
+fn draw_image_with_zoom_pan(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    resp: &egui::Response,
+    tex: &egui::TextureHandle,
+    id_salt: &str,
+) {
+    let id = ui.make_persistent_id((id_salt, "zoompan"));
+    let mut zp: ImageZoomPan = ui
+        .ctx()
+        .memory(|m| m.data.get_temp::<ImageZoomPan>(id))
+        .unwrap_or_default();
+    let tex_size = tex.size_vec2();
+
+    // Auto-fit on first frame (or after user pressed Fit).
+    if zp.zoom <= 0.0 {
+        let fit = (rect.width() / tex_size.x)
+            .min(rect.height() / tex_size.y)
+            .min(1.0)
+            .max(0.01);
+        zp.zoom = fit;
+        zp.pan = egui::Vec2::ZERO;
+        zp.user_zoomed = false;
+    }
+
+    // Scroll-wheel zoom with mouse-anchored scaling. We use the raw
+    // scroll delta (not smoothed) for direct feel; one tick ≈ 10%.
+    if resp.hovered() {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll != 0.0 {
+            let factor = (scroll / 120.0).exp2(); // one full "tick" ≈ 2x
+            let new_zoom = (zp.zoom * factor).clamp(0.02, 32.0);
+            // Anchor around the cursor: offset the pan so the world
+            // point under the cursor stays under the cursor.
+            if let Some(cursor) = resp.hover_pos() {
+                let centre = rect.center() + zp.pan;
+                let world_under_cursor = (cursor - centre) / zp.zoom;
+                let new_centre = cursor - world_under_cursor * new_zoom;
+                zp.pan = new_centre - rect.center();
+            }
+            zp.zoom = new_zoom;
+            zp.user_zoomed = true;
+        }
+    }
+
+    // Drag-to-pan.
+    if resp.dragged() {
+        zp.pan += resp.drag_delta();
+    }
+
+    // Compute draw rect and blit.
+    let draw_size = tex_size * zp.zoom;
+    let centre = rect.center() + zp.pan;
+    let draw_rect = egui::Rect::from_center_size(centre, draw_size);
+    // Clip to pane so zoomed-in images don't bleed over neighbouring
+    // widgets (e.g. the metadata footer below).
+    let painter = ui.painter_at(rect);
+    painter.image(
+        tex.id(),
+        draw_rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+
+    // Persist updated state for the next frame.
+    ui.ctx().memory_mut(|m| m.data.insert_temp(id, zp));
 }
 
 fn empty_panel(ui: &mut egui::Ui, caption: &str) {
