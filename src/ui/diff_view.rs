@@ -32,22 +32,7 @@ use crate::git::{
 
 const PANEL_MIN_WIDTH: f32 = 280.0;
 const PANEL_DEFAULT_WIDTH: f32 = 340.0;
-/// Default row height for file list rows *without* a thumbnail slot.
-/// Matches the pre-thumbnail-era height so text-heavy file lists keep
-/// their dense layout and don't visibly expand when this feature lands.
 const FILE_ROW_HEIGHT: f32 = 20.0;
-/// Row height when at least one file in the batch has an inline
-/// thumbnail. We picked a single list-wide height (not per-row
-/// adaptive) because `ScrollArea::show_rows` assumes a uniform row
-/// height — mixed heights would force us off the fast virtualized
-/// renderer. 28 px fits a 22 px thumbnail + 3 px breathing room and
-/// reads well against the 12.5 px monospace path text.
-const FILE_ROW_HEIGHT_WITH_THUMB: f32 = 28.0;
-/// Rendered thumbnail size. Smaller than the decoded `THUMB_MAX_DIM`
-/// (64 px) so even a tall/narrow asset downscales cleanly when drawn
-/// at row height. We go slightly under the row height so a 1 px border
-/// doesn't push the text baseline around.
-const THUMB_DRAW_SIZE: f32 = 22.0;
 
 pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let needs_image_loaders = match &app.view {
@@ -87,21 +72,12 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     // the diff panel snap-shake each time the diff hop-scotched between
     // these two ids.
     let diff = ws.current_diff.clone();
-    // Snapshot combined-diff metadata too — the panel renders the
-    // synthetic "N commits combined" banner in place of the usual
-    // single-commit summary when this is set.
-    let combined_diff_sources = ws.combined_diff_source.clone();
-    // And the active focus-file filter, if any. Presence of a focus
-    // path decorates the banner with "Focused on: <path>" plus a
-    // chip to clear the filter and restore the full combined diff.
-    let combined_diff_focus = ws.combined_diff_focus_path.clone();
     if !show_working_tree_panel && diff.is_none() && ws.diff_task.is_none() {
         // Nothing to show and nothing computing — don't render the panel.
         return;
     }
 
     let mut close = false;
-    let mut clear_focus = false;
 
     egui::SidePanel::right("diff_panel")
         .resizable(true)
@@ -154,17 +130,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         }
                     });
                 });
-                if let Some(sources) = combined_diff_sources {
-                    if render_combined_diff_banner(
-                        ui,
-                        &sources,
-                        combined_diff_focus.as_deref(),
-                    ) {
-                        clear_focus = true;
-                    }
-                } else {
-                    render_commit_summary(ui, &diff);
-                }
+                render_commit_summary(ui, &diff);
                 ui.separator();
 
                 // File list header: count + flat/tree toggle.
@@ -211,18 +177,6 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         ws.set_image_cache(None);
         // Preserve the graph selection visually even after closing the diff:
         // we only clear the diff pane, not the row highlight.
-    }
-    // Restore the unfiltered combined diff in-place. We intentionally
-    // keep `combined_diff_full` populated — the user can re-open the
-    // picker and pick a different path without recomputing the
-    // cherry-pick chain.
-    if clear_focus && ws.combined_diff_focus_path.is_some() {
-        ws.combined_diff_focus_path = None;
-        if let Some(full) = ws.combined_diff_full.clone() {
-            ws.current_diff = Some(full);
-        }
-        ws.selected_file_idx = None;
-        ws.set_image_cache(None);
     }
 }
 
@@ -409,6 +363,47 @@ fn render_working_tree_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, entries:
         });
 }
 
+/// Aggregate a folder's status entries into a tri-state staging flag.
+/// `Mixed` is the result when entries disagree, OR when any single entry has
+/// *both* staged and unstaged portions (a partially-staged file) — cycling
+/// that through "stage all" or "unstage all" resolves it, which matches
+/// Anchorpoint's behavior.
+fn folder_stage_state(entries: &[&StatusEntry]) -> FolderStage {
+    // Untracked files can't be "unstaged" — they're outside the index. We
+    // treat them as "not staged" for the purposes of the folder checkbox so
+    // a folder of all-new files starts at FolderStage::None.
+    let mut any_staged = false;
+    let mut any_unstaged = false;
+    for e in entries {
+        // Conflicted files don't participate in the staging toggle — we leave
+        // them to the conflict-resolution flow. Treat as mixed-ish by forcing
+        // Mixed if any conflicted entry exists.
+        if e.conflicted {
+            return FolderStage::Mixed;
+        }
+        if e.staged {
+            any_staged = true;
+        }
+        if e.unstaged || matches!(e.kind, EntryKind::Untracked) {
+            any_unstaged = true;
+        }
+    }
+    match (any_staged, any_unstaged) {
+        (true, false) => FolderStage::All,
+        (false, true) => FolderStage::None,
+        (false, false) => FolderStage::None, // empty folder — shouldn't happen
+        (true, true) => FolderStage::Mixed,
+    }
+}
+
+/// Working-tree tree view with Anchorpoint-style folder headers. Each folder
+/// gets a tri-state staging checkbox that cycles:
+///   `Mixed`  → clicking stages every file in the folder (`FolderStage::All`)
+///   `All`    → clicking unstages every file in the folder (`FolderStage::None`)
+///   `None`   → clicking stages every file in the folder (`FolderStage::All`)
+/// This matches Anchorpoint and git-gui where the default "resolve" action
+/// from a mixed state is to stage everything (the common workflow is
+/// "I want this whole folder in my next commit").
 fn render_working_tree_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, entries: &[StatusEntry]) {
     let mut dirs: std::collections::BTreeMap<String, Vec<&StatusEntry>> =
         std::collections::BTreeMap::new();
@@ -421,6 +416,11 @@ fn render_working_tree_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, entries:
         dirs.entry(dir.to_string()).or_default().push(entry);
     }
 
+    // Collect folder-level staging requests here and apply them *after* the
+    // render loop so we don't mutate the working-tree cache while still
+    // reading it. Each request is a (paths, should_stage) tuple.
+    let mut stage_requests: Vec<(Vec<std::path::PathBuf>, bool)> = Vec::new();
+
     ScrollArea::vertical()
         .id_salt("working_tree_files_tree")
         .auto_shrink([false, false])
@@ -429,87 +429,157 @@ fn render_working_tree_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, entries:
                 let dir_label = if dir == "." {
                     "(root)".to_string()
                 } else {
-                    format!("📁 {dir}/")
+                    dir.clone()
                 };
-                egui::CollapsingHeader::new(
-                    RichText::new(format!("{dir_label}  ({})", files.len())).weak(),
-                )
-                .default_open(true)
-                .show(ui, |ui| {
-                    for entry in files {
-                        let selected = ws
-                            .selected_working_file
-                            .as_ref()
-                            .map(|path| path == &entry.path)
-                            .unwrap_or(false);
-                        let display = entry.path.display().to_string();
-                        let file_name = display.rsplit('/').next().unwrap_or(&display);
-                        let color = working_tree_status_color(entry);
-                        let row_w = ui.available_width();
-                        let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(row_w, FILE_ROW_HEIGHT),
-                            egui::Sense::click(),
-                        );
-                        if selected {
-                            ui.painter().rect_filled(
-                                rect,
-                                0.0,
-                                ui.visuals().selection.bg_fill.gamma_multiply(0.4),
-                            );
-                        } else if resp.hovered() {
-                            ui.painter()
-                                .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
-                        }
 
-                        let mut child = ui.new_child(
-                            egui::UiBuilder::new()
-                                .max_rect(rect)
-                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                        );
-                        child.label(
-                            RichText::new(entry.kind.glyph())
-                                .color(color)
-                                .monospace()
-                                .strong(),
-                        );
-                        child.add_space(4.0);
-                        child.add(
-                            egui::Label::new(RichText::new(file_name).monospace())
-                                .truncate()
-                                .selectable(false),
-                        );
+                let mut stats = FolderStats::default();
+                for e in files {
+                    // Map `EntryKind` → `DeltaStatus` for stats reuse. The
+                    // mapping is lossy (Typechange, Untracked collapse to
+                    // "other"/"added") but drives display only.
+                    let ds = match e.kind {
+                        EntryKind::New | EntryKind::Untracked => DeltaStatus::Added,
+                        EntryKind::Modified => DeltaStatus::Modified,
+                        EntryKind::Deleted => DeltaStatus::Deleted,
+                        EntryKind::Renamed => DeltaStatus::Renamed,
+                        EntryKind::Typechange => DeltaStatus::Typechange,
+                        EntryKind::Conflicted => DeltaStatus::Unmodified,
+                    };
+                    stats.push(ds);
+                }
 
-                        let galley = ui.painter().layout_no_wrap(
-                            working_tree_stats_str(entry),
-                            FontId::monospace(11.0),
-                            ui.visuals().weak_text_color(),
-                        );
-                        ui.painter().galley(
-                            egui::pos2(
-                                rect.right() - galley.size().x - 4.0,
-                                rect.center().y - galley.size().y * 0.5,
-                            ),
-                            galley,
-                            ui.visuals().weak_text_color(),
-                        );
+                let stage = folder_stage_state(files);
 
-                        if resp.clicked() {
-                            if selected {
-                                ws.selected_working_file = None;
-                                ws.working_file_diff = None;
-                            } else {
-                                ws.selected_working_file = Some(entry.path.clone());
-                                ws.working_file_diff =
-                                    crate::git::diff_text_for_working_entry(ws.repo.path(), entry)
-                                        .ok();
-                            }
-                            ws.selected_file_view = SelectedFileView::Diff;
-                            ws.set_image_cache(None);
-                        }
+                let open_id = ui.id().with(("wt_tree_open", dir));
+                let mut open = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<bool>(open_id))
+                    .unwrap_or(true);
+
+                let (toggled, cb_resp) =
+                    folder_header_row(ui, open, &dir_label, &stats, Some(stage));
+                if toggled {
+                    open = !open;
+                    ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
+                }
+                if let Some(resp) = cb_resp {
+                    if resp.clicked() {
+                        // Cycle: Mixed → All, None → All, All → None.
+                        let should_stage = !matches!(stage, FolderStage::All);
+                        let paths: Vec<std::path::PathBuf> =
+                            files.iter().map(|e| e.path.clone()).collect();
+                        stage_requests.push((paths, should_stage));
                     }
-                });
+                }
+                if !open {
+                    continue;
+                }
+                for entry in files {
+                    let selected = ws
+                        .selected_working_file
+                        .as_ref()
+                        .map(|path| path == &entry.path)
+                        .unwrap_or(false);
+                    let display = entry.path.display().to_string();
+                    let file_name = display.rsplit('/').next().unwrap_or(&display);
+                    let color = working_tree_status_color(entry);
+                    let row_w = ui.available_width();
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(row_w, FILE_ROW_HEIGHT),
+                        egui::Sense::click(),
+                    );
+                    if selected {
+                        ui.painter().rect_filled(
+                            rect,
+                            0.0,
+                            ui.visuals().selection.bg_fill.gamma_multiply(0.4),
+                        );
+                    } else if resp.hovered() {
+                        ui.painter()
+                            .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+                    }
+
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect.shrink2(egui::vec2(16.0, 0.0)))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    child.label(
+                        RichText::new(entry.kind.glyph())
+                            .color(color)
+                            .monospace()
+                            .strong(),
+                    );
+                    child.add_space(4.0);
+                    child.add(
+                        egui::Label::new(RichText::new(file_name).monospace())
+                            .truncate()
+                            .selectable(false),
+                    );
+
+                    let galley = ui.painter().layout_no_wrap(
+                        working_tree_stats_str(entry),
+                        FontId::monospace(11.0),
+                        ui.visuals().weak_text_color(),
+                    );
+                    ui.painter().galley(
+                        egui::pos2(
+                            rect.right() - galley.size().x - 4.0,
+                            rect.center().y - galley.size().y * 0.5,
+                        ),
+                        galley,
+                        ui.visuals().weak_text_color(),
+                    );
+
+                    if resp.clicked() {
+                        if selected {
+                            ws.selected_working_file = None;
+                            ws.working_file_diff = None;
+                        } else {
+                            ws.selected_working_file = Some(entry.path.clone());
+                            ws.working_file_diff =
+                                crate::git::diff_text_for_working_entry(ws.repo.path(), entry)
+                                    .ok();
+                        }
+                        ws.selected_file_view = SelectedFileView::Diff;
+                        ws.set_image_cache(None);
+                    }
+                }
             }
         });
+
+    // Apply deferred folder-level staging operations. We call the git-ops
+    // layer directly (which is allowed — only app.rs and a few other files
+    // are off-limits) and then force the next working-tree poll to rerun so
+    // the UI reflects the change without a full frame of stale state.
+    for (paths, stage_it) in stage_requests {
+        let path_refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+        let result = if stage_it {
+            crate::git::ops::stage_paths(ws.repo.path(), &path_refs)
+        } else {
+            crate::git::ops::unstage_paths(ws.repo.path(), &path_refs)
+        };
+        if let Err(err) = result {
+            // Surface the error into the working-tree error slot so the user
+            // sees it (the panel already renders `working_error`). We don't
+            // reach into app.rs to show a toast — that would require touching
+            // forbidden files.
+            if let Some(cache) = ws.repo_ui_cache.as_mut() {
+                cache.working_error = Some(format!(
+                    "Folder stage/unstage failed: {}",
+                    err
+                ));
+            }
+        } else {
+            // Force the next poll to refresh immediately by rewinding the
+            // last-poll timestamp past the poll interval. We don't have
+            // access to `WORKING_TREE_POLL_INTERVAL` (private to app.rs), but
+            // subtracting a generous 5 s guarantees we're past any sane value.
+            ws.last_working_tree_poll = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(5))
+                .unwrap_or_else(std::time::Instant::now);
+        }
+    }
 }
 
 fn working_tree_status_color(entry: &StatusEntry) -> Color32 {
@@ -743,27 +813,30 @@ fn render_working_file_snapshot(
             render_text_snapshot(ui, &file.display_path(), &text, &bounds);
         }
         FileKind::Image { ext } => {
-            // Working-tree case: the "current" bytes may come from disk
-            // (unstaged edit) — we don't always have an oid. The preview
-            // pipeline accepts anonymous blobs by caching against a
-            // pointer hash, so the thumbnail cache still dedupes across
-            // frames even without a content address.
-            let bytes = image_cache
-                .and_then(|cache| cache.new_bytes.clone().or(cache.old_bytes.clone()));
-            let caption = if file.new_path.is_some() {
-                "Current working tree file"
-            } else {
-                "Deleted file (last committed contents)"
-            };
-            render_single_image_preview(
-                ui,
-                "working_snapshot_image",
-                caption,
-                bytes,
-                None,
-                ext,
-                file.new_size.max(file.old_size),
-            );
+            ScrollArea::both()
+                .id_salt("working_snapshot_image")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let image = image_cache
+                        .and_then(|cache| cache.new_bytes.clone().or(cache.old_bytes.clone()));
+                    if let Some(bytes) = image {
+                        let caption = if file.new_path.is_some() {
+                            "Current working tree file"
+                        } else {
+                            "Deleted file (last committed contents)"
+                        };
+                        image_panel(
+                            ui,
+                            caption,
+                            bytes,
+                            file.new_size.max(file.old_size),
+                            ext,
+                            None,
+                        );
+                    } else {
+                        ui.weak("Could not load image contents for this working tree file.");
+                    }
+                });
         }
         FileKind::Binary => {
             ui.weak("Binary working tree file snapshot is not shown inline.");
@@ -841,70 +914,6 @@ fn path_looks_like_image(path: &std::path::Path) -> bool {
             | Some("tiff")
             | Some("tif")
     )
-}
-
-/// Top-of-panel banner for a synthetic combined diff (produced by
-/// `basket_ops::compute_combined_diff`). Shows the cumulative count
-/// and the topo-sorted SHAs so the user can tell "which commits got
-/// collapsed into this diff" at a glance.
-///
-/// When `focus_path` is set, the banner additionally renders a
-/// "Focused on: <path>" row with a "Clear filter" chip; returning
-/// `true` signals the caller to drop the focus filter this frame.
-/// We funnel the click through a return value rather than mutating
-/// `WorkspaceState` here because this function is deliberately
-/// UI-only — keeping side-effects at the call site mirrors the
-/// `close = true` pattern already used for the panel's x-button.
-fn render_combined_diff_banner(
-    ui: &mut egui::Ui,
-    sources: &[gix::ObjectId],
-    focus_path: Option<&str>,
-) -> bool {
-    let mut clear_focus = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(format!("✦ Combined diff of {} commits", sources.len()))
-                .strong()
-                .color(Color32::from_rgb(210, 180, 100)),
-        );
-    });
-    if !sources.is_empty() {
-        ui.horizontal_wrapped(|ui| {
-            ui.weak("order:");
-            for (idx, oid) in sources.iter().enumerate() {
-                if idx > 0 {
-                    ui.weak("→");
-                }
-                ui.add(egui::Label::new(
-                    RichText::new(short_sha(oid)).monospace(),
-                ))
-                .on_hover_text(oid.to_string());
-            }
-        });
-    }
-    ui.weak("Cherry-pick apply order (oldest → newest). Read-only synthetic diff.");
-    if let Some(path) = focus_path {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new("Focused on:")
-                    .color(Color32::from_rgb(210, 180, 100))
-                    .strong(),
-            );
-            ui.add(egui::Label::new(RichText::new(path).monospace()))
-                .on_hover_text(path);
-            if ui
-                .small_button("✕ Clear filter")
-                .on_hover_text(
-                    "Show all files in the combined diff again. The file \
-                     picker can be re-opened from the basket bar.",
-                )
-                .clicked()
-            {
-                clear_focus = true;
-            }
-        });
-    }
-    clear_focus
 }
 
 fn render_commit_summary(ui: &mut egui::Ui, diff: &RepoDiff) {
@@ -1059,38 +1068,23 @@ fn relative_time(ts: i64) -> String {
 
 /// Flat file list — virtualized, left-aligned glyph + path, right-aligned stats.
 /// Full-width click target so selection highlight spans the whole row.
-///
-/// Row height is uniform across the list: if any file in the diff is an
-/// image/PSD asset we bump *every* row to [`FILE_ROW_HEIGHT_WITH_THUMB`]
-/// so the virtualized renderer (`show_rows`) can keep indexing by
-/// `row_idx * row_height`. Per-row adaptive heights would defeat
-/// virtualization on thousand-file diffs (Linux kernel merge commits)
-/// which is where the file list's scroll performance actually matters.
 fn render_file_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff) {
     let total_files = diff.files.len();
-    let has_any_thumb = diff
-        .files
-        .iter()
-        .any(|f| matches!(f.kind, FileKind::Image { .. }));
-    let row_height = if has_any_thumb {
-        FILE_ROW_HEIGHT_WITH_THUMB
-    } else {
-        FILE_ROW_HEIGHT
-    };
-    let repo = ws.repo.gix().clone();
     ScrollArea::vertical()
         .id_salt("diff_files_flat")
         .auto_shrink([false, false])
-        .show_rows(ui, row_height, total_files, |ui, range| {
+        .show_rows(ui, FILE_ROW_HEIGHT, total_files, |ui, range| {
             let row_width = ui.available_width();
             for i in range {
                 let file = &diff.files[i];
                 let selected = ws.selected_file_idx == Some(i);
                 let color = status_color(file.status);
+                // Allocate a full-width row for consistent click target + highlight.
                 let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(row_width, row_height),
+                    egui::vec2(row_width, FILE_ROW_HEIGHT),
                     egui::Sense::click(),
                 );
+                // Selection / hover background.
                 if selected {
                     ui.painter().rect_filled(
                         rect,
@@ -1101,6 +1095,7 @@ fn render_file_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
                     ui.painter()
                         .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
                 }
+                // Left: glyph + path.
                 let mut child = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(rect)
@@ -1113,15 +1108,12 @@ fn render_file_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
                         .strong(),
                 );
                 child.add_space(4.0);
-                if has_any_thumb {
-                    paint_inline_thumbnail(&mut child, &repo, file);
-                    child.add_space(6.0);
-                }
                 child.add(
                     egui::Label::new(RichText::new(file.display_path()).monospace())
                         .truncate()
                         .selectable(false),
                 );
+                // Right: stats.
                 let stats_text = file_stats_str(file);
                 let stats_galley = ui.painter().layout_no_wrap(
                     stats_text,
@@ -1144,13 +1136,221 @@ fn render_file_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
         });
 }
 
-/// Tree view — files grouped by directory with collapsible headers.
+/// Aggregated counts for a folder — drives the "[N modified, M new]" subtitle
+/// under each folder header. Grouping by `DeltaStatus` lets the user see at a
+/// glance what happened in a folder without having to unfold it (especially
+/// useful for commits that touch hundreds of files across a handful of dirs).
+#[derive(Default, Clone, Copy)]
+struct FolderStats {
+    added: usize,
+    modified: usize,
+    deleted: usize,
+    renamed: usize,
+    other: usize,
+}
+
+impl FolderStats {
+    fn push(&mut self, status: DeltaStatus) {
+        match status {
+            DeltaStatus::Added => self.added += 1,
+            DeltaStatus::Modified => self.modified += 1,
+            DeltaStatus::Deleted => self.deleted += 1,
+            DeltaStatus::Renamed | DeltaStatus::Copied => self.renamed += 1,
+            _ => self.other += 1,
+        }
+    }
+
+    /// Render as "3 modified, 1 new" — skips zero buckets so the line stays
+    /// scannable. Returns None when nothing interesting happened (empty folder
+    /// shouldn't get a subtitle at all).
+    fn summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.modified > 0 {
+            parts.push(format!("{} modified", self.modified));
+        }
+        if self.added > 0 {
+            parts.push(format!("{} new", self.added));
+        }
+        if self.deleted > 0 {
+            parts.push(format!("{} deleted", self.deleted));
+        }
+        if self.renamed > 0 {
+            parts.push(format!("{} renamed", self.renamed));
+        }
+        if self.other > 0 {
+            parts.push(format!("{} other", self.other));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
+        }
+    }
+}
+
+/// Three-state flag for the folder-level staging checkbox. Working-tree tree
+/// view uses this; commit-detail tree view ignores it (no staging concept).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FolderStage {
+    /// Every file in the folder is fully staged (and not also dirty-in-wt).
+    All,
+    /// Nothing in the folder is staged — pure working-tree changes.
+    None,
+    /// Partial — some staged, some not, or files with both index + wt diffs.
+    /// Renders as "–" instead of "✓" so the user knows one more click won't
+    /// do what they think.
+    Mixed,
+}
+
+/// Render an Anchorpoint-style folder header row: fold-triangle, folder icon,
+/// breadcrumb path in monospace, and an aggregated "[N modified, M new]"
+/// subtitle. Returns (whether-the-header-was-clicked-to-toggle, checkbox-response)
+/// so callers can wire up folder-scoped actions (stage all / unstage all) and
+/// expand/collapse without re-laying out the row.
 ///
-/// Like [`render_file_flat`] we pick a single row height based on
-/// whether *any* file in the diff is an image; keeps tree-leaf rows
-/// visually aligned so path letters sit on the same baseline whether
-/// a row has a thumbnail or not.
+/// We draw the row manually instead of using `egui::CollapsingHeader` because:
+/// 1. AP-style puts a checkbox *inside* the header, and egui's collapsing
+///    header eats clicks on anything inside its title row, making the checkbox
+///    stop working as a distinct control.
+/// 2. We need the subtitle line directly under the header, not indented as a
+///    child — a collapsing header forces that indentation.
+/// The tradeoff is that we manage the `open` flag ourselves via `ws`-side
+/// state; callers pass it in and we return whether the user toggled it.
+fn folder_header_row(
+    ui: &mut egui::Ui,
+    open: bool,
+    dir_label: &str,
+    stats: &FolderStats,
+    stage: Option<FolderStage>,
+) -> (bool, Option<egui::Response>) {
+    let row_h = FILE_ROW_HEIGHT + 2.0;
+    let row_w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(row_w, row_h),
+        egui::Sense::click(),
+    );
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+    }
+
+    // Layout (left → right): [▸/▾] [☐/☑/–] 📁 path/in/mono  (aggregate stats)
+    let mut cursor_x = rect.min.x + 4.0;
+    let mid_y = rect.center().y;
+
+    // Fold triangle.
+    let tri = if open { "▾" } else { "▸" };
+    let tri_galley = ui.painter().layout_no_wrap(
+        tri.into(),
+        FontId::monospace(12.0),
+        ui.visuals().widgets.noninteractive.fg_stroke.color,
+    );
+    ui.painter().galley(
+        egui::pos2(cursor_x, mid_y - tri_galley.size().y * 0.5),
+        tri_galley,
+        ui.visuals().widgets.noninteractive.fg_stroke.color,
+    );
+    cursor_x += 14.0;
+
+    // Tri-state checkbox — drawn inline, with its own click rect so the
+    // folder-row click (toggle open/close) and the checkbox click (stage /
+    // unstage all) don't fight for the same pointer event.
+    let checkbox_resp = if let Some(stage) = stage {
+        let cb_rect = egui::Rect::from_min_size(
+            egui::pos2(cursor_x, mid_y - 8.0),
+            egui::vec2(16.0, 16.0),
+        );
+        let cb_resp = ui.interact(
+            cb_rect,
+            ui.id().with(("folder_cb", dir_label)),
+            egui::Sense::click(),
+        );
+        let (glyph, col) = match stage {
+            FolderStage::All => ("☑", ui.visuals().text_color()),
+            FolderStage::None => ("☐", ui.visuals().weak_text_color()),
+            FolderStage::Mixed => ("–", ui.visuals().warn_fg_color),
+        };
+        let g = ui.painter().layout_no_wrap(
+            glyph.into(),
+            FontId::monospace(14.0),
+            col,
+        );
+        ui.painter().galley(
+            egui::pos2(cb_rect.min.x, mid_y - g.size().y * 0.5),
+            g,
+            col,
+        );
+        cursor_x += 20.0;
+        Some(cb_resp)
+    } else {
+        None
+    };
+
+    // Folder icon + breadcrumb path.
+    let folder_glyph = "📁";
+    let fg = ui.painter().layout_no_wrap(
+        folder_glyph.into(),
+        FontId::proportional(13.0),
+        ui.visuals().text_color(),
+    );
+    ui.painter().galley(
+        egui::pos2(cursor_x, mid_y - fg.size().y * 0.5),
+        fg,
+        ui.visuals().text_color(),
+    );
+    cursor_x += 20.0;
+
+    let path_galley = ui.painter().layout_no_wrap(
+        dir_label.to_string(),
+        FontId::monospace(12.5),
+        ui.visuals().strong_text_color(),
+    );
+    ui.painter().galley(
+        egui::pos2(cursor_x, mid_y - path_galley.size().y * 0.5),
+        path_galley.clone(),
+        ui.visuals().strong_text_color(),
+    );
+    cursor_x += path_galley.size().x + 10.0;
+
+    // Aggregate stats subtitle — right-aligned so it doesn't overlap the path
+    // when folder names are long.
+    if let Some(summary) = stats.summary() {
+        let subtitle = format!("[{}]", summary);
+        let sg = ui.painter().layout_no_wrap(
+            subtitle,
+            FontId::proportional(11.0),
+            ui.visuals().weak_text_color(),
+        );
+        let sx = (rect.right() - sg.size().x - 6.0).max(cursor_x);
+        ui.painter().galley(
+            egui::pos2(sx, mid_y - sg.size().y * 0.5),
+            sg,
+            ui.visuals().weak_text_color(),
+        );
+    }
+
+    // If the checkbox grabbed the click, the row click shouldn't also fire;
+    // egui returns both responses for nested interact rects, so check the
+    // checkbox response first.
+    let cb_clicked = checkbox_resp
+        .as_ref()
+        .map(|r| r.clicked())
+        .unwrap_or(false);
+    let header_clicked = resp.clicked() && !cb_clicked;
+    (header_clicked, checkbox_resp)
+}
+
+/// Tree view — files grouped by directory with Anchorpoint-style folder
+/// headers. Multi-level paths (`a/b/c`) render as a single breadcrumb row
+/// rather than nested groups; flatter = easier to scan when a commit touches
+/// many sibling subtrees.
+///
+/// For commit diffs we *don't* show a folder-level staging checkbox since
+/// "stage" is meaningless for an existing commit's files.
 fn render_file_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff) {
+    // Build a simple directory → file-indices map. We preserve the
+    // original index so clicking a tree leaf sets the correct
+    // `selected_file_idx` into `diff.files`.
     let mut dirs: std::collections::BTreeMap<String, Vec<(usize, &FileDiff)>> =
         std::collections::BTreeMap::new();
     for (i, file) in diff.files.iter().enumerate() {
@@ -1162,17 +1362,6 @@ fn render_file_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
         dirs.entry(dir.to_string()).or_default().push((i, file));
     }
 
-    let has_any_thumb = diff
-        .files
-        .iter()
-        .any(|f| matches!(f.kind, FileKind::Image { .. }));
-    let row_height = if has_any_thumb {
-        FILE_ROW_HEIGHT_WITH_THUMB
-    } else {
-        FILE_ROW_HEIGHT
-    };
-    let repo = ws.repo.gix().clone();
-
     ScrollArea::vertical()
         .id_salt("diff_files_tree")
         .auto_shrink([false, false])
@@ -1181,172 +1370,92 @@ fn render_file_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, diff: &RepoDiff)
                 let dir_label = if dir == "." {
                     "(root)".to_string()
                 } else {
-                    format!("📁 {dir}/")
+                    dir.clone()
                 };
-                egui::CollapsingHeader::new(
-                    RichText::new(format!("{dir_label}  ({})", files.len())).weak(),
-                )
-                .default_open(true)
-                .show(ui, |ui| {
-                    for &(i, file) in files {
-                        let selected = ws.selected_file_idx == Some(i);
-                        let display = file.display_path();
-                        let file_name = display.rsplit('/').next().unwrap_or(&display);
-                        let color = status_color(file.status);
-                        let row_w = ui.available_width();
-                        let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(row_w, row_height),
-                            egui::Sense::click(),
+
+                // Track open/closed state per folder-per-panel via egui's
+                // persistent memory. This keeps the user's fold preferences
+                // across frames without threading state through WorkspaceState
+                // (we'd need `app.rs` changes for that, which is out of scope).
+                let open_id = ui.id().with(("diff_tree_open", dir));
+                let mut open = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<bool>(open_id))
+                    .unwrap_or(true);
+
+                let mut stats = FolderStats::default();
+                for &(_, f) in files {
+                    stats.push(f.status);
+                }
+
+                // Commit-detail view: no staging checkbox.
+                let (toggled, _) = folder_header_row(ui, open, &dir_label, &stats, None);
+                if toggled {
+                    open = !open;
+                    ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
+                }
+                if !open {
+                    continue;
+                }
+                for &(i, file) in files {
+                    let selected = ws.selected_file_idx == Some(i);
+                    let display = file.display_path();
+                    let file_name = display.rsplit('/').next().unwrap_or(&display);
+                    let color = status_color(file.status);
+                    let row_w = ui.available_width();
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(row_w, FILE_ROW_HEIGHT),
+                        egui::Sense::click(),
+                    );
+                    if selected {
+                        ui.painter().rect_filled(
+                            rect,
+                            0.0,
+                            ui.visuals().selection.bg_fill.gamma_multiply(0.4),
                         );
-                        if selected {
-                            ui.painter().rect_filled(
-                                rect,
-                                0.0,
-                                ui.visuals().selection.bg_fill.gamma_multiply(0.4),
-                            );
-                        } else if resp.hovered() {
-                            ui.painter()
-                                .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
-                        }
-                        let mut child = ui.new_child(
-                            egui::UiBuilder::new()
-                                .max_rect(rect)
-                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                        );
-                        child.label(
-                            RichText::new(file.status.glyph())
-                                .color(color)
-                                .monospace()
-                                .strong(),
-                        );
-                        child.add_space(4.0);
-                        if has_any_thumb {
-                            paint_inline_thumbnail(&mut child, &repo, file);
-                            child.add_space(6.0);
-                        }
-                        child.add(
-                            egui::Label::new(RichText::new(file_name).monospace())
-                                .truncate()
-                                .selectable(false),
-                        );
-                        let stats = file_stats_str(file);
-                        let galley = ui.painter().layout_no_wrap(
-                            stats,
-                            egui::FontId::monospace(11.0),
-                            ui.visuals().weak_text_color(),
-                        );
-                        ui.painter().galley(
-                            egui::pos2(
-                                rect.right() - galley.size().x - 4.0,
-                                rect.center().y - galley.size().y * 0.5,
-                            ),
-                            galley,
-                            ui.visuals().weak_text_color(),
-                        );
-                        if resp.clicked() {
-                            ws.selected_file_idx = if selected { None } else { Some(i) };
-                            ws.selected_file_view = SelectedFileView::Diff;
-                            ws.set_image_cache(None);
-                        }
+                    } else if resp.hovered() {
+                        ui.painter()
+                            .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
                     }
-                });
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect.shrink2(egui::vec2(16.0, 0.0)))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    child.label(
+                        RichText::new(file.status.glyph())
+                            .color(color)
+                            .monospace()
+                            .strong(),
+                    );
+                    child.add_space(4.0);
+                    child.add(
+                        egui::Label::new(RichText::new(file_name).monospace())
+                            .truncate()
+                            .selectable(false),
+                    );
+                    let stats = file_stats_str(file);
+                    let galley = ui.painter().layout_no_wrap(
+                        stats,
+                        egui::FontId::monospace(11.0),
+                        ui.visuals().weak_text_color(),
+                    );
+                    ui.painter().galley(
+                        egui::pos2(
+                            rect.right() - galley.size().x - 4.0,
+                            rect.center().y - galley.size().y * 0.5,
+                        ),
+                        galley,
+                        ui.visuals().weak_text_color(),
+                    );
+                    if resp.clicked() {
+                        ws.selected_file_idx = if selected { None } else { Some(i) };
+                        ws.selected_file_view = SelectedFileView::Diff;
+                        ws.set_image_cache(None);
+                    }
+                }
             }
         });
-}
-
-/// Draw the inline-thumbnail slot for a single file row, reserving the
-/// same layout footprint whether or not this specific file is an image.
-/// Non-image rows get a transparent spacer so the path text column is
-/// still aligned with the image rows above/below.
-///
-/// Behavior by state:
-///   * not an image → blank spacer of equal size
-///   * `Ready`      → the decoded texture, rendered fit-to-square
-///   * `Pending`    → a faint placeholder square so row width doesn't
-///                     reflow when the decode lands mid-frame
-///   * `Unsupported`/`TooLarge`/`Failed` → blank spacer; the typed
-///                     placeholder / error lives in the detail pane
-///                     where there's room to explain, not the 22px row
-fn paint_inline_thumbnail(ui: &mut egui::Ui, repo: &gix::Repository, file: &FileDiff) {
-    let size = egui::vec2(THUMB_DRAW_SIZE, THUMB_DRAW_SIZE);
-    let FileKind::Image { ext } = &file.kind else {
-        ui.allocate_exact_size(size, egui::Sense::hover());
-        return;
-    };
-    // Prefer `new_oid` (the state after the commit) so the thumbnail
-    // matches the "after" image in the diff pane. For pure deletions
-    // we still show the last-committed image from `old_oid` — the row
-    // is explicitly labelled with a 'D' glyph so there's no ambiguity.
-    let oid = match file.new_oid.or(file.old_oid) {
-        Some(o) => o,
-        None => {
-            ui.allocate_exact_size(size, egui::Sense::hover());
-            return;
-        }
-    };
-    let key = crate::ui::file_preview::PreviewKey {
-        identity: crate::ui::file_preview::PreviewIdentity::Blob(oid),
-        mode: crate::ui::file_preview::PreviewMode::Thumb,
-    };
-    let manager = crate::ui::file_preview::PreviewManager::global();
-    // Peek before reading the blob: `load_blob_bytes` copies into an
-    // `Arc<[u8]>` each call, and the row renders once per frame for
-    // every visible file. Cache-hit fast-path means we never touch the
-    // object DB beyond the first miss.
-    let state = match manager.peek(&key) {
-        Some(s) => s,
-        None => {
-            if let Some(bytes) = crate::git::diff::load_blob_bytes(repo, Some(oid)) {
-                manager.request_blob(
-                    oid,
-                    bytes,
-                    ext,
-                    crate::ui::file_preview::PreviewMode::Thumb,
-                )
-            } else {
-                // Missing blob (shouldn't happen on a well-formed diff):
-                // render a blank spacer, don't poison the cache.
-                ui.allocate_exact_size(size, egui::Sense::hover());
-                return;
-            }
-        }
-    };
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    match state {
-        crate::ui::file_preview::PreviewState::Ready(_) => {
-            if let Some(tex) = manager.texture_for(ui.ctx(), &key, &format!("thumb-{oid}")) {
-                let tex_size = tex.size_vec2();
-                // Fit-to-square while preserving aspect ratio.
-                let scale = (rect.width() / tex_size.x).min(rect.height() / tex_size.y);
-                let draw_size = tex_size * scale;
-                let draw_rect = egui::Rect::from_center_size(rect.center(), draw_size);
-                egui::Image::new(&tex).paint_at(ui, draw_rect);
-            } else {
-                // Transient (texture promotion race on the exact frame
-                // the Ready state landed): treat like Pending for one
-                // frame, then the next frame has the handle cached.
-                ui.painter().rect_filled(
-                    rect,
-                    2.0,
-                    ui.visuals().faint_bg_color.gamma_multiply(0.6),
-                );
-            }
-        }
-        crate::ui::file_preview::PreviewState::Pending => {
-            ui.painter()
-                .rect_filled(rect, 2.0, ui.visuals().faint_bg_color);
-            // Schedule a repaint so we don't have to wait for user
-            // input to re-check the pending state. 50 ms matches the
-            // upper end of a "feels instant" perceptual window.
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(50));
-        }
-        _ => {
-            // Failed / TooLarge / Unsupported: leave the slot blank.
-            // The full preview pane will surface the reason text when
-            // the user selects the row.
-        }
-    }
 }
 
 /// Short stats string like "+12 −3" for a file.
@@ -1426,59 +1535,15 @@ fn selected_image_cache(ws: &mut WorkspaceState, file: &FileDiff) -> Option<Sele
         })
         .unwrap_or(false);
     if !cache_matches {
-        let old_bytes_raw = crate::git::diff::load_blob_bytes(ws.repo.gix(), file.old_oid);
-        let new_bytes_raw = crate::git::diff::load_blob_bytes(ws.repo.gix(), file.new_oid);
-        // Extended formats (TGA / PSD / EXR / HDR / QOI) aren't served
-        // by egui_extras's built-in loaders. We decode them with the
-        // `image` crate (or the PSD embedded-thumbnail parser) and
-        // re-encode as PNG so the cached bytes are always in a format
-        // the loader can render. PNG stored here is the canonical
-        // "preview" representation; the user still sees file size/ext
-        // from the original blob further down.
-        let (old_bytes, new_bytes, stored_ext) =
-            if matches!(ext.as_str(), "tga" | "psd" | "exr" | "hdr" | "qoi") {
-                let old_converted = old_bytes_raw
-                    .as_ref()
-                    .and_then(|b| convert_extended_to_png(b, &ext));
-                let new_converted = new_bytes_raw
-                    .as_ref()
-                    .and_then(|b| convert_extended_to_png(b, &ext));
-                (old_converted, new_converted, "png".to_string())
-            } else {
-                (old_bytes_raw, new_bytes_raw, ext.clone())
-            };
         ws.set_image_cache(Some(SelectedImageCache {
             old_oid: file.old_oid,
             new_oid: file.new_oid,
-            old_bytes,
-            new_bytes,
-            ext: stored_ext,
+            old_bytes: crate::git::diff::load_blob_bytes(ws.repo.gix(), file.old_oid),
+            new_bytes: crate::git::diff::load_blob_bytes(ws.repo.gix(), file.new_oid),
+            ext,
         }));
     }
     ws.selected_image_cache.clone()
-}
-
-/// Decode an extended image format to an in-memory PNG. Returns
-/// `None` on decode failure so the caller can gracefully fall back to
-/// the "image unavailable" placeholder instead of propagating the
-/// error up the frame loop.
-fn convert_extended_to_png(bytes: &[u8], ext: &str) -> Option<std::sync::Arc<[u8]>> {
-    use crate::ui::file_preview::{DecodedImage, FormatKind, PreviewMode};
-    let decoded: Option<DecodedImage> = match ext {
-        "psd" => crate::ui::file_preview::decode_psd_for_diff_pane(bytes).ok(),
-        _ => crate::ui::file_preview::decode_image_for_diff_pane(bytes).ok(),
-    };
-    let _ = (FormatKind::from_ext(ext), PreviewMode::Full);
-    let decoded = decoded?;
-    let img = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.rgba)?;
-    let mut out = Vec::new();
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(
-            &mut std::io::Cursor::new(&mut out),
-            image::ImageFormat::Png,
-        )
-        .ok()?;
-    Some(out.into())
 }
 
 /// One row in the virtualized diff list. Every row has the same fixed
@@ -1653,29 +1718,30 @@ fn render_file_snapshot(
             render_highlighted_snapshot(ui, file, cache);
         }
         FileKind::Image { ext } => {
-            // The snapshot ("File View") is the natural home for a
-            // single-image preview: we're looking at *this file as of
-            // this commit*, not a before/after comparison. We route
-            // through the async preview pipeline (`PreviewManager`) so
-            // large textures don't block the UI thread on decode the
-            // way the raw `image_panel` loader does.
-            let bytes = image_cache
-                .and_then(|cache| cache.new_bytes.clone().or(cache.old_bytes.clone()));
-            let oid = file.new_oid.or(file.old_oid);
-            let caption = if file.new_oid.is_some() {
-                "File at selected commit"
-            } else {
-                "Deleted file (previous contents)"
-            };
-            render_single_image_preview(
-                ui,
-                "snapshot_image",
-                caption,
-                bytes,
-                oid,
-                ext,
-                file.new_size.max(file.old_size),
-            );
+            ScrollArea::both()
+                .id_salt("snapshot_image")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let image = image_cache
+                        .and_then(|cache| cache.new_bytes.clone().or(cache.old_bytes.clone()));
+                    if let Some(bytes) = image {
+                        let caption = if file.new_oid.is_some() {
+                            "File at selected commit"
+                        } else {
+                            "Deleted file (previous contents)"
+                        };
+                        image_panel(
+                            ui,
+                            caption,
+                            bytes,
+                            file.new_size.max(file.old_size),
+                            ext,
+                            file.new_oid.or(file.old_oid),
+                        );
+                    } else {
+                        ui.weak("Could not load image contents for this commit.");
+                    }
+                });
         }
         FileKind::Binary => {
             ui.weak("Binary file snapshot is not shown inline.");
@@ -1888,268 +1954,6 @@ fn image_panel(
             });
         ui.small(format!("{size} bytes · .{ext}"));
     });
-}
-
-/// Zoom/pan state for the single-image preview pane. Kept in egui's
-/// per-context memory keyed by the pane id so state survives frame-to-
-/// frame redraws but auto-resets when the user switches to a different
-/// file (different id = different entry).
-///
-/// `zoom = 0` is a sentinel for "not initialised yet; fit to pane on
-/// the next frame" — we can't compute fit during first paint because
-/// the pane rect isn't known until allocation.
-#[derive(Debug, Clone, Copy)]
-struct ImageZoomPan {
-    /// Absolute zoom: 1.0 = 1 image-pixel per screen-pixel. Lower =
-    /// image is smaller than native, higher = zoomed in.
-    zoom: f32,
-    /// Pan offset in screen pixels relative to the pane centre.
-    pan: egui::Vec2,
-    /// True if the user has manually zoomed — future frames should
-    /// NOT auto-fit on pane resize (they'd feel possessive otherwise).
-    user_zoomed: bool,
-}
-
-impl Default for ImageZoomPan {
-    fn default() -> Self {
-        Self {
-            zoom: 0.0,
-            pan: egui::Vec2::ZERO,
-            user_zoomed: false,
-        }
-    }
-}
-
-/// Single-image preview with mouse-wheel zoom + drag-to-pan + metadata.
-/// Feeds through `PreviewManager` so decode is async and large textures
-/// don't block the UI.
-///
-/// Design notes:
-/// * The pane is always rendered (even when the image is pending /
-///   failed) so the surrounding layout is stable across the decode
-///   lifecycle — no snap when the image lands.
-/// * Zoom uses the mouse position as the anchor: scrolling the wheel
-///   over a specific pixel keeps that pixel under the cursor. This is
-///   what every modern image viewer does and it's worth the small
-///   cost over naive centre-zoom.
-/// * Metadata row lives *below* the image with the caption on top so
-///   the eye falls through the image first, then reads context. Flips
-///   from the old side-by-side layout which led with the caption.
-fn render_single_image_preview(
-    ui: &mut egui::Ui,
-    id_salt: &str,
-    caption: &str,
-    bytes: Option<Arc<[u8]>>,
-    oid: Option<gix::ObjectId>,
-    ext: &str,
-    size_bytes: usize,
-) {
-    use crate::ui::file_preview::{
-        PreviewIdentity, PreviewKey, PreviewManager, PreviewMode, PreviewState,
-    };
-
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(caption).strong());
-            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Fit").on_hover_text("Fit to pane").clicked() {
-                    // Fit button resets both zoom and pan; clearing
-                    // user_zoomed re-enables auto-fit on resize.
-                    let id = ui.make_persistent_id((id_salt, "zoompan"));
-                    ui.ctx().memory_mut(|m| {
-                        m.data.insert_temp(id, ImageZoomPan::default());
-                    });
-                }
-            });
-        });
-
-        let Some(bytes) = bytes else {
-            ui.weak("Could not load image contents.");
-            return;
-        };
-
-        // Identity for the preview pipeline. Anonymous (no oid) paths
-        // hash the pointer so working-tree edits still dedupe within
-        // one edit session.
-        let identity = match oid {
-            Some(o) => PreviewIdentity::Blob(o),
-            None => PreviewIdentity::Blob(synthetic_oid_for_ptr(bytes.as_ptr() as usize)),
-        };
-        let key = PreviewKey {
-            identity,
-            mode: PreviewMode::Full,
-        };
-        let manager = PreviewManager::global();
-        let state = match manager.peek(&key) {
-            Some(s) => s,
-            None => {
-                let pseudo_oid = match oid {
-                    Some(o) => o,
-                    None => synthetic_oid_for_ptr(bytes.as_ptr() as usize),
-                };
-                manager.request_blob(pseudo_oid, bytes.clone(), ext, PreviewMode::Full)
-            }
-        };
-
-        // Reserve the remaining vertical space minus a small footer
-        // area for metadata. A fixed max keeps enormous 8k textures
-        // from eating the entire pane.
-        let avail = ui.available_size();
-        let pane_size = egui::vec2(avail.x.max(200.0), (avail.y - 36.0).max(200.0));
-        let (rect, resp) = ui.allocate_exact_size(pane_size, egui::Sense::click_and_drag());
-        ui.painter()
-            .rect_stroke(rect, 2.0, Stroke::new(1.0, Color32::from_gray(70)));
-
-        match state {
-            PreviewState::Ready(ref img) => {
-                let tex_name = format!(
-                    "preview-full-{}",
-                    oid.map(|o| o.to_string())
-                        .unwrap_or_else(|| "anon".to_string())
-                );
-                if let Some(tex) = manager.texture_for(ui.ctx(), &key, &tex_name) {
-                    draw_image_with_zoom_pan(ui, rect, &resp, &tex, id_salt);
-                }
-                ui.small(format!(
-                    "{w} × {h} · {size} bytes · .{ext}",
-                    w = img.width,
-                    h = img.height,
-                    size = size_bytes,
-                ));
-            }
-            PreviewState::Pending => {
-                ui.painter()
-                    .rect_filled(rect, 2.0, ui.visuals().faint_bg_color);
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Decoding…",
-                    egui::FontId::proportional(13.0),
-                    ui.visuals().weak_text_color(),
-                );
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(50));
-                ui.small(format!("{size_bytes} bytes · .{ext}"));
-            }
-            PreviewState::Failed { reason } => {
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    format!("Preview failed: {reason}"),
-                    egui::FontId::proportional(13.0),
-                    Color32::from_rgb(220, 140, 120),
-                );
-                ui.small(format!("{size_bytes} bytes · .{ext}"));
-            }
-            PreviewState::TooLarge { bytes: n } => {
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    format!(
-                        "Image too large to preview ({n} bytes > {} MB cap)",
-                        crate::ui::file_preview::MAX_INPUT_BYTES / (1024 * 1024)
-                    ),
-                    egui::FontId::proportional(13.0),
-                    Color32::from_rgb(220, 180, 90),
-                );
-                ui.small(format!("{size_bytes} bytes · .{ext}"));
-            }
-            PreviewState::Unsupported { label } => {
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    label,
-                    egui::FontId::proportional(13.0),
-                    ui.visuals().weak_text_color(),
-                );
-                ui.small(format!("{size_bytes} bytes · .{ext}"));
-            }
-        }
-    });
-}
-
-/// Build a deterministic synthetic `ObjectId` from a pointer. We only
-/// use this to feed `request_blob` — it doesn't have to be a real git
-/// object, just stable across frames for the same `Arc<[u8]>`.
-fn synthetic_oid_for_ptr(ptr: usize) -> gix::ObjectId {
-    let mut bytes = [0u8; 20];
-    let p = (ptr as u64).to_le_bytes();
-    bytes[..8].copy_from_slice(&p);
-    // Tag remaining bytes so a collision with a real SHA-1 is vanishingly
-    // unlikely. "MERGEFOXSYNT" fills 12 bytes.
-    bytes[8..20].copy_from_slice(b"MERGEFOXSYNT");
-    gix::ObjectId::from_bytes_or_panic(&bytes)
-}
-
-/// Actually draw the texture, applying the active zoom/pan and
-/// updating it from mouse events this frame. Called only when the
-/// preview is in the `Ready` state and we have a `TextureHandle`.
-fn draw_image_with_zoom_pan(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    resp: &egui::Response,
-    tex: &egui::TextureHandle,
-    id_salt: &str,
-) {
-    let id = ui.make_persistent_id((id_salt, "zoompan"));
-    let mut zp: ImageZoomPan = ui
-        .ctx()
-        .memory(|m| m.data.get_temp::<ImageZoomPan>(id))
-        .unwrap_or_default();
-    let tex_size = tex.size_vec2();
-
-    // Auto-fit on first frame (or after user pressed Fit).
-    if zp.zoom <= 0.0 {
-        let fit = (rect.width() / tex_size.x)
-            .min(rect.height() / tex_size.y)
-            .min(1.0)
-            .max(0.01);
-        zp.zoom = fit;
-        zp.pan = egui::Vec2::ZERO;
-        zp.user_zoomed = false;
-    }
-
-    // Scroll-wheel zoom with mouse-anchored scaling. We use the raw
-    // scroll delta (not smoothed) for direct feel; one tick ≈ 10%.
-    if resp.hovered() {
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
-        if scroll != 0.0 {
-            let factor = (scroll / 120.0).exp2(); // one full "tick" ≈ 2x
-            let new_zoom = (zp.zoom * factor).clamp(0.02, 32.0);
-            // Anchor around the cursor: offset the pan so the world
-            // point under the cursor stays under the cursor.
-            if let Some(cursor) = resp.hover_pos() {
-                let centre = rect.center() + zp.pan;
-                let world_under_cursor = (cursor - centre) / zp.zoom;
-                let new_centre = cursor - world_under_cursor * new_zoom;
-                zp.pan = new_centre - rect.center();
-            }
-            zp.zoom = new_zoom;
-            zp.user_zoomed = true;
-        }
-    }
-
-    // Drag-to-pan.
-    if resp.dragged() {
-        zp.pan += resp.drag_delta();
-    }
-
-    // Compute draw rect and blit.
-    let draw_size = tex_size * zp.zoom;
-    let centre = rect.center() + zp.pan;
-    let draw_rect = egui::Rect::from_center_size(centre, draw_size);
-    // Clip to pane so zoomed-in images don't bleed over neighbouring
-    // widgets (e.g. the metadata footer below).
-    let painter = ui.painter_at(rect);
-    painter.image(
-        tex.id(),
-        draw_rect,
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
-
-    // Persist updated state for the next frame.
-    ui.ctx().memory_mut(|m| m.data.insert_temp(id, zp));
 }
 
 fn empty_panel(ui: &mut egui::Ui, caption: &str) {
