@@ -743,6 +743,11 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
         ui.close_menu();
     }
 
+    if ui.button("Split commit…").clicked() {
+        action = Some(CommitAction::SplitCommit(row.oid));
+        ui.close_menu();
+    }
+
     // ---- HEAD-specific ----
     if is_head {
         ui.separator();

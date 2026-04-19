@@ -7,9 +7,13 @@ pub mod jobs;
 pub mod lfs;
 pub mod ops;
 pub mod repo;
+pub mod split_ops;
 
 pub use basket_ops::{
     revert_to_working_tree, squash_basket_into_one, RevertOutcome, SquashOutcome,
+};
+pub use split_ops::{
+    discover_hunks, split_commit, DiscoveredHunk, HunkRef, SplitOutcome, SplitPart, SplitPlan,
 };
 pub use blame::{blame_file, BlameCommit, BlameLine, BlameResult};
 pub use cli::{
