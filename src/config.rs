@@ -63,6 +63,11 @@ pub struct Config {
     /// newer binary.
     #[serde(default)]
     pub diff_prefs: DiffPrefs,
+    /// Repo paths for which the user has dismissed the "switch to
+    /// Game-dev mode?" auto-detection toast. Recorded so we don't nag
+    /// the same repo twice across restarts.
+    #[serde(default)]
+    pub profile_suggestion_dismissed_for: Vec<PathBuf>,
     // NOTE: the `secrets_backend` field was removed along with the OS
     // keychain dependency. Old config files that still have it will be
     // silently ignored by serde. Going forward the secret store is
@@ -82,6 +87,7 @@ impl Default for Config {
             ai_endpoint: None,
             clone_defaults: CloneDefaults::default(),
             diff_prefs: DiffPrefs::default(),
+            profile_suggestion_dismissed_for: Vec::new(),
         }
     }
 }
@@ -517,6 +523,49 @@ pub struct RepoSettings {
     /// pick which one pushes to which repo.
     #[serde(default)]
     pub provider_account: Option<String>,
+    /// Per-user workspace profile override for this repo. Priority:
+    /// user override > team file (`.mergefox/workspace.toml`) > General.
+    /// `None` = fall through to team file / default.
+    #[serde(default)]
+    pub profile_override: Option<WorkspaceProfile>,
+}
+
+/// Which workspace profile applies to a repo. A profile bundles UI
+/// defaults / visibility rules consumed via
+/// `crate::ui::profile_rules::rules_for`. Profiles never change git
+/// semantics — only what panels / buttons / labels the UI surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceProfile {
+    #[default]
+    General,
+    GameDev,
+    /// Reserved — dropdown shows it disabled with a "Coming soon"
+    /// hover. In the enum so forward-compat config files don't need a
+    /// migration when the feature ships.
+    Minimal,
+}
+
+impl WorkspaceProfile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::GameDev => "Game-dev",
+            Self::Minimal => "Minimal",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::General => {
+                "Balanced defaults: full history, every panel on, advanced rebase visible."
+            }
+            Self::GameDev => {
+                "Asset-heavy repositories: LFS lock controls, project-tree centre view, \
+                 simplified history actions."
+            }
+            Self::Minimal => "Reserved for a future release.",
+        }
+    }
 }
 
 impl Config {
@@ -549,6 +598,7 @@ impl Config {
             ai_endpoint: self.ai_endpoint.as_ref(),
             clone_defaults: &self.clone_defaults,
             diff_prefs: &self.diff_prefs,
+            profile_suggestion_dismissed_for: &self.profile_suggestion_dismissed_for,
         };
         write_config(&path, &to_write)
     }
@@ -631,6 +681,7 @@ struct SerConfig<'a> {
     ai_endpoint: Option<&'a crate::ai::Endpoint>,
     clone_defaults: &'a CloneDefaults,
     diff_prefs: &'a DiffPrefs,
+    profile_suggestion_dismissed_for: &'a [PathBuf],
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -746,6 +797,7 @@ fn save_config_to_path(path: &Path, cfg: &Config) -> Result<()> {
         ai_endpoint: cfg.ai_endpoint.as_ref(),
         clone_defaults: &cfg.clone_defaults,
         diff_prefs: &cfg.diff_prefs,
+        profile_suggestion_dismissed_for: &cfg.profile_suggestion_dismissed_for,
     };
     write_config(path, &to_write)
 }
