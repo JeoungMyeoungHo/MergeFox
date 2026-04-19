@@ -34,7 +34,13 @@ use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{Color32, FontId, RichText, ScrollArea, Stroke, TextEdit};
 
 use crate::app::{MergeFoxApp, View, WorkspaceState};
-use crate::git::{ConflictBlob, ConflictChoice, ConflictEntry, RepoState};
+use crate::git::{
+    compose_resolved_text, parse_conflict_markers, ConflictBlob, ConflictChoice, ConflictEntry,
+    HunkResolution, HunkResolutionState, RepoState,
+};
+use crate::ui::conflict_hunks_view::{
+    self as hunks_view, HunkIntent, SideLabels as HunksViewLabels,
+};
 
 /// Palette — picked to keep ours/theirs distinguishable even on
 /// dark-or-light themes. RGB values are hand-tuned; sRGB is fine for egui.
@@ -80,6 +86,19 @@ enum ConflictIntent {
     /// detached — it may open a blocking GUI or write directly back to
     /// the working tree, depending on the configured tool.
     LaunchMergetool(PathBuf),
+    /// A user action inside the per-hunk editor. The enum variant carries
+    /// the intent exactly as the view emitted it; we bundle the file path
+    /// alongside so the applier can validate it still matches the selected
+    /// conflict even after a slow state change.
+    HunkAction(PathBuf, HunkIntent),
+    /// Save the per-hunk-composed result. Fired only when every hunk in
+    /// the selected file has a non-Pending resolution — the UI button
+    /// itself is disabled otherwise, but we double-check in the applier
+    /// so a keyboard shortcut can't bypass the guard.
+    SaveHunks(PathBuf),
+    /// Reset every hunk's resolution to `Pending` for the selected file.
+    /// Used as a "start over" escape hatch.
+    ResetHunks(PathBuf),
     Continue,
     Abort,
 }
@@ -439,6 +458,170 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
                     ui.add_space(6.0);
 
+                    // ---------- Semantic hint banner ----------------------
+                    //
+                    // Tree-level conflict classes (added/removed on one
+                    // side, binary conflicts) are surfaced as a single-line
+                    // banner above the per-hunk editor. Picking a whole
+                    // side is the only sensible move in these cases, so we
+                    // keep the hunk UI hidden further down.
+                    render_semantic_banner(ui, entry);
+
+                    // ---------- Per-hunk interactive editor ---------------
+                    //
+                    // The per-hunk editor is the *primary* surface for
+                    // line-level resolution. Each Conflict chunk becomes an
+                    // independently-resolvable card: Use ours, Use theirs,
+                    // Use both, or Edit custom. The raw-textarea editor is
+                    // kept below the Advanced collapsing header for users
+                    // who want to drop to markers.
+                    //
+                    // Binary files skip this entirely — the Pick-whole-file
+                    // buttons above are the only path forward there.
+                    if !entry.is_binary {
+                        let parsed =
+                            parse_conflict_markers(&ws.conflict_editor_text);
+                        if parsed.conflict_count() > 0 {
+                            // Make sure the resolutions vector matches the
+                            // parser's hunk count. ensure_conflict_editor
+                            // already sized it, but a mid-session save can
+                            // shrink the text; defensive resize keeps the
+                            // view's index invariants.
+                            if ws.conflict_hunk_resolutions.len()
+                                != parsed.conflict_count()
+                            {
+                                ws.conflict_hunk_resolutions.resize(
+                                    parsed.conflict_count(),
+                                    HunkResolutionState::default(),
+                                );
+                            }
+
+                            // Persistent open/closed state for the inline
+                            // custom editors — one bool per hunk. Stored
+                            // in egui memory so it survives re-renders
+                            // without living on `WorkspaceState` (it's UI
+                            // transient, not domain state).
+                            let custom_mem_id = egui::Id::new((
+                                "conflict_hunk_custom_open",
+                                &entry.path,
+                            ));
+                            let mut open_custom = ui
+                                .ctx()
+                                .data(|d| {
+                                    d.get_temp::<Vec<bool>>(custom_mem_id)
+                                        .clone()
+                                })
+                                .unwrap_or_default();
+                            if open_custom.len()
+                                != parsed.conflict_count()
+                            {
+                                open_custom
+                                    .resize(parsed.conflict_count(), false);
+                            }
+
+                            let side_labels = HunksViewLabels {
+                                ours_short: labels.ours_short.clone(),
+                                theirs_short: labels.theirs_short.clone(),
+                            };
+                            let mut hunk_intents = hunks_view::render(
+                                ui,
+                                &parsed,
+                                &ws.conflict_hunk_resolutions,
+                                ws.conflict_active_hunk,
+                                &side_labels,
+                                &mut open_custom,
+                            );
+                            hunks_view::handle_shortcuts(
+                                ui.ctx(),
+                                true,
+                                &mut hunk_intents,
+                            );
+
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(custom_mem_id, open_custom);
+                            });
+
+                            for hi in hunk_intents {
+                                intent = Some(ConflictIntent::HunkAction(
+                                    entry.path.clone(),
+                                    hi,
+                                ));
+                            }
+
+                            // Per-hunk action bar: Save & Reset.
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                let all_resolved =
+                                    ws.conflict_hunk_resolutions.iter().all(
+                                        |r| {
+                                            r.resolution
+                                                != HunkResolution::Pending
+                                        },
+                                    );
+                                let save_btn = egui::Button::new(
+                                    RichText::new(
+                                        "✓ Save & mark resolved",
+                                    )
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                                )
+                                .fill(if all_resolved {
+                                    palette::SUCCESS
+                                } else {
+                                    Color32::DARK_GRAY
+                                });
+                                let resp = ui
+                                    .add_enabled(all_resolved, save_btn)
+                                    .on_hover_text(if all_resolved {
+                                        "Compose the resolved file from \
+                                         the hunk choices and stage it \
+                                         (keyboard: Enter)"
+                                    } else {
+                                        "Resolve every hunk first — \
+                                         pending hunks block saving."
+                                    });
+                                if resp.clicked()
+                                    || (all_resolved
+                                        && ui.ctx().input(|i| {
+                                            i.key_pressed(egui::Key::Enter)
+                                        }))
+                                {
+                                    intent = Some(ConflictIntent::SaveHunks(
+                                        entry.path.clone(),
+                                    ));
+                                }
+                                if ui
+                                    .button(
+                                        RichText::new("Reset all to Pending"),
+                                    )
+                                    .on_hover_text(
+                                        "Clear every hunk's chosen side and start over",
+                                    )
+                                    .clicked()
+                                {
+                                    intent =
+                                        Some(ConflictIntent::ResetHunks(
+                                            entry.path.clone(),
+                                        ));
+                                }
+                            });
+                        } else {
+                            // Parse failure — git says this file has conflicts
+                            // but we couldn't find any markers, or the markers
+                            // are malformed. Surface a warning banner and
+                            // fall back to the raw textarea further down.
+                            ui.colored_label(
+                                palette::WARNING,
+                                RichText::new(
+                                    "⚠ Marker parse failed — edit raw content below",
+                                )
+                                .strong(),
+                            );
+                        }
+                    }
+
+                    ui.add_space(6.0);
+
                     // ---------- Line-by-line 3-way editor -----------------
                     //
                     // A dedicated side-by-side view where each conflict hunk
@@ -749,9 +932,167 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         Some(ConflictIntent::LaunchMergetool(path)) => {
             launch_mergetool(app, &path);
         }
+        Some(ConflictIntent::HunkAction(path, hi)) => {
+            apply_hunk_intent(app, &path, hi);
+        }
+        Some(ConflictIntent::SaveHunks(path)) => {
+            save_hunks(app, &path);
+        }
+        Some(ConflictIntent::ResetHunks(path)) => {
+            reset_hunks(app, &path);
+        }
         Some(ConflictIntent::Continue) => app.continue_conflict_operation(),
         Some(ConflictIntent::Abort) => app.abort_conflict_operation(),
         None => {}
+    }
+}
+
+/// Apply a single `HunkIntent` coming out of the per-hunk editor view.
+///
+/// All mutation lives on `WorkspaceState::conflict_hunk_resolutions` +
+/// `conflict_active_hunk`; the filesystem / repo only sees the result
+/// when the user explicitly presses "Save & mark resolved" (which fires
+/// the separate `SaveHunks` intent). Keeping commit-on-explicit-save
+/// means the user can try Use Ours / Use Theirs / Custom on a single
+/// hunk without every click flushing to disk.
+fn apply_hunk_intent(app: &mut MergeFoxApp, path: &Path, hi: HunkIntent) {
+    let View::Workspace(tabs) = &mut app.view else {
+        return;
+    };
+    let ws = tabs.current_mut();
+    if ws.conflict_editor_path.as_deref() != Some(path) {
+        return;
+    }
+    match hi {
+        HunkIntent::Set { index, resolution } => {
+            if let Some(slot) = ws.conflict_hunk_resolutions.get_mut(index) {
+                slot.resolution = resolution;
+            }
+            ws.conflict_active_hunk = Some(index);
+        }
+        HunkIntent::OpenCustom { index, seed } => {
+            if let Some(slot) = ws.conflict_hunk_resolutions.get_mut(index) {
+                if slot.custom_text.is_empty() {
+                    slot.custom_text = seed;
+                }
+            }
+            ws.conflict_active_hunk = Some(index);
+        }
+        HunkIntent::EditCustom { index, text } => {
+            if let Some(slot) = ws.conflict_hunk_resolutions.get_mut(index) {
+                slot.custom_text = text;
+                slot.resolution = HunkResolution::Custom;
+            }
+            ws.conflict_active_hunk = Some(index);
+        }
+        HunkIntent::CloseCustom { index: _ } => {
+            // The open/closed flag is tracked in egui memory, not here —
+            // no mutation required on the workspace side.
+        }
+        HunkIntent::NavPending { forward } => {
+            if let Some(next) = hunks_view::next_pending(
+                &ws.conflict_hunk_resolutions,
+                ws.conflict_active_hunk,
+                forward,
+            ) {
+                ws.conflict_active_hunk = Some(next);
+            }
+        }
+        HunkIntent::SetActive { resolution } => {
+            let idx = ws.conflict_active_hunk.unwrap_or(0);
+            if let Some(slot) = ws.conflict_hunk_resolutions.get_mut(idx) {
+                slot.resolution = resolution;
+            }
+        }
+    }
+}
+
+/// Assemble the resolved text from the per-hunk selections, write it to
+/// disk, and stage it via `resolve_conflict_manual`. The UI button is
+/// already disabled when any hunk is pending, but we guard here too so a
+/// keyboard shortcut can't slip through.
+fn save_hunks(app: &mut MergeFoxApp, path: &Path) {
+    let composed = {
+        let View::Workspace(tabs) = &app.view else {
+            return;
+        };
+        let ws = tabs.current();
+        if ws.conflict_editor_path.as_deref() != Some(path) {
+            return;
+        }
+        let parsed = parse_conflict_markers(&ws.conflict_editor_text);
+        compose_resolved_text(&parsed, &ws.conflict_hunk_resolutions)
+    };
+    match composed {
+        Some(text) => resolve_conflict_manual(app, path, &text),
+        None => {
+            app.last_error = Some(
+                "save hunks: one or more hunks are still Pending".to_string(),
+            );
+        }
+    }
+}
+
+/// Reset every hunk in the active file back to `Pending`, wiping any
+/// custom-editor text the user typed. Used by the "Reset all" button —
+/// the equivalent of closing and reopening the file, but without losing
+/// the user's place in the conflict list.
+fn reset_hunks(app: &mut MergeFoxApp, path: &Path) {
+    let View::Workspace(tabs) = &mut app.view else {
+        return;
+    };
+    let ws = tabs.current_mut();
+    if ws.conflict_editor_path.as_deref() != Some(path) {
+        return;
+    }
+    for slot in ws.conflict_hunk_resolutions.iter_mut() {
+        *slot = HunkResolutionState::default();
+    }
+    ws.conflict_active_hunk = if ws.conflict_hunk_resolutions.is_empty() {
+        None
+    } else {
+        Some(0)
+    };
+}
+
+/// Render a single-line banner describing a tree-level conflict class, if
+/// the entry matches one. Called above the per-hunk editor. Silent when
+/// nothing notable applies (normal modify/modify conflict).
+fn render_semantic_banner(ui: &mut egui::Ui, entry: &ConflictEntry) {
+    // Binary conflicts are already red-chipped in the file header; we
+    // re-surface the message here because the per-hunk editor is about
+    // to be suppressed and users should see *why* line-level picking is
+    // unavailable.
+    if entry.is_binary {
+        ui.colored_label(
+            palette::DANGER,
+            RichText::new(
+                "⛔ Binary file conflict: line merging disabled. Pick ours or theirs.",
+            )
+            .strong(),
+        );
+        return;
+    }
+    match (entry.ancestor.is_some(), entry.ours.is_some(), entry.theirs.is_some()) {
+        (false, true, false) => {
+            ui.colored_label(
+                palette::WARNING,
+                RichText::new(
+                    "⚠ Add / remove conflict: added in ours, deleted in theirs. Pick whole file below.",
+                )
+                .strong(),
+            );
+        }
+        (false, false, true) => {
+            ui.colored_label(
+                palette::WARNING,
+                RichText::new(
+                    "⚠ Add / remove conflict: added in theirs, deleted in ours. Pick whole file below.",
+                )
+                .strong(),
+            );
+        }
+        _ => {}
     }
 }
 
@@ -1052,6 +1393,18 @@ fn ensure_conflict_editor(ws: &mut WorkspaceState, conflicts: &[ConflictEntry], 
         .unwrap_or_default();
     ws.conflict_editor_path = Some(path.to_path_buf());
     ws.conflict_editor_text = text;
+    // The per-hunk resolution vector is file-scoped — switching files or
+    // re-loading from the working tree starts over from `Pending` for every
+    // hunk. Shape the vector to exactly the number of `Conflict` chunks the
+    // parser finds so the UI can index into it without bounds checks.
+    let parsed = parse_conflict_markers(&ws.conflict_editor_text);
+    ws.conflict_hunk_resolutions =
+        vec![HunkResolutionState::default(); parsed.conflict_count()];
+    ws.conflict_active_hunk = if parsed.conflict_count() > 0 {
+        Some(0)
+    } else {
+        None
+    };
 }
 
 fn resolve_conflict_choice(app: &mut MergeFoxApp, path: &Path, choice: ConflictChoice) {

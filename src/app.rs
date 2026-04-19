@@ -605,6 +605,17 @@ pub struct WorkspaceState {
     pub conflict_editor_path: Option<PathBuf>,
     /// Editor contents for `conflict_editor_path`.
     pub conflict_editor_text: String,
+    /// Per-hunk resolution state for the currently selected conflict file.
+    /// Lives here (not on `MergeFoxApp`) because it's file-scoped and
+    /// resets when the user switches between conflicted files — the
+    /// per-file entry point `ensure_conflict_editor` repopulates it by
+    /// re-parsing `conflict_editor_text`. Indexed 1:1 with the `Conflict`
+    /// chunks in the parsed view of `conflict_editor_text`.
+    pub conflict_hunk_resolutions: Vec<crate::git::HunkResolutionState>,
+    /// Which hunk (among `Conflict` chunks only) the keyboard shortcuts
+    /// act on. Starts at 0; `n`/`p` jump between pending hunks. None when
+    /// no file is selected or the file has no parsed conflicts.
+    pub conflict_active_hunk: Option<usize>,
     /// Modal state for planning an interactive rebase.
     pub rebase_modal: Option<RebaseModalState>,
     /// Active linear rebase replay session, if one is in progress.
@@ -2735,6 +2746,8 @@ impl MergeFoxApp {
             selected_conflict: None,
             conflict_editor_path: None,
             conflict_editor_text: String::new(),
+            conflict_hunk_resolutions: Vec::new(),
+            conflict_active_hunk: None,
             rebase_modal: None,
             rebase_session: None,
             column_prefs: ColumnPrefs::default(),

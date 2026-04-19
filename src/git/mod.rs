@@ -3,6 +3,7 @@ pub mod blame;
 pub mod find_fix_ops;
 pub mod reword_ops;
 pub mod cli;
+pub mod conflict_hunks;
 pub mod diff;
 pub mod graph;
 pub mod hunk_staging;
@@ -31,6 +32,10 @@ pub use split_ops::{
     discover_hunks, split_commit, DiscoveredHunk, HunkRef, SplitOutcome, SplitPart, SplitPlan,
 };
 pub use blame::{blame_file, BlameCommit, BlameLine, BlameResult};
+pub use conflict_hunks::{
+    compose_resolved_text, default_custom_seed, parse_conflict_markers, ConflictHunkKind,
+    HunkResolution, HunkResolutionState, ParsedConflict,
+};
 pub use cli::{
     classify_git_error, probe_git_capability, recent_git_log, GitCapability, GitErrorKind,
 };
