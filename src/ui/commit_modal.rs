@@ -573,14 +573,40 @@ fn render_row(
         ui.label(RichText::new(glyph).color(color).monospace().strong());
 
         // Clickable path label — clicking toggles the checkbox so users
-        // don't have to aim at the tiny checkbox.
+        // don't have to aim at the tiny checkbox. Right-click opens a
+        // lightweight context menu for whole-file staging shortcuts
+        // (per-hunk staging lives in the diff view itself).
         let path_text = entry.path.display().to_string();
-        if ui
-            .add(egui::Label::new(path_text).sense(egui::Sense::click()))
-            .clicked()
-        {
+        let label_resp = ui.add(
+            egui::Label::new(path_text.clone()).sense(egui::Sense::click()),
+        );
+        if label_resp.clicked() {
             apply_selection_click(ui, panel_entries, entry, modal);
         }
+        label_resp.context_menu(|ui| {
+            let has_unstaged = entry.unstaged || matches!(entry.kind, EntryKind::Untracked);
+            let has_staged = entry.staged;
+            if has_unstaged
+                && ui
+                    .button("Stage all hunks of this file")
+                    .on_hover_text("Same as the downward arrow on the right — stages the whole file")
+                    .clicked()
+            {
+                *move_intent = Some(MoveIntent::StageOne(entry.path.clone()));
+                ui.close_menu();
+            }
+            if has_staged
+                && ui
+                    .button("Unstage all hunks of this file")
+                    .on_hover_text("Move every staged change for this file back to the working tree")
+                    .clicked()
+            {
+                *move_intent = Some(MoveIntent::UnstageOne(entry.path.clone()));
+                ui.close_menu();
+            }
+            ui.separator();
+            ui.weak("For per-hunk staging, open the diff view for this file.");
+        });
 
         // Per-row move arrow on the right edge.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
