@@ -276,4 +276,11 @@ impl MergeFoxApp {
         self.notifications
             .push_with_detail(NotifSeverity::Error, msg, Some(detail.into()));
     }
+    /// Success counterpart to `notify_err_with_detail`. Used after a
+    /// partial / sparse clone so the filter level and sparse list are
+    /// readable under a short headline.
+    pub fn notify_ok_with_detail(&mut self, msg: impl Into<String>, detail: impl Into<String>) {
+        self.notifications
+            .push_with_detail(NotifSeverity::Success, msg, Some(detail.into()));
+    }
 }
