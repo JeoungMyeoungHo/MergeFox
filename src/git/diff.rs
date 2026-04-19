@@ -310,6 +310,36 @@ pub fn diff_text_for_working_entry(repo_path: &Path, entry: &StatusEntry) -> Res
     run_diff_command(text)
 }
 
+/// Fetch just the *unstaged* unified diff for a working-tree entry —
+/// i.e. the slice that `git apply --cached` would move into the index.
+/// Used by the hunk-staging UI when the user clicks "Stage hunk" so the
+/// patch we generate matches the working-tree → index semantics exactly.
+pub fn diff_text_unstaged_only(repo_path: &Path, entry: &StatusEntry) -> Result<String> {
+    if matches!(entry.kind, EntryKind::New | EntryKind::Untracked) {
+        // `git diff -- <path>` against the index is empty for an
+        // untracked/newly-added path; for these the hunk flow is
+        // disabled and callers fall back to whole-file staging.
+        return Ok(String::new());
+    }
+    let cmd = super::cli::GitCommand::new(repo_path)
+        .args(["diff", "--binary", "--unified=3", "--"])
+        .arg(&entry.path);
+    run_diff_command(cmd)
+}
+
+/// Fetch just the *staged* diff (index vs HEAD) for a working-tree
+/// entry — the slice that `git apply --cached --reverse` would move
+/// back out of the index.
+pub fn diff_text_staged_only(repo_path: &Path, entry: &StatusEntry) -> Result<String> {
+    if matches!(entry.kind, EntryKind::Untracked) {
+        return Ok(String::new());
+    }
+    let cmd = super::cli::GitCommand::new(repo_path)
+        .args(["diff", "--cached", "--binary", "--unified=3", "--"])
+        .arg(&entry.path);
+    run_diff_command(cmd)
+}
+
 /// Convert cached unified diff text for a working-tree entry into the same
 /// `FileDiff` structure used by commit diffs, so the UI can reuse the normal
 /// renderer without a special-case text widget.

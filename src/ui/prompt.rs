@@ -120,6 +120,14 @@ pub enum ConfirmKind {
         remote: String,
         branch: String,
     },
+    /// Discard a working-tree hunk. Destructive — the change is gone
+    /// from disk and only recoverable via the file's last-saved IDE
+    /// buffer or the OS trash. `line_indices` empty = whole hunk.
+    DiscardHunk {
+        file: std::path::PathBuf,
+        hunk_index: usize,
+        line_indices: Vec<usize>,
+    },
 }
 
 impl ConfirmKind {
@@ -130,6 +138,7 @@ impl ConfirmKind {
             Self::DropCommit { .. } => "Drop commit?",
             Self::DropStash { .. } => "Drop stash?",
             Self::ForcePush { .. } => "Force push?",
+            Self::DiscardHunk { .. } => "Discard hunk?",
         }
     }
 
@@ -168,6 +177,22 @@ impl ConfirmKind {
             Self::ForcePush { remote, branch } => format!(
                 "Force-push `{branch}` to `{remote}`?\n\nPrefer `force-with-lease` unless you're certain no one else pushed while you worked."
             ),
+            Self::DiscardHunk {
+                file,
+                hunk_index,
+                line_indices,
+            } => {
+                let scope = if line_indices.is_empty() {
+                    "the whole hunk".to_string()
+                } else {
+                    format!("{} selected line(s)", line_indices.len())
+                };
+                format!(
+                    "Discard {scope} from `{}` (hunk {})?\n\nThis reverts the working tree only — the index and committed history are untouched — but there's no journal entry for it. If the file is open in an editor, unsaved buffers may overwrite the discard.",
+                    file.display(),
+                    hunk_index + 1
+                )
+            }
         }
     }
 }
@@ -526,6 +551,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                                     ConfirmKind::DropCommit { .. } => "Drop",
                                     ConfirmKind::DropStash { .. } => "Drop stash",
                                     ConfirmKind::ForcePush { .. } => "Force push",
+                                    ConfirmKind::DiscardHunk { .. } => "Discard",
                                 };
                                 if ui
                                     .button(
@@ -792,6 +818,22 @@ pub fn stash_push_prompt() -> PendingPrompt {
 pub fn drop_stash_confirm(index: usize, message: String) -> PendingPrompt {
     PendingPrompt::Confirm {
         kind: ConfirmKind::DropStash { index, message },
+        confirmed: false,
+        preflight: None,
+    }
+}
+
+pub fn hunk_discard_confirm(
+    file: std::path::PathBuf,
+    hunk_index: usize,
+    line_indices: Vec<usize>,
+) -> PendingPrompt {
+    PendingPrompt::Confirm {
+        kind: ConfirmKind::DiscardHunk {
+            file,
+            hunk_index,
+            line_indices,
+        },
         confirmed: false,
         preflight: None,
     }

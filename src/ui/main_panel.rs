@@ -1224,6 +1224,53 @@ fn run_prompt(app: &mut MergeFoxApp, prompt: PendingPrompt) -> DispatchOutcome {
                     Err(e) => out.error = Some(format!("stash drop: {e:#}")),
                 }
             }
+            crate::ui::prompt::ConfirmKind::DiscardHunk {
+                file,
+                hunk_index,
+                line_indices,
+            } => {
+                // Re-fetch the unstaged diff now (not at prompt-open
+                // time) so concurrent editor saves can't fool the
+                // patch with a stale view. `git apply --check` inside
+                // `discard_hunk` will catch residual mismatches and
+                // surface them via the error path.
+                let repo_path = ws.repo.path().to_path_buf();
+                let entry = ws
+                    .repo_ui_cache
+                    .as_ref()
+                    .and_then(|c| c.working.as_ref())
+                    .and_then(|entries| entries.iter().find(|e| e.path == file).cloned());
+                match entry {
+                    Some(e) => {
+                        let side_text = crate::git::diff_text_unstaged_only(&repo_path, &e)
+                            .unwrap_or_default();
+                        let fd = crate::git::file_diff_for_working_entry(&e, &side_text);
+                        let sel = crate::git::hunk_staging::HunkSelector {
+                            file: file.clone(),
+                            hunk_index,
+                            line_indices,
+                        };
+                        match crate::git::hunk_staging::discard_hunk(&repo_path, &fd, &sel) {
+                            Ok(()) => {
+                                out.hud = Some(format!(
+                                    "Discarded hunk {} in {}",
+                                    hunk_index + 1,
+                                    file.display()
+                                ));
+                                ws.working_file_diff = None;
+                                ws.hunk_selection.selected_lines.clear();
+                            }
+                            Err(err) => {
+                                out.error = Some(format!("discard hunk: {err:#}"));
+                            }
+                        }
+                    }
+                    None => {
+                        out.error =
+                            Some("discard hunk: file no longer in working tree status".into());
+                    }
+                }
+            }
         },
     }
 

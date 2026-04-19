@@ -679,6 +679,23 @@ pub struct WorkspaceState {
     pub selected_working_file: Option<std::path::PathBuf>,
     /// Diff of the selected working tree file (staged or unstaged).
     pub working_file_diff: Option<String>,
+    /// Which side of the selected working tree file the diff panel is
+    /// currently showing. Drives whether the per-hunk buttons read
+    /// "Stage / Discard" (unstaged side) or "Unstage" (staged side).
+    /// Cleared/reset whenever the user selects a different file.
+    pub working_diff_side: crate::git::hunk_staging::DiffSide,
+    /// Per-hunk line selections for the currently-selected working
+    /// tree file. Used by the "Stage selected lines" toolbar. Cleared
+    /// whenever the file or the diff side changes so selections never
+    /// leak across files.
+    pub hunk_selection: crate::git::hunk_staging::HunkSelectionState,
+    /// Deferred hunk-level stage/unstage/discard request. The diff
+    /// view collects these while rendering (can't mutate git state from
+    /// inside the paint closure without re-borrowing) and the main app
+    /// loop drains them in the same place it handles other post-render
+    /// side effects. `Discard` requests open a confirmation prompt
+    /// first rather than firing immediately.
+    pub pending_hunk_action: Option<crate::ui::diff_view::HunkAction>,
     /// Whether the Working Tree virtual node is selected (like a commit selection).
     /// When true, the diff panel shows working tree changes instead of a commit.
     pub selected_working_tree: bool,
@@ -2736,6 +2753,9 @@ impl MergeFoxApp {
             working_tree_expanded: false,
             selected_working_file: None,
             working_file_diff: None,
+            working_diff_side: crate::git::hunk_staging::DiffSide::Unstaged,
+            hunk_selection: crate::git::hunk_staging::HunkSelectionState::default(),
+            pending_hunk_action: None,
             selected_working_tree: false,
         };
 
@@ -2908,6 +2928,213 @@ impl MergeFoxApp {
     /// git op (via `rebuild_graph`), and when the user explicitly
     /// refreshes. The sidebar / top-bar / main-panel read from the
     /// cached snapshot instead of re-hitting gix / git each paint.
+    /// Translate a bare `s` / `u` / `d` key press into a `HunkAction`
+    /// targeting the currently-viewed working-tree file. The action is
+    /// queued on `WorkspaceState::pending_hunk_action`, which
+    /// `drain_pending_hunk_actions` picks up at the end of the frame.
+    ///
+    /// No-ops when there's no working-tree file selected, the file is
+    /// conflicted, or the file has no hunks.
+    fn queue_hunk_shortcut(&mut self, key: HunkShortcut) {
+        let View::Workspace(tabs) = &mut self.view else {
+            return;
+        };
+        let ws = tabs.current_mut();
+        if !ws.selected_working_tree {
+            return;
+        }
+        let Some(path) = ws.selected_working_file.clone() else {
+            return;
+        };
+        // If any lines are selected, operate on those; else default to
+        // hunk 0 so the shortcut is always meaningful the moment a
+        // file is in view.
+        let selection_snapshot: Vec<(usize, Vec<usize>)> = ws
+            .hunk_selection
+            .selected_lines
+            .iter()
+            .map(|(h, s)| (*h, s.iter().copied().collect()))
+            .collect();
+
+        let (hunk_index, line_indices) = if let Some((h, lines)) = selection_snapshot.first() {
+            (*h, lines.clone())
+        } else {
+            (0, Vec::new())
+        };
+
+        let action = match (key, ws.working_diff_side) {
+            (HunkShortcut::Stage, _) | (HunkShortcut::Unstage, crate::git::hunk_staging::DiffSide::Unstaged) => {
+                // `s` always stages; `u` on the unstaged side is a
+                // misfire — nothing to unstage from there. We silently
+                // degrade to the stage action so a user tapping `u`
+                // after losing track of panel state still gets a
+                // coherent result.
+                crate::ui::diff_view::HunkAction::StageHunk {
+                    file: path,
+                    hunk_index,
+                    line_indices,
+                }
+            }
+            (HunkShortcut::Unstage, crate::git::hunk_staging::DiffSide::Staged) => {
+                crate::ui::diff_view::HunkAction::UnstageHunk {
+                    file: path,
+                    hunk_index,
+                    line_indices,
+                }
+            }
+            (HunkShortcut::Discard, _) => crate::ui::diff_view::HunkAction::DiscardHunk {
+                file: path,
+                hunk_index,
+                line_indices,
+            },
+        };
+        ws.pending_hunk_action = Some(action);
+    }
+
+    /// Apply any hunk-level stage/unstage/discard action the diff view
+    /// queued during its render pass. Called from the main `update`
+    /// loop after `ui::main_panel::show` returns, i.e. once the paint
+    /// closure has released its `&mut WorkspaceState` borrow.
+    pub fn drain_pending_hunk_actions(&mut self) {
+        let Some(action) = self.take_pending_hunk_action() else {
+            return;
+        };
+        self.apply_hunk_action(action);
+    }
+
+    fn take_pending_hunk_action(&mut self) -> Option<crate::ui::diff_view::HunkAction> {
+        let View::Workspace(tabs) = &mut self.view else {
+            return None;
+        };
+        tabs.current_mut().pending_hunk_action.take()
+    }
+
+    fn apply_hunk_action(&mut self, action: crate::ui::diff_view::HunkAction) {
+        use crate::git::hunk_staging::{self, HunkSelector};
+        use crate::ui::diff_view::HunkAction;
+
+        // Discard is destructive — route it through the confirmation
+        // prompt machinery so the user gets a chance to bail out.
+        // Other actions (stage / unstage) are reversible: staging
+        // doesn't lose data, and unstaging leaves the working tree
+        // untouched.
+        if let HunkAction::DiscardHunk {
+            file,
+            hunk_index,
+            line_indices,
+        } = &action
+        {
+            let prompt = crate::ui::prompt::hunk_discard_confirm(
+                file.clone(),
+                *hunk_index,
+                line_indices.clone(),
+            );
+            self.pending_prompt = Some(prompt);
+            return;
+        }
+
+        let View::Workspace(tabs) = &mut self.view else {
+            return;
+        };
+        let ws = tabs.current_mut();
+        let repo_path = ws.repo.path().to_path_buf();
+
+        // Pick which side we're operating on. For "Selected lines"
+        // flavours we honour `working_diff_side`; otherwise the
+        // variant itself says "stage" or "unstage".
+        let result: anyhow::Result<String> = match action {
+            HunkAction::StageHunk {
+                file,
+                hunk_index,
+                line_indices,
+            } => {
+                let entry = ws
+                    .repo_ui_cache
+                    .as_ref()
+                    .and_then(|c| c.working.as_ref())
+                    .and_then(|entries| entries.iter().find(|e| e.path == file).cloned());
+                match entry {
+                    Some(e) => {
+                        let side_text = crate::git::diff_text_unstaged_only(&repo_path, &e)
+                            .unwrap_or_default();
+                        let fd = crate::git::file_diff_for_working_entry(&e, &side_text);
+                        let sel = HunkSelector {
+                            file: file.clone(),
+                            hunk_index,
+                            line_indices,
+                        };
+                        hunk_staging::stage_hunk(&repo_path, &fd, &sel).map(|_| {
+                            format!("Staged hunk {} in {}", hunk_index + 1, file.display())
+                        })
+                    }
+                    None => Err(anyhow::anyhow!("file no longer in working tree status")),
+                }
+            }
+            HunkAction::UnstageHunk {
+                file,
+                hunk_index,
+                line_indices,
+            } => {
+                let entry = ws
+                    .repo_ui_cache
+                    .as_ref()
+                    .and_then(|c| c.working.as_ref())
+                    .and_then(|entries| entries.iter().find(|e| e.path == file).cloned());
+                match entry {
+                    Some(e) => {
+                        let side_text = crate::git::diff_text_staged_only(&repo_path, &e)
+                            .unwrap_or_default();
+                        let fd = crate::git::file_diff_for_working_entry(&e, &side_text);
+                        let sel = HunkSelector {
+                            file: file.clone(),
+                            hunk_index,
+                            line_indices,
+                        };
+                        hunk_staging::unstage_hunk(&repo_path, &fd, &sel).map(|_| {
+                            format!("Unstaged hunk {} in {}", hunk_index + 1, file.display())
+                        })
+                    }
+                    None => Err(anyhow::anyhow!("file no longer in working tree status")),
+                }
+            }
+            HunkAction::StageSelectedLines { file } => {
+                apply_selected_lines(ws, &file, /* stage */ true)
+            }
+            HunkAction::UnstageSelectedLines { file } => {
+                apply_selected_lines(ws, &file, /* stage */ false)
+            }
+            HunkAction::DiscardHunk { .. } => unreachable!("handled above"),
+        };
+
+        match result {
+            Ok(msg) => {
+                self.notify_ok(msg);
+            }
+            Err(err) => {
+                self.notify_err_with_detail("Hunk staging failed", format!("{err:#}"));
+            }
+        }
+        // Force-refresh so the diff and file status reflect the change.
+        self.reset_hunk_selection_and_refresh();
+    }
+
+    /// Called after a hunk op lands: clear the line-selection state,
+    /// force the diff-text to refetch, and prod the working-tree poll
+    /// so the side panel picks up the new status on the next frame.
+    fn reset_hunk_selection_and_refresh(&mut self) {
+        if let View::Workspace(tabs) = &mut self.view {
+            let ws = tabs.current_mut();
+            ws.hunk_selection.selected_lines.clear();
+            ws.working_file_diff = None;
+            // Rewind the working-tree poll so the next paint fetches
+            // fresh status immediately.
+            ws.last_working_tree_poll = std::time::Instant::now()
+                .checked_sub(WORKING_TREE_POLL_INTERVAL + std::time::Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now);
+        }
+        self.refresh_repo_ui_cache();
+    }
+
     pub fn refresh_repo_ui_cache(&mut self) {
         let View::Workspace(tabs) = &mut self.view else {
             return;
@@ -6309,6 +6536,12 @@ impl eframe::App for MergeFoxApp {
                 ui::sidebar::show(ctx, self);
                 ui::diff_view::show(ctx, self);
                 ui::main_panel::show(ctx, self);
+                // Drain any per-hunk stage/unstage/discard request the
+                // diff view queued while rendering. Done *after* the
+                // paint closures release their `&mut ws` borrow so the
+                // op can re-enter `self.refresh_repo_ui_cache` and
+                // `self.notify_err_with_detail` without aliasing.
+                self.drain_pending_hunk_actions();
             }
         }
 
@@ -6455,6 +6688,9 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
         open_reflog,
         open_shortcuts,
         open_palette,
+        hunk_stage_key,
+        hunk_unstage_key,
+        hunk_discard_key,
     ) = ctx.input_mut(|i| {
         let z = i.key_pressed(egui::Key::Z);
         let esc = i.key_pressed(egui::Key::Escape);
@@ -6497,6 +6733,17 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
         // a text field is focused (that's the whole point of the
         // palette; users hit it mid-typing to jump around).
         let open_palette = k_k && cmd_only;
+        // Bare `s` / `u` / `d` for hunk staging / unstaging / discard.
+        // Only when no modifier is held and nothing has text focus —
+        // same rule as the `?` shortcut above, so typing into the
+        // commit message box doesn't accidentally stage a hunk.
+        let plain = !m.command && !m.ctrl && !m.alt && !m.shift;
+        let hunk_stage_key =
+            plain && shortcuts_hotkey_allowed && i.key_pressed(egui::Key::S);
+        let hunk_unstage_key =
+            plain && shortcuts_hotkey_allowed && i.key_pressed(egui::Key::U);
+        let hunk_discard_key =
+            plain && shortcuts_hotkey_allowed && i.key_pressed(egui::Key::D);
         // Consume the events so textfields / other widgets don't also react.
         if undo || redo {
             i.events.retain(|e| {
@@ -6582,6 +6829,44 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 )
             });
         }
+        // Consume s/u/d key events only when we fired the action, so
+        // they still work for text input elsewhere in the UI.
+        if hunk_stage_key {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::S,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+        }
+        if hunk_unstage_key {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::U,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+        }
+        if hunk_discard_key {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::D,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+        }
         (
             undo,
             redo,
@@ -6592,6 +6877,9 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
             open_reflog,
             open_shortcuts,
             open_palette,
+            hunk_stage_key,
+            hunk_unstage_key,
+            hunk_discard_key,
         )
     });
 
@@ -6635,6 +6923,25 @@ fn handle_hotkeys(ctx: &egui::Context, app: &mut MergeFoxApp) {
             app.palette_selected = 0;
         }
     }
+    if hunk_stage_key {
+        app.queue_hunk_shortcut(HunkShortcut::Stage);
+    }
+    if hunk_unstage_key {
+        app.queue_hunk_shortcut(HunkShortcut::Unstage);
+    }
+    if hunk_discard_key {
+        app.queue_hunk_shortcut(HunkShortcut::Discard);
+    }
+}
+
+/// Which key fired for the hunk-shortcut routing. Kept as a separate
+/// enum so the dispatcher method can branch once instead of juggling
+/// three bool flags.
+#[derive(Clone, Copy)]
+enum HunkShortcut {
+    Stage,
+    Unstage,
+    Discard,
 }
 
 /// Extract the hostname from a git remote URL.
@@ -6796,6 +7103,78 @@ fn system_time_to_nanos(time: SystemTime) -> Option<u128> {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_nanos())
+}
+
+/// Translate the currently-buffered `HunkSelectionState` into one
+/// `stage_hunk` / `unstage_hunk` call per affected hunk. We collect
+/// per-hunk (`hunk_index`, `line_indices`) tuples up front so the loop
+/// doesn't borrow the selection while reading the diff text.
+fn apply_selected_lines(
+    ws: &mut WorkspaceState,
+    file: &std::path::Path,
+    stage: bool,
+) -> anyhow::Result<String> {
+    use crate::git::hunk_staging::{self, HunkSelector};
+
+    let entry = ws
+        .repo_ui_cache
+        .as_ref()
+        .and_then(|c| c.working.as_ref())
+        .and_then(|entries| entries.iter().find(|e| e.path == file).cloned())
+        .ok_or_else(|| anyhow::anyhow!("file no longer in working tree status"))?;
+
+    // Fetch the diff text for the side the selection was built from.
+    let repo_path = ws.repo.path().to_path_buf();
+    let side_text = if stage {
+        crate::git::diff_text_unstaged_only(&repo_path, &entry)?
+    } else {
+        crate::git::diff_text_staged_only(&repo_path, &entry)?
+    };
+    let fd = crate::git::file_diff_for_working_entry(&entry, &side_text);
+    let hunks = match &fd.kind {
+        crate::git::FileKind::Text { hunks, .. } => hunks.clone(),
+        _ => anyhow::bail!("hunk staging is only supported for text files"),
+    };
+
+    let selection_snapshot: Vec<(usize, Vec<usize>)> = ws
+        .hunk_selection
+        .selected_lines
+        .iter()
+        .map(|(h, set)| (*h, set.iter().copied().collect()))
+        .collect();
+
+    if selection_snapshot.is_empty() {
+        anyhow::bail!("no lines selected");
+    }
+
+    let mut affected = 0usize;
+    for (hunk_idx, line_indices) in selection_snapshot {
+        let Some(hunk) = hunks.get(hunk_idx) else {
+            continue;
+        };
+        let cleaned = hunk_staging::sanitize_selection(hunk, &line_indices);
+        if cleaned.is_empty() {
+            continue;
+        }
+        let sel = HunkSelector {
+            file: file.to_path_buf(),
+            hunk_index: hunk_idx,
+            line_indices: cleaned,
+        };
+        if stage {
+            hunk_staging::stage_hunk(&repo_path, &fd, &sel)?;
+        } else {
+            hunk_staging::unstage_hunk(&repo_path, &fd, &sel)?;
+        }
+        affected += 1;
+    }
+
+    Ok(format!(
+        "{} {} line selection(s) in {}",
+        if stage { "Staged" } else { "Unstaged" },
+        affected,
+        file.display()
+    ))
 }
 
 pub fn default_remote_name(ws: &WorkspaceState, config: &Config) -> String {
