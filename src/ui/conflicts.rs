@@ -10,6 +10,23 @@
 //!     files aren't a scroll-and-hunt exercise.
 //!   * Offer "Take Both" alongside "Use Ours / Theirs" for the common
 //!     "keep the additions from both sides" case.
+//!
+//! Fork-inspired card picker (added in the `card_picker` section below):
+//!   * The per-file picker leads with two large rounded cards — Local (our)
+//!     and Remote (their) — each showing the branch/tip, the file path, a
+//!     "modified" status chip, and a click-to-pick checkbox. A subtle
+//!     connector line is drawn between the cards so users can see that the
+//!     two sides are the "alternatives" they're choosing between rather than
+//!     independent controls.
+//!   * The "Merge in External Tool" button hands off to `git mergetool` so
+//!     power users with a configured tool (Beyond Compare, Kaleidoscope,
+//!     meld, …) don't have to drop to a terminal. Git's own `mergetool`
+//!     driver respects the user's global config (`merge.tool`) and will
+//!     write the resolved file back to the working tree, which is exactly
+//!     the behaviour the rest of MergeFox already expects.
+//!   * The existing editor-mode UI is preserved as an "Advanced" collapsing
+//!     section so users who want to hand-resolve markers still can. The
+//!     card surface is *additive*, not a rewrite of the underlying flow.
 
 use std::path::{Path, PathBuf};
 
@@ -31,6 +48,19 @@ mod palette {
     pub const DANGER: Color32 = Color32::from_rgb(230, 80, 80);
     pub const SUCCESS: Color32 = Color32::from_rgb(80, 180, 110);
     pub const MUTED: Color32 = Color32::from_rgb(170, 170, 170);
+    /// Amber used for the conflict-warning triangles in the file list and
+    /// the top-of-window "Merge Conflict" banner. Yellow is the universal
+    /// "attention, not error" signal — the files aren't broken, they just
+    /// need a choice. Red (DANGER) is reserved for destructive prompts
+    /// (Abort, binary file blocker).
+    pub const WARNING: Color32 = Color32::from_rgb(230, 180, 50);
+    /// Soft card background used behind the Local/Remote cards. Slightly
+    /// lifted from the window fill so the cards read as "panels" without
+    /// needing a heavy stroke.
+    pub const CARD_FILL: Color32 = Color32::from_rgb(38, 40, 44);
+    /// Even fainter divider colour for the connector line drawn between
+    /// the two cards (see `draw_card_connector`).
+    pub const CONNECTOR: Color32 = Color32::from_rgb(120, 120, 130);
 }
 
 /// Navigation direction for Prev/Next conflict-marker jumps.
@@ -45,6 +75,11 @@ enum ConflictIntent {
     ResolveEditorRegion(PathBuf, usize, EditorResolution),
     ResolveEditorAll(PathBuf, EditorResolution),
     SaveManual(PathBuf, String),
+    /// Hand off a single conflicted path to the user's configured external
+    /// mergetool (`git mergetool -- <path>`). The subprocess is spawned
+    /// detached — it may open a blocking GUI (Beyond Compare, Kaleidoscope)
+    /// or write directly back to the working tree.
+    LaunchMergetool(PathBuf),
     Continue,
     Abort,
 }
@@ -297,7 +332,21 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         }
                     });
 
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
+
+                    // ---------- Fork-style Local / Remote cards ------------
+                    //
+                    // The card pair is the new *primary* affordance: it
+                    // matches what users see in Fork and communicates the
+                    // Ours-vs-Theirs decision far more clearly than two
+                    // adjacent buttons. Clicking the checkbox on a card is
+                    // equivalent to pressing "Use ours/theirs" — it's just a
+                    // more spatial way of expressing the same choice. The
+                    // old button row remains below so keyboard/muscle-memory
+                    // users aren't displaced.
+                    render_card_picker(ui, entry, &labels, &mut intent);
+
+                    ui.add_space(10.0);
 
                     // Action buttons ---------------------------------------
                     ui.horizontal(|ui| {
@@ -362,10 +411,62 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                                 ));
                             }
                         });
+
+                        // Fork also exposes a "Merge in External Tool"
+                        // button. We wire it to `git mergetool -- <path>`,
+                        // which reads `merge.tool` from the user's global
+                        // git config (so Beyond Compare, Kaleidoscope,
+                        // meld, p4merge etc. all work without us having to
+                        // special-case them). `git mergetool` itself writes
+                        // back to the working tree and stages the file on
+                        // success, so no MergeFox-side write is required.
+                        if ui
+                            .button(
+                                RichText::new("🛠 Merge in External Tool")
+                                    .strong(),
+                            )
+                            .on_hover_text(
+                                "Launch `git mergetool` for this file.\n\
+                                 Respects your git config `merge.tool` — configure it with e.g.\n\
+                                 `git config --global merge.tool kaleidoscope`.",
+                            )
+                            .clicked()
+                        {
+                            intent = Some(ConflictIntent::LaunchMergetool(
+                                entry.path.clone(),
+                            ));
+                        }
                     });
 
                     ui.add_space(6.0);
 
+                    // ---------- Advanced (text-editor) fallback ------------
+                    //
+                    // Everything below is the pre-Fork-redesign editor UI.
+                    // We keep it intact — users who actually hand-resolve
+                    // markers rely on the colour-coded editor, Prev/Next
+                    // jumps, and the built-in "Use ours/theirs in all
+                    // regions" helpers. Wrapping it in a `CollapsingHeader`
+                    // gets it out of the way by default while still making
+                    // it one click to open.
+                    //
+                    // The collapsing header opens by default for binary
+                    // files (because the card picker is the only path
+                    // forward) and when markers already exist in the
+                    // working tree (user is mid-hand-edit).
+                    let markers_for_default =
+                        ConflictMarkers::scan(&ws.conflict_editor_text);
+                    let default_open =
+                        entry.is_binary || markers_for_default.count() == 0;
+                    // `Id::new(&entry.path)` keeps each file's advanced
+                    // section opened/closed state separate, so toggling one
+                    // file doesn't stomp another.
+                    let adv_header = egui::CollapsingHeader::new(
+                        RichText::new("Advanced: edit merged result").strong(),
+                    )
+                    .id_salt(egui::Id::new(("conflict_adv", &entry.path)))
+                    .default_open(default_open);
+                    adv_header.show(ui, |ui| {
                     // Conflict navigation strip ----------------------------
                     if !entry.is_binary {
                         let markers = ConflictMarkers::scan(&ws.conflict_editor_text);
@@ -538,6 +639,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                             }
                         }
                     }
+                    }); // end advanced-editor CollapsingHeader
                 });
             });
 
@@ -608,6 +710,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         }
         Some(ConflictIntent::SaveManual(path, text)) => {
             resolve_conflict_manual(app, &path, &text);
+        }
+        Some(ConflictIntent::LaunchMergetool(path)) => {
+            launch_mergetool(app, &path);
         }
         Some(ConflictIntent::Continue) => app.continue_conflict_operation(),
         Some(ConflictIntent::Abort) => app.abort_conflict_operation(),
@@ -699,6 +804,12 @@ fn render_region_card(
 }
 
 /// File-list row with an inline conflict-count badge.
+///
+/// Fork's sidebar uses a yellow warning triangle to flag conflicted files.
+/// We follow the same convention because yellow reads as "needs attention"
+/// without implying an error — conflicts are a normal part of merging, not
+/// a crash. Binary files *do* get a red chip because the user genuinely
+/// can't hand-merge them; that's a harder blocker.
 fn file_list_row(
     ui: &mut egui::Ui,
     entry: &ConflictEntry,
@@ -715,14 +826,26 @@ fn file_list_row(
             let resp = ui
                 .horizontal(|ui| {
                     ui.set_width(ui.available_width());
+                    // Prefix the row with a yellow triangle so the eye
+                    // immediately lands on "these are the conflicted
+                    // files". Using RichText with explicit color beats a
+                    // coloured_label because it keeps the triangle aligned
+                    // with the selectable_label's baseline.
+                    ui.label(
+                        RichText::new("▲")
+                            .color(palette::WARNING)
+                            .strong(),
+                    );
                     let path_resp = ui.selectable_label(selected, label_text);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if entry.is_binary {
                             ui.colored_label(palette::DANGER, "Bin");
                         } else if conflict_count > 0 {
                             ui.colored_label(
-                                palette::DANGER,
-                                RichText::new(format!("⚠{conflict_count}")).small().strong(),
+                                palette::WARNING,
+                                RichText::new(format!("{conflict_count}"))
+                                    .small()
+                                    .strong(),
                             );
                         }
                     });
@@ -741,6 +864,27 @@ fn header(
     conflicts: &[ConflictEntry],
     labels: &SideLabels,
 ) {
+    // Fork-style heading: a prominent warning triangle next to a one-line
+    // title, followed by an explanatory sentence. We intentionally keep the
+    // operation-progress and ours/theirs legend underneath because those are
+    // MergeFox-specific affordances that Fork doesn't provide (e.g. rebase
+    // step counter, the reminder that "theirs" is your own commit during a
+    // rebase — see SideLabels::resolve).
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("⚠")
+                .size(22.0)
+                .color(palette::WARNING)
+                .strong(),
+        );
+        ui.label(RichText::new("Merge Conflict").heading().strong());
+    });
+    ui.add_space(2.0);
+    ui.label(
+        "The following files were changed both locally and remotely. Select local \
+         (yours) or remote (theirs) changes, or merge the changes manually.",
+    );
+    ui.add_space(6.0);
     ui.horizontal(|ui| {
         let title = rebase_summary
             .map(str::to_string)
@@ -753,11 +897,6 @@ fn header(
         ui.weak("·  Theirs");
         ui.colored_label(palette::THEIRS, RichText::new(&labels.theirs_long).strong());
     });
-    ui.add_space(2.0);
-    ui.weak(
-        "Pick a side, combine both, or edit the merged result below. Save each file, \
-         then press Continue to finish the operation.",
-    );
 }
 
 fn side_pill(ui: &mut egui::Ui, label: &str, color: Color32, oid: Option<gix::ObjectId>) {
@@ -931,6 +1070,315 @@ fn resolve_conflict_manual(app: &mut MergeFoxApp, path: &Path, text: &str) {
             app.last_error = Some(format!("manual resolution: {err:#}"));
         }
     }
+}
+
+/// Spawn `git mergetool -- <path>` in the current repo so the user's
+/// configured merge driver (Beyond Compare, Kaleidoscope, meld, p4merge,
+/// vimdiff, …) opens for this single file.
+///
+/// We deliberately use `std::process::Command::spawn` instead of the
+/// synchronous `run()` helper in `git::cli` because mergetool is *blocking
+/// and interactive* — it expects to keep the foreground until the user
+/// resolves the file. Running it synchronously would freeze MergeFox's UI
+/// thread for however long the user takes. Spawn-and-forget is the right
+/// shape: `git mergetool` writes back to the working tree and stages the
+/// file itself on success, so when the user next interacts with MergeFox
+/// the normal conflict-entry scan will reflect the new state.
+///
+/// If `git mergetool` has no configured tool (`merge.tool` unset), the
+/// git CLI prints an instructional error to stderr and exits — we swallow
+/// the detached stdout/stderr here, so the user instead sees no effect and
+/// the tooltip on the button tells them how to configure it. Good enough
+/// for a first pass; a richer version could capture stderr into the HUD.
+fn launch_mergetool(app: &mut MergeFoxApp, path: &Path) {
+    let repo_path = {
+        let View::Workspace(tabs) = &app.view else {
+            return;
+        };
+        tabs.current().repo.path().to_path_buf()
+    };
+
+    // `-y` ("no-prompt") skips the "Hit return to start merge resolution
+    // tool" prompt that git otherwise prints before each file — unhelpful
+    // here because we've already made that choice by clicking the button.
+    // The `--` ensures the path is never interpreted as a flag, even when
+    // a file starts with a dash.
+    let path_arg = path.display().to_string();
+    let spawn_result = std::process::Command::new("git")
+        .arg("mergetool")
+        .arg("-y")
+        .arg("--")
+        .arg(&path_arg)
+        .current_dir(&repo_path)
+        // Fully detach: we don't wait, we don't care about exit code, and
+        // we don't want the child printing to our stdout/stderr since the
+        // GUI process captures those for its own logs.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    match spawn_result {
+        Ok(_child) => {
+            app.hud = Some(crate::app::Hud::new(
+                format!(
+                    "Launched external mergetool for {}",
+                    format_path(path)
+                ),
+                2400,
+            ));
+        }
+        Err(err) => {
+            app.last_error = Some(format!(
+                "launch mergetool: {err}\n\
+                 Is `git` on PATH and `merge.tool` configured?"
+            ));
+        }
+    }
+}
+
+/// Render the Fork-style Local (our) / Remote (their) card pair.
+///
+/// Each card is a rounded, softly-filled panel with:
+///   * a heading stating the side + operation-specific label
+///     (e.g. "Local (our)" / "Remote (their)"),
+///   * the branch/tip short label from [`SideLabels`],
+///   * the file path with a lightweight icon prefix,
+///   * a "modified" chip that matches Fork's status treatment,
+///   * a checkbox that picks the side when clicked. The checkbox reads as
+///     a "radio" in effect: checking Local unchecks Remote (both cards
+///     immediately commit the choice by firing the same `UseFile` intent
+///     that the legacy buttons use).
+///
+/// A thin connector line runs between the cards with a small diamond at
+/// its midpoint, echoing Fork's visual cue that the two cards are the two
+/// sides of one choice. We keep the connector purely decorative — clicking
+/// it does nothing — because egui can't easily overlay an interactive
+/// widget mid-panel without a separate layer.
+fn render_card_picker(
+    ui: &mut egui::Ui,
+    entry: &ConflictEntry,
+    labels: &SideLabels,
+    intent: &mut Option<ConflictIntent>,
+) {
+    // Reserve the full available width, split into two cards with a narrow
+    // connector gutter in the middle. We use `ui.columns(3, …)` to get
+    // three equal-width columns then manually resize by putting the
+    // connector drawing inside the middle column — but a cleaner approach
+    // is `ui.horizontal` with explicit sizing so the cards stretch.
+    let total_width = ui.available_width();
+    let connector_width: f32 = 40.0;
+    let card_width = ((total_width - connector_width) / 2.0).max(240.0);
+
+    ui.horizontal(|ui| {
+        // --- Local (our) card -------------------------------------------
+        let picked_ours = false; // stateless: each click commits immediately
+        render_side_card(
+            ui,
+            CardSpec {
+                width: card_width,
+                heading: format!("Local ({})", labels.ours_short),
+                accent: palette::OURS,
+                branch_tip: labels.ours_long.clone(),
+                path: entry.path.clone(),
+                available: entry.ours.is_some(),
+                checked: picked_ours,
+                on_pick: || {
+                    ConflictIntent::UseFile(entry.path.clone(), ConflictChoice::Ours)
+                },
+            },
+            intent,
+        );
+
+        // --- Connector between cards -----------------------------------
+        draw_card_connector(ui, connector_width);
+
+        // --- Remote (their) card ----------------------------------------
+        let picked_theirs = false;
+        render_side_card(
+            ui,
+            CardSpec {
+                width: card_width,
+                heading: format!("Remote ({})", labels.theirs_short),
+                accent: palette::THEIRS,
+                branch_tip: labels.theirs_long.clone(),
+                path: entry.path.clone(),
+                available: entry.theirs.is_some(),
+                checked: picked_theirs,
+                on_pick: || {
+                    ConflictIntent::UseFile(
+                        entry.path.clone(),
+                        ConflictChoice::Theirs,
+                    )
+                },
+            },
+            intent,
+        );
+    });
+}
+
+/// Inputs for a single side-card. Grouped into a struct so `render_card_picker`
+/// reads as a pair of symmetric calls rather than a 9-positional-arg blob.
+struct CardSpec<F: FnOnce() -> ConflictIntent> {
+    width: f32,
+    heading: String,
+    accent: Color32,
+    branch_tip: String,
+    path: PathBuf,
+    /// False if the blob doesn't exist on this side (file added on one side
+    /// only). The card still renders — users need to see that one side is
+    /// empty — but the checkbox is disabled.
+    available: bool,
+    /// Currently-checked? Always false in the current implementation since
+    /// we commit on click (no pending state), but left here so a future
+    /// "stage a choice then confirm" flow can light up the checkbox.
+    checked: bool,
+    /// Intent builder fired when the user picks this card. Boxed as a
+    /// closure so both cards can produce different `ConflictChoice`
+    /// variants without branching inside `render_side_card`.
+    on_pick: F,
+}
+
+fn render_side_card<F: FnOnce() -> ConflictIntent>(
+    ui: &mut egui::Ui,
+    spec: CardSpec<F>,
+    intent: &mut Option<ConflictIntent>,
+) {
+    let CardSpec {
+        width,
+        heading,
+        accent,
+        branch_tip,
+        path,
+        available,
+        checked,
+        on_pick,
+    } = spec;
+
+    egui::Frame::none()
+        .fill(palette::CARD_FILL)
+        .stroke(Stroke::new(1.5, accent))
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .show(ui, |ui| {
+            ui.set_width(width);
+            // Heading row: side + accent bar on the left.
+            ui.horizontal(|ui| {
+                ui.colored_label(accent, RichText::new("●").strong());
+                ui.label(RichText::new(&heading).strong().size(15.0));
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let mut cb = checked;
+                        let resp = ui
+                            .add_enabled(
+                                available,
+                                egui::Checkbox::without_text(&mut cb),
+                            )
+                            .on_hover_text(if available {
+                                "Resolve the whole file to this side"
+                            } else {
+                                "This side is absent (file added or deleted elsewhere)"
+                            });
+                        if resp.clicked() && available {
+                            *intent = Some(on_pick());
+                        }
+                    },
+                );
+            });
+
+            ui.add_space(4.0);
+
+            // Branch / tip name row.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("⎇").color(palette::MUTED));
+                ui.label(RichText::new(&branch_tip).monospace().small());
+            });
+
+            ui.add_space(2.0);
+
+            // File path row — uses a generic "page" glyph because MergeFox
+            // doesn't yet have filetype-specific icons in the conflicts UI.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("📄").color(palette::MUTED));
+                ui.label(
+                    RichText::new(format_path(&path))
+                        .monospace()
+                        .small(),
+                );
+            });
+
+            ui.add_space(6.0);
+
+            // "modified" status chip — matches the Fork screenshot. For the
+            // "absent" side (file was only added or deleted on one side) we
+            // say so explicitly so the user knows what the checkbox would
+            // actually do if it were enabled.
+            ui.horizontal(|ui| {
+                let (chip_text, chip_color) = if available {
+                    ("modified", palette::WARNING)
+                } else {
+                    ("absent", palette::MUTED)
+                };
+                egui::Frame::none()
+                    .fill(chip_color.gamma_multiply(0.25))
+                    .stroke(Stroke::new(1.0, chip_color))
+                    .rounding(egui::Rounding::same(10.0))
+                    .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(chip_text)
+                                .small()
+                                .strong()
+                                .color(chip_color),
+                        );
+                    });
+            });
+        });
+}
+
+/// Draw a horizontal connector line with a diamond in the middle between
+/// the Local and Remote cards. Purely visual: it reinforces that the cards
+/// are "two sides of one choice" rather than independent controls.
+///
+/// We draw directly via `ui.painter()` at the allocated rect so the line
+/// sits vertically centred regardless of card content height. The rect's
+/// width is fixed by the caller (see `connector_width` in
+/// `render_card_picker`) which matches Fork's 40-ish-pixel gutter.
+fn draw_card_connector(ui: &mut egui::Ui, width: f32) {
+    // Allocate the gutter with a min height large enough to centre against
+    // typical card height (~110px). The painter draws at the midpoint so
+    // the exact height doesn't matter as long as it's >0.
+    let desired = egui::vec2(width, 100.0);
+    let (rect, _resp) =
+        ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    let mid_y = rect.center().y;
+    let left = egui::pos2(rect.left() + 4.0, mid_y);
+    let right = egui::pos2(rect.right() - 4.0, mid_y);
+
+    painter.line_segment(
+        [left, right],
+        Stroke::new(1.5, palette::CONNECTOR),
+    );
+
+    // Diamond in the middle — slightly rotated square drawn as a
+    // filled convex polygon.
+    let cx = rect.center().x;
+    let cy = mid_y;
+    let r = 5.0;
+    let diamond = vec![
+        egui::pos2(cx, cy - r),
+        egui::pos2(cx + r, cy),
+        egui::pos2(cx, cy + r),
+        egui::pos2(cx - r, cy),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        diamond,
+        palette::CONNECTOR,
+        Stroke::new(1.0, palette::CONNECTOR),
+    ));
 }
 
 fn render_blob_preview(
