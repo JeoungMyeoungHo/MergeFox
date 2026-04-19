@@ -21,6 +21,7 @@ pub mod main_panel;
 pub mod notifications;
 pub mod palette;
 pub mod panic_recovery;
+pub mod profile_rules;
 pub mod prompt;
 pub mod publish_remote;
 pub mod rebase;

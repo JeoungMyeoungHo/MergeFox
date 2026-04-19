@@ -158,6 +158,11 @@ pub struct MergeFoxApp {
     pub reflog_rewind_confirm: Option<ReflogRewindConfirm>,
     /// In-flight `git reset --hard` from the reflog rewind.
     pub reflog_rewind_task: Option<ReflogRewindTask>,
+    /// Outstanding workspace-profile suggestion toasts. Each entry pairs a
+    /// notification id with the repo path the toast is about; when the
+    /// toast disappears (sticky, so only via × click) we persist the path
+    /// to `config.profile_suggestion_dismissed_for` so we don't nag again.
+    pub pending_profile_suggestions: Vec<(u64, std::path::PathBuf)>,
 }
 
 /// Worker-thread handle for an in-flight basket revert. Opaque to the
@@ -808,6 +813,12 @@ pub struct WorkspaceState {
     /// Whether the Working Tree virtual node is selected (like a commit selection).
     /// When true, the diff panel shows working tree changes instead of a commit.
     pub selected_working_tree: bool,
+    /// Effective workspace profile for this tab. Read-only to UI
+    /// modules — funnel through `crate::ui::profile_rules::rules_for`
+    /// rather than matching on the profile directly.
+    pub workspace_profile: crate::config::WorkspaceProfile,
+    /// Cached project-kind detection run once when the repo opened.
+    pub detected_project_kind: Option<crate::workspace_profile::DetectedProjectKind>,
 }
 
 #[derive(Default)]
@@ -1232,6 +1243,7 @@ impl MergeFoxApp {
             split_commit_task: None,
             reflog_rewind_confirm: None,
             reflog_rewind_task: None,
+            pending_profile_suggestions: Vec::new(),
         }
     }
 
@@ -2952,6 +2964,42 @@ impl MergeFoxApp {
             .unwrap_or_else(|| repo_path.display().to_string());
         let lfs_scan = spawn_lfs_scan(&repo_path);
 
+        // Workspace profile resolution (Phase 1: plumbing only — nothing
+        // in the UI consumes these yet). We precompute the effective
+        // profile and cache the project-kind detection so later phases
+        // can read them without a "profile might not be known yet"
+        // branch. Priority: user override > team file > General.
+        let team_profile =
+            crate::workspace_profile::load_team_profile(&repo_path).unwrap_or_default();
+        let user_override = self
+            .config
+            .repo_settings_for(&repo_path)
+            .profile_override;
+        let workspace_profile =
+            crate::workspace_profile::effective_profile(&team_profile, user_override);
+        let detection = crate::workspace_profile::detect_project_kind(&repo_path);
+        let detected_project_kind = detection.kind;
+
+        // Decide whether to post the one-shot "looks like a game-engine
+        // project" suggestion toast. Gated: detection found something,
+        // no user override, no team file, effective profile still
+        // General, and this repo wasn't already dismissed.
+        let already_dismissed = self
+            .config
+            .profile_suggestion_dismissed_for
+            .iter()
+            .any(|p| p == &repo_path);
+        let should_suggest = detected_project_kind.is_some()
+            && user_override.is_none()
+            && team_profile.profile.is_none()
+            && workspace_profile == crate::config::WorkspaceProfile::General
+            && !already_dismissed;
+        let suggestion_to_post = if should_suggest {
+            detected_project_kind.map(|kind| (kind, repo_path.clone()))
+        } else {
+            None
+        };
+
         let new_ws = WorkspaceState {
             repo,
             selected_branch: None,
@@ -2999,6 +3047,8 @@ impl MergeFoxApp {
             hunk_selection: crate::git::hunk_staging::HunkSelectionState::default(),
             pending_hunk_action: None,
             selected_working_tree: false,
+            workspace_profile,
+            detected_project_kind,
         };
 
         // If we came from an existing workspace, append the new tab
@@ -3022,6 +3072,54 @@ impl MergeFoxApp {
         self.restore_active_tab_cache();
         self.ensure_active_forge_loaded();
         self.ensure_repo_ui_cache();
+
+        // Fire the profile-suggestion toast after the tab is live so
+        // the user's × click gets the notification id recorded below.
+        if let Some((kind, repo_path)) = suggestion_to_post {
+            let id = self.notifications.push_with_detail(
+                crate::ui::notifications::NotifSeverity::Info,
+                format!("{} project detected. Enable Game-dev mode?", kind.label()),
+                Some(
+                    "Open Settings → Repository to switch, or ignore this once and it won't \
+                     nag again."
+                        .to_string(),
+                ),
+            );
+            self.pending_profile_suggestions.push((id, repo_path));
+        }
+    }
+
+    /// Reap profile-suggestion toasts that the user has closed. Sticky
+    /// toasts don't auto-expire, so a toast vanishing can only mean `×`
+    /// was clicked — we persist the repo path to
+    /// `profile_suggestion_dismissed_for` so the next open stays quiet.
+    pub fn sweep_profile_suggestions(&mut self) {
+        if self.pending_profile_suggestions.is_empty() {
+            return;
+        }
+        let live_ids: std::collections::HashSet<u64> =
+            self.notifications.items.iter().map(|n| n.id).collect();
+        let mut dirty = false;
+        self.pending_profile_suggestions.retain(|(id, repo_path)| {
+            if live_ids.contains(id) {
+                return true;
+            }
+            if !self
+                .config
+                .profile_suggestion_dismissed_for
+                .iter()
+                .any(|p| p == repo_path)
+            {
+                self.config
+                    .profile_suggestion_dismissed_for
+                    .push(repo_path.clone());
+                dirty = true;
+            }
+            false
+        });
+        if dirty {
+            let _ = self.config.save();
+        }
     }
 
     /// Focus a tab by index. No-op if out of range.
@@ -6754,6 +6852,7 @@ impl eframe::App for MergeFoxApp {
         self.poll_find_fix_scan();
         self.poll_find_fix_apply();
         self.poll_basket_squash();
+        self.sweep_profile_suggestions();
         self.poll_ci_status_task();
         self.tick_ci_status_heartbeat();
         self.poll_reflog_rewind_task();

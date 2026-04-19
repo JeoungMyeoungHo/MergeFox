@@ -17,6 +17,7 @@ mod preflight;
 mod providers;
 mod secrets;
 mod ui;
+mod workspace_profile;
 
 use app::MergeFoxApp;
 

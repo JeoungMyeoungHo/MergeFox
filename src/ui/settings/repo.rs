@@ -814,6 +814,11 @@ fn save_preferences(app: &mut MergeFoxApp, labels: &Labels) {
             default_remote: modal.default_remote.clone(),
             pull_strategy: modal.pull_strategy,
             provider_account: modal.provider_account_slug.clone(),
+            profile_override: app
+                .config
+                .repo_settings
+                .get(&repo_path.to_string_lossy().to_string())
+                .and_then(|s| s.profile_override),
         };
         (repo_path, settings)
     };
