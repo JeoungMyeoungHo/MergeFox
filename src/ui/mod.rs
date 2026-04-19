@@ -6,6 +6,7 @@ pub mod blame;
 pub mod columns;
 pub mod commit_basket;
 pub mod commit_modal;
+pub mod conflict_hunks_view;
 pub mod conflicts;
 pub mod diff_minimap;
 pub mod diff_view;
