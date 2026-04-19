@@ -28,6 +28,7 @@ use std::pin::Pin;
 use reqwest::Client;
 use secrecy::SecretString;
 
+pub mod ci_status;
 pub mod error;
 pub mod oauth;
 pub mod pat;
@@ -44,6 +45,7 @@ mod gitlab;
 
 pub use azure::AzureDevOpsProvider;
 pub use bitbucket::BitbucketProvider;
+pub use ci_status::{CheckSummary, CiStatus};
 pub use error::{ProviderError, ProviderResult};
 pub use generic::GenericProvider;
 pub use gitea::GiteaProvider;

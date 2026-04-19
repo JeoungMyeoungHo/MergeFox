@@ -242,6 +242,12 @@ impl GraphView {
         // commits are currently in the basket. Caller handles
         // toggling (see `GraphInteraction::toggle_basket`).
         basket: &std::collections::BTreeSet<gix::ObjectId>,
+        // Read-only view of the CI/check-run cache. Rows whose oid
+        // has an entry get a badge painted next to the subject.
+        // Rows without an entry paint no badge at all — absence
+        // from the map is a deliberate "don't know / don't care"
+        // signal, not an `Unknown` verdict.
+        ci_status_cache: &std::collections::HashMap<gix::ObjectId, crate::providers::CheckSummary>,
     ) -> GraphInteraction {
         let row_count = self.graph.rows.len();
         if row_count == 0 && working_entries.map(|e| e.is_empty()).unwrap_or(true) {
@@ -454,7 +460,7 @@ impl GraphView {
                         paint_refs_cell(ui, cells.refs, row, is_head, prefs);
                     }
                     if prefs.show_message {
-                        paint_message_cell(ui, cells.message, row);
+                        paint_message_cell(ui, cells.message, row, ci_status_cache.get(&row.oid));
                     }
                     if prefs.show_author {
                         paint_author_cell(ui, cells.author, row);
@@ -906,9 +912,19 @@ fn paint_graph_cell(
             }
         }
     } else if let Some(lane) = top_connector_lane {
+        // Top connector on the first commit when a WT pseudo-row sits
+        // above it: dashed to signal "this edge terminates at a
+        // not-yet-real node (your uncommitted changes)". Matches the
+        // dashed style painted by `render_working_tree_row` so the
+        // connection reads continuously across both rows.
         let x = lane_x(lane);
         let stroke = Stroke::new(LINE_WIDTH, lane_color(lane));
-        painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, mid_y)], stroke);
+        draw_dashed_vline(
+            painter,
+            Pos2::new(x, rect.top()),
+            Pos2::new(x, mid_y),
+            stroke,
+        );
     }
 
     // ---- BOTTOM HALF ----
@@ -1216,7 +1232,12 @@ fn paint_ref_chip(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32) {
     ui.add_space(4.0);
 }
 
-fn paint_message_cell(ui: &mut Ui, rect: Rect, row: &GraphRow) {
+fn paint_message_cell(
+    ui: &mut Ui,
+    rect: Rect,
+    row: &GraphRow,
+    ci: Option<&crate::providers::CheckSummary>,
+) {
     if rect.width() <= 0.0 {
         return;
     }
@@ -1225,6 +1246,17 @@ fn paint_message_cell(ui: &mut Ui, rect: Rect, row: &GraphRow) {
             .max_rect(rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
+    // CI badge — painted BEFORE the subject so it sits at the left
+    // of the message cell, within the user's saccade path when
+    // scanning a column of commits. We draw the badge first (small,
+    // fixed width) and then let the text fill the remaining space.
+    // Without this ordering the badge would end up on the trailing
+    // edge of a truncated label, which is exactly where the eye
+    // doesn't look.
+    if let Some(summary) = ci {
+        paint_ci_badge(&mut child, summary);
+        child.add_space(6.0);
+    }
     // `.selectable(false)` — egui 0.29 Labels default to text-selectable
     // (for copy-on-drag). That also means they consume clicks: clicking
     // anywhere on the label text swallowed the row-select event, so users
@@ -1262,6 +1294,105 @@ fn paint_message_cell(ui: &mut Ui, rect: Rect, row: &GraphRow) {
         );
     }
     child.add(egui::Label::new(job).truncate().selectable(false));
+}
+
+/// Paint a small colored-circle CI badge with hover tooltip + click-to-open.
+///
+/// Kept inside `paint_message_cell`'s child UI so it participates in the
+/// left-to-right layout and the badge's click hit-rect stays tight
+/// around the circle (not the whole row). This is on purpose: the row
+/// itself is click-to-select-commit; only the small circle opens the
+/// details URL.
+fn paint_ci_badge(ui: &mut egui::Ui, summary: &crate::providers::CheckSummary) {
+    use crate::providers::CiStatus;
+
+    const BADGE_DIAM: f32 = 11.0;
+    const BADGE_RADIUS: f32 = BADGE_DIAM * 0.5;
+
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(BADGE_DIAM, BADGE_DIAM), egui::Sense::click());
+
+    let color = match summary.status {
+        CiStatus::Success => Color32::from_rgb(116, 192, 136),
+        CiStatus::Failure => Color32::from_rgb(235, 108, 108),
+        CiStatus::Pending => Color32::from_rgb(240, 180, 96),
+        CiStatus::Neutral => Color32::from_gray(160),
+        CiStatus::Unknown => Color32::from_gray(120),
+    };
+    let painter = ui.painter();
+    let center = rect.center();
+    painter.circle_filled(center, BADGE_RADIUS, color);
+    painter.circle_stroke(
+        center,
+        BADGE_RADIUS,
+        Stroke::new(1.0, Color32::from_black_alpha(70)),
+    );
+    // Inner glyph to reinforce the color coding for colorblind users
+    // and for the tiny sizes where hue alone isn't legible.
+    let glyph_stroke = Stroke::new(1.4, Color32::from_white_alpha(220));
+    match summary.status {
+        CiStatus::Success => {
+            // Checkmark — two short strokes.
+            let a = egui::pos2(center.x - BADGE_RADIUS * 0.45, center.y);
+            let b = egui::pos2(center.x - BADGE_RADIUS * 0.10, center.y + BADGE_RADIUS * 0.35);
+            let c = egui::pos2(center.x + BADGE_RADIUS * 0.45, center.y - BADGE_RADIUS * 0.30);
+            painter.line_segment([a, b], glyph_stroke);
+            painter.line_segment([b, c], glyph_stroke);
+        }
+        CiStatus::Failure => {
+            let off = BADGE_RADIUS * 0.4;
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - off, center.y - off),
+                    egui::pos2(center.x + off, center.y + off),
+                ],
+                glyph_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x + off, center.y - off),
+                    egui::pos2(center.x - off, center.y + off),
+                ],
+                glyph_stroke,
+            );
+        }
+        CiStatus::Pending => {
+            // Three tiny dots stacked horizontally — classic "…"
+            let dot_r = BADGE_RADIUS * 0.15;
+            for dx in [-BADGE_RADIUS * 0.45, 0.0, BADGE_RADIUS * 0.45] {
+                painter.circle_filled(
+                    egui::pos2(center.x + dx, center.y),
+                    dot_r,
+                    Color32::from_white_alpha(220),
+                );
+            }
+        }
+        CiStatus::Neutral | CiStatus::Unknown => {
+            // Hollow ring — no verdict to communicate.
+            painter.circle_stroke(center, BADGE_RADIUS * 0.45, glyph_stroke);
+        }
+    }
+
+    // Hover tooltip: "CI: N passed · M failed · K pending" + clickable URL.
+    let tooltip_text = format!(
+        "CI: {} passed · {} failed · {} pending",
+        summary.passed, summary.failed, summary.pending
+    );
+    let resp = resp.on_hover_ui(|ui| {
+        ui.label(egui::RichText::new(&tooltip_text).strong());
+        if let Some(url) = summary.details_url.as_deref() {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(url).monospace().weak());
+            ui.add_space(2.0);
+            ui.weak("Click the badge to open details in your browser.");
+        }
+    });
+
+    if resp.clicked() {
+        if let Some(url) = summary.details_url.as_deref() {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+    }
 }
 
 fn paint_author_cell(ui: &mut Ui, rect: Rect, row: &GraphRow) {
@@ -1606,6 +1737,41 @@ fn draw_lane_curve(painter: &Painter, start: Pos2, end: Pos2, stroke: Stroke) {
     ));
 }
 
+/// Paint a dashed vertical-ish line from `from` to `to`.
+///
+/// egui's `Painter` has no built-in dash support in 0.29, so we approximate
+/// by chopping the segment into fixed-length dashes with gaps between. The
+/// dash length (`6.0`) and gap (`4.0`) are tuned for `ROW_HEIGHT = 24`: one
+/// full row ends up with roughly 2½ dashes, enough to read as "dashed" at
+/// a glance without looking like tiny noise.
+///
+/// Kept generic over direction (not strictly vertical) so future non-axis-
+/// aligned uses (e.g. a diagonal pending-merge indicator) can share this.
+fn draw_dashed_vline(painter: &Painter, from: Pos2, to: Pos2, stroke: Stroke) {
+    const DASH: f32 = 6.0;
+    const GAP: f32 = 4.0;
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= 0.0 {
+        return;
+    }
+    let ux = dx / len;
+    let uy = dy / len;
+    let mut t = 0.0_f32;
+    while t < len {
+        let end = (t + DASH).min(len);
+        painter.line_segment(
+            [
+                Pos2::new(from.x + ux * t, from.y + uy * t),
+                Pos2::new(from.x + ux * end, from.y + uy * end),
+            ],
+            stroke,
+        );
+        t = end + GAP;
+    }
+}
+
 fn lane_color(lane: u16) -> Color32 {
     // Pastel palette — low-saturation, high-value colours so even a merge-
     // heavy history reads as a softly coloured ribbon instead of a candy-
@@ -1701,11 +1867,21 @@ fn render_working_tree_row(
             .rect_filled(rect, 0.0, ui.visuals().faint_bg_color.gamma_multiply(1.1));
     }
 
-    // Click handling
+    // Click handling — single click selects the WT pseudo-row (the
+    // right-hand pane switches to a file-picker for staging / diffing
+    // uncommitted changes). Double-click is the "I want to commit now"
+    // shortcut: it opens the commit modal immediately. Same gesture
+    // contract as real commit rows, where double-click pops a commit
+    // detail view.
     if resp.clicked() {
         *selected = true;
         out.clear_commit_selection = true;
         out.clicked = None;
+    }
+    if resp.double_clicked() {
+        *selected = true;
+        out.clear_commit_selection = true;
+        out.open_commit = true;
     }
 
     // Context menu
@@ -1720,7 +1896,14 @@ fn render_working_tree_row(
         }
     });
 
-    // Paint virtual graph node like a normal commit row (if graph column visible)
+    // Paint virtual graph node like a normal commit row (if graph column visible).
+    //
+    // The connector down to HEAD is deliberately *dashed*, not solid —
+    // this encodes the fact that the working-tree node isn't a real
+    // commit yet. If the user committed right now, the dashed line
+    // would become the solid edge from their new commit back to HEAD;
+    // the visual contract is "dashed = pending / not yet in git's
+    // object graph".
     if layout.show_graph {
         let clipped = ui.painter().with_clip_rect(cells.graph);
         let head_lane = connected_lane.unwrap_or(0);
@@ -1730,16 +1913,25 @@ fn render_working_tree_row(
         let dot_center = egui::pos2(lane_x, rect.center().y);
         let lane_color = lane_color(head_lane);
         if connected_lane.is_some() {
-            clipped.line_segment(
-                [dot_center, egui::pos2(lane_x, cells.graph.bottom())],
+            draw_dashed_vline(
+                &clipped,
+                dot_center,
+                egui::pos2(lane_x, cells.graph.bottom()),
                 egui::Stroke::new(LINE_WIDTH, lane_color),
             );
         }
-        clipped.circle_filled(dot_center, DOT_RADIUS, lane_color);
+        // The WT "dot" is drawn as a ring (hollow) rather than filled,
+        // reinforcing the "not yet real" semantic against the filled
+        // solid dots used for actual commits.
+        clipped.circle_filled(
+            dot_center,
+            DOT_RADIUS,
+            ui.visuals().extreme_bg_color,
+        );
         clipped.circle_stroke(
             dot_center,
             DOT_RADIUS,
-            egui::Stroke::new(1.0, Color32::from_black_alpha(80)),
+            egui::Stroke::new(1.6, lane_color),
         );
     }
 
