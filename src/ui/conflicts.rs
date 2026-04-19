@@ -11,7 +11,7 @@
 //!   * Offer "Take Both" alongside "Use Ours / Theirs" for the common
 //!     "keep the additions from both sides" case.
 //!
-//! Fork-inspired card picker (added in the `card_picker` section below):
+//! Local/Remote card picker (added in the `card_picker` section below):
 //!   * The per-file picker leads with two large rounded cards — Local (our)
 //!     and Remote (their) — each showing the branch/tip, the file path, a
 //!     "modified" status chip, and a click-to-pick checkbox. A subtle
@@ -19,11 +19,11 @@
 //!     two sides are the "alternatives" they're choosing between rather than
 //!     independent controls.
 //!   * The "Merge in External Tool" button hands off to `git mergetool` so
-//!     power users with a configured tool (Beyond Compare, Kaleidoscope,
-//!     meld, …) don't have to drop to a terminal. Git's own `mergetool`
-//!     driver respects the user's global config (`merge.tool`) and will
-//!     write the resolved file back to the working tree, which is exactly
-//!     the behaviour the rest of MergeFox already expects.
+//!     power users with a configured merge driver don't have to drop to a
+//!     terminal. Git's own `mergetool` driver respects the user's global
+//!     config (`merge.tool`) and will write the resolved file back to the
+//!     working tree, which is exactly the behaviour the rest of MergeFox
+//!     already expects.
 //!   * The existing editor-mode UI is preserved as an "Advanced" collapsing
 //!     section so users who want to hand-resolve markers still can. The
 //!     card surface is *additive*, not a rewrite of the underlying flow.
@@ -77,8 +77,8 @@ enum ConflictIntent {
     SaveManual(PathBuf, String),
     /// Hand off a single conflicted path to the user's configured external
     /// mergetool (`git mergetool -- <path>`). The subprocess is spawned
-    /// detached — it may open a blocking GUI (Beyond Compare, Kaleidoscope)
-    /// or write directly back to the working tree.
+    /// detached — it may open a blocking GUI or write directly back to
+    /// the working tree, depending on the configured tool.
     LaunchMergetool(PathBuf),
     Continue,
     Abort,
@@ -334,16 +334,15 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
                     ui.add_space(10.0);
 
-                    // ---------- Fork-style Local / Remote cards ------------
+                    // ---------- Local / Remote cards ------------------------
                     //
-                    // The card pair is the new *primary* affordance: it
-                    // matches what users see in Fork and communicates the
-                    // Ours-vs-Theirs decision far more clearly than two
-                    // adjacent buttons. Clicking the checkbox on a card is
-                    // equivalent to pressing "Use ours/theirs" — it's just a
-                    // more spatial way of expressing the same choice. The
-                    // old button row remains below so keyboard/muscle-memory
-                    // users aren't displaced.
+                    // The card pair is the *primary* affordance: two side-by-
+                    // side cards communicate the Ours-vs-Theirs decision far
+                    // more clearly than two adjacent buttons. Clicking the
+                    // checkbox on a card is equivalent to pressing "Use
+                    // ours/theirs" — it's just a more spatial way of
+                    // expressing the same choice. The old button row remains
+                    // below so keyboard / muscle-memory users aren't displaced.
                     render_card_picker(ui, entry, &labels, &mut intent);
 
                     ui.add_space(10.0);
@@ -412,14 +411,14 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                             }
                         });
 
-                        // Fork also exposes a "Merge in External Tool"
-                        // button. We wire it to `git mergetool -- <path>`,
-                        // which reads `merge.tool` from the user's global
-                        // git config (so Beyond Compare, Kaleidoscope,
-                        // meld, p4merge etc. all work without us having to
-                        // special-case them). `git mergetool` itself writes
-                        // back to the working tree and stages the file on
-                        // success, so no MergeFox-side write is required.
+                        // "Merge in External Tool" — we wire it to
+                        // `git mergetool -- <path>`, which reads
+                        // `merge.tool` from the user's global git config
+                        // (so every tool git supports works without us
+                        // having to special-case any of them). `git
+                        // mergetool` itself writes back to the working
+                        // tree and stages the file on success, so no
+                        // MergeFox-side write is required.
                         if ui
                             .button(
                                 RichText::new("🛠 Merge in External Tool")
@@ -444,8 +443,8 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     //
                     // A dedicated side-by-side view where each conflict hunk
                     // gets its own pair of checkboxes (Their's on the left,
-                    // Our's on the right — matching the Fork reference
-                    // mock-up). Clicking a side's checkbox schedules that
+                    // Our's on the right — standard 3-way merge layout).
+                    // Clicking a side's checkbox schedules that
                     // side's lines for inclusion in the resolved output;
                     // checking both emits ours + blank + theirs (the same
                     // semantics as `EditorResolution::Both`). The view is
@@ -478,7 +477,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
                     // ---------- Advanced (text-editor) fallback ------------
                     //
-                    // Everything below is the pre-Fork-redesign editor UI.
+                    // Everything below is the pre-card-redesign editor UI.
                     // We keep it intact — users who actually hand-resolve
                     // markers rely on the colour-coded editor, Prev/Next
                     // jumps, and the built-in "Use ours/theirs in all
@@ -841,11 +840,11 @@ fn render_region_card(
 
 /// File-list row with an inline conflict-count badge.
 ///
-/// Fork's sidebar uses a yellow warning triangle to flag conflicted files.
-/// We follow the same convention because yellow reads as "needs attention"
-/// without implying an error — conflicts are a normal part of merging, not
-/// a crash. Binary files *do* get a red chip because the user genuinely
-/// can't hand-merge them; that's a harder blocker.
+/// Conflicted files carry a yellow warning triangle. Yellow reads as
+/// "needs attention" without implying an error — conflicts are a normal
+/// part of merging, not a crash. Binary files *do* get a red chip
+/// because the user genuinely can't hand-merge them; that's a harder
+/// blocker.
 fn file_list_row(
     ui: &mut egui::Ui,
     entry: &ConflictEntry,
@@ -900,12 +899,11 @@ fn header(
     conflicts: &[ConflictEntry],
     labels: &SideLabels,
 ) {
-    // Fork-style heading: a prominent warning triangle next to a one-line
-    // title, followed by an explanatory sentence. We intentionally keep the
-    // operation-progress and ours/theirs legend underneath because those are
-    // MergeFox-specific affordances that Fork doesn't provide (e.g. rebase
-    // step counter, the reminder that "theirs" is your own commit during a
-    // rebase — see SideLabels::resolve).
+    // Heading: a prominent warning triangle next to a one-line title,
+    // followed by an explanatory sentence. The operation-progress and
+    // ours/theirs legend sit underneath because they carry MergeFox-
+    // specific context (rebase step counter, the reminder that "theirs"
+    // is your own commit during a rebase — see SideLabels::resolve).
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("⚠")
@@ -1108,9 +1106,9 @@ fn resolve_conflict_manual(app: &mut MergeFoxApp, path: &Path, text: &str) {
     }
 }
 
-/// Spawn `git mergetool -- <path>` in the current repo so the user's
-/// configured merge driver (Beyond Compare, Kaleidoscope, meld, p4merge,
-/// vimdiff, …) opens for this single file.
+/// Spawn `git mergetool -- <path>` in the current repo so whatever
+/// merge driver the user has wired up in `merge.tool` opens for this
+/// single file.
 ///
 /// We deliberately use `std::process::Command::spawn` instead of the
 /// synchronous `run()` helper in `git::cli` because mergetool is *blocking
@@ -1173,24 +1171,24 @@ fn launch_mergetool(app: &mut MergeFoxApp, path: &Path) {
     }
 }
 
-/// Render the Fork-style Local (our) / Remote (their) card pair.
+/// Render the Local (our) / Remote (their) card pair.
 ///
 /// Each card is a rounded, softly-filled panel with:
 ///   * a heading stating the side + operation-specific label
 ///     (e.g. "Local (our)" / "Remote (their)"),
 ///   * the branch/tip short label from [`SideLabels`],
 ///   * the file path with a lightweight icon prefix,
-///   * a "modified" chip that matches Fork's status treatment,
+///   * a "modified" / "absent" status chip,
 ///   * a checkbox that picks the side when clicked. The checkbox reads as
 ///     a "radio" in effect: checking Local unchecks Remote (both cards
 ///     immediately commit the choice by firing the same `UseFile` intent
 ///     that the legacy buttons use).
 ///
 /// A thin connector line runs between the cards with a small diamond at
-/// its midpoint, echoing Fork's visual cue that the two cards are the two
-/// sides of one choice. We keep the connector purely decorative — clicking
-/// it does nothing — because egui can't easily overlay an interactive
-/// widget mid-panel without a separate layer.
+/// its midpoint — a visual cue that the two cards are the two sides of
+/// one choice. We keep the connector purely decorative (clicking it does
+/// nothing) because egui can't easily overlay an interactive widget
+/// mid-panel without a separate layer.
 fn render_card_picker(
     ui: &mut egui::Ui,
     entry: &ConflictEntry,
@@ -1346,10 +1344,10 @@ fn render_side_card<F: FnOnce() -> ConflictIntent>(
 
             ui.add_space(6.0);
 
-            // "modified" status chip — matches the Fork screenshot. For the
-            // "absent" side (file was only added or deleted on one side) we
-            // say so explicitly so the user knows what the checkbox would
-            // actually do if it were enabled.
+            // "modified" status chip. For the "absent" side (file was
+            // only added or deleted on one side) we say so explicitly
+            // so the user knows what the checkbox would actually do if
+            // it were enabled.
             ui.horizontal(|ui| {
                 let (chip_text, chip_color) = if available {
                     ("modified", palette::WARNING)
@@ -1380,7 +1378,8 @@ fn render_side_card<F: FnOnce() -> ConflictIntent>(
 /// We draw directly via `ui.painter()` at the allocated rect so the line
 /// sits vertically centred regardless of card content height. The rect's
 /// width is fixed by the caller (see `connector_width` in
-/// `render_card_picker`) which matches Fork's 40-ish-pixel gutter.
+/// `render_card_picker`) — ~40px gives the two cards visible
+/// breathing room without letting the connector line feel stringy.
 fn draw_card_connector(ui: &mut egui::Ui, width: f32) {
     // Allocate the gutter with a min height large enough to centre against
     // typical card height (~110px). The painter draws at the midpoint so
@@ -1786,8 +1785,8 @@ fn choice_label(choice: ConflictChoice) -> &'static str {
 // 3-way line-by-line editor
 // ===========================================================================
 //
-// The Fork-style 3-way editor renders Their's on the left and Our's on the
-// right, each column a line-numbered monospace view of the file. Conflict
+// The line-by-line 3-way editor renders Their's on the left and Our's on
+// the right, each column a line-numbered monospace view of the file. Conflict
 // regions are painted with accent fills and carry a checkbox on the hunk
 // header: checking a side schedules its lines for inclusion in the resolved
 // output. Prev / Next arrows jump between regions; Resolve composes the
@@ -1805,7 +1804,7 @@ fn choice_label(choice: ConflictChoice) -> &'static str {
 // * **Scroll linkage.** egui's `ScrollArea::id_salt(...).link_with(...)` is
 //   the supported way to sync two scroll areas. We wrap both columns in a
 //   shared `egui::ScrollArea::vertical` via a single `horizontal` strip so
-//   the two columns always scroll together — matches Fork's behaviour.
+//   the two columns always scroll together.
 // * **Navigation.** Prev/Next set a `scroll_to_region` target consumed on
 //   the next frame; each hunk row calls `scroll_to_me` when its index
 //   matches.
@@ -2064,8 +2063,8 @@ fn render_three_way_editor(
     let mut state = load_three_way_state(ui.ctx(), &entry.path);
     if state.selections.len() < region_count {
         // Default: keep *our* lines (the safer choice when the user
-        // hasn't looked at each hunk yet). Matches Fork's "Accept
-        // Current Change" default.
+        // hasn't looked at each hunk yet — matches the common
+        // "Accept Current Change" default).
         state.selections.resize(region_count, (true, false));
     }
     if state.selections.len() > region_count {

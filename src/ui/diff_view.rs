@@ -366,8 +366,8 @@ fn render_working_tree_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, entries:
 /// Aggregate a folder's status entries into a tri-state staging flag.
 /// `Mixed` is the result when entries disagree, OR when any single entry has
 /// *both* staged and unstaged portions (a partially-staged file) — cycling
-/// that through "stage all" or "unstage all" resolves it, which matches
-/// Anchorpoint's behavior.
+/// that through "stage all" or "unstage all" resolves it, which is the
+/// idiom most file-browser-style staging UIs follow.
 fn folder_stage_state(entries: &[&StatusEntry]) -> FolderStage {
     // Untracked files can't be "unstaged" — they're outside the index. We
     // treat them as "not staged" for the purposes of the folder checkbox so
@@ -396,14 +396,14 @@ fn folder_stage_state(entries: &[&StatusEntry]) -> FolderStage {
     }
 }
 
-/// Working-tree tree view with Anchorpoint-style folder headers. Each folder
-/// gets a tri-state staging checkbox that cycles:
+/// Working-tree tree view with folder headers and per-folder tri-state
+/// staging checkboxes. Clicking a folder checkbox cycles:
 ///   `Mixed`  → clicking stages every file in the folder (`FolderStage::All`)
 ///   `All`    → clicking unstages every file in the folder (`FolderStage::None`)
 ///   `None`   → clicking stages every file in the folder (`FolderStage::All`)
-/// This matches Anchorpoint and git-gui where the default "resolve" action
-/// from a mixed state is to stage everything (the common workflow is
-/// "I want this whole folder in my next commit").
+/// This matches git-gui's default — resolving a mixed state by staging
+/// everything aligns with the common "I want this whole folder in my
+/// next commit" workflow.
 fn render_working_tree_tree(ui: &mut egui::Ui, ws: &mut WorkspaceState, entries: &[StatusEntry]) {
     let mut dirs: std::collections::BTreeMap<String, Vec<&StatusEntry>> =
         std::collections::BTreeMap::new();
@@ -1202,15 +1202,15 @@ enum FolderStage {
     Mixed,
 }
 
-/// Render an Anchorpoint-style folder header row: fold-triangle, folder icon,
-/// breadcrumb path in monospace, and an aggregated "[N modified, M new]"
-/// subtitle. Returns (whether-the-header-was-clicked-to-toggle, checkbox-response)
-/// so callers can wire up folder-scoped actions (stage all / unstage all) and
+/// Render a folder header row: fold-triangle, folder icon, breadcrumb path
+/// in monospace, and an aggregated "[N modified, M new]" subtitle. Returns
+/// `(whether-the-header-was-clicked-to-toggle, checkbox-response)` so
+/// callers can wire up folder-scoped actions (stage all / unstage all) and
 /// expand/collapse without re-laying out the row.
 ///
 /// We draw the row manually instead of using `egui::CollapsingHeader` because:
-/// 1. AP-style puts a checkbox *inside* the header, and egui's collapsing
-///    header eats clicks on anything inside its title row, making the checkbox
+/// 1. We put a checkbox *inside* the header, and egui's collapsing header
+///    eats clicks on anything inside its title row, making the checkbox
 ///    stop working as a distinct control.
 /// 2. We need the subtitle line directly under the header, not indented as a
 ///    child — a collapsing header forces that indentation.
@@ -1340,8 +1340,8 @@ fn folder_header_row(
     (header_clicked, checkbox_resp)
 }
 
-/// Tree view — files grouped by directory with Anchorpoint-style folder
-/// headers. Multi-level paths (`a/b/c`) render as a single breadcrumb row
+/// Tree view — files grouped by directory with folder headers + tri-state
+/// staging checkboxes. Multi-level paths (`a/b/c`) render as a single breadcrumb row
 /// rather than nested groups; flatter = easier to scan when a commit touches
 /// many sibling subtrees.
 ///

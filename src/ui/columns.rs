@@ -28,7 +28,7 @@ pub struct ColumnPrefs {
     /// Compact-graph-column: shrinks the lane cells to half the usual LANE_WIDTH.
     pub compact_graph: bool,
     /// Smart-branch-visibility: hides branch chips on rows that already
-    /// have the branch name shown by a descendant (≈ what Fork calls it).
+    /// have the branch name shown by a descendant.
     pub smart_branches: bool,
     /// User-overridden column widths (drag handles in the graph view).
     /// `None` means "auto" — the graph view picks a default for that
