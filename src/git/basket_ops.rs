@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 
 use super::diff::{diff_for_commit_in, RepoDiff};
+use super::repo::{auto_stash_path, AutoStashOpts, AutoStashOutcome};
 
 /// Why the combined-diff computation couldn't finish.
 #[derive(Debug)]
@@ -376,6 +377,229 @@ pub fn filter_combined_diff_to_path(diff: &RepoDiff, focus_path: &str) -> RepoDi
     }
 }
 
+// ============================================================
+// Phase 5: Revert-to-working-tree over a basket of commits
+// ============================================================
+
+/// Outcome of a basket `git revert --no-commit <oids…>` chain, from the
+/// caller's (UI thread's) point of view.
+///
+/// The distinction between `Clean` and `Conflicts` is NOT "did git exit
+/// zero" — git's revert machinery can partially succeed and then stop on
+/// a conflict, leaving `REVERT_HEAD` in place. We classify based on
+/// conflict markers in the working tree after the command returns. The
+/// `Aborted` variant is only produced when we actively ran
+/// `git revert --abort` to roll back, and corresponds to an unclean
+/// state we couldn't reason about (e.g. git exited non-zero with no
+/// conflicted paths — usually a permissions / disk-full scenario).
+#[derive(Debug, Clone)]
+pub enum RevertOutcome {
+    /// All commits were reverted into the working tree cleanly.
+    Clean {
+        commits_reverted: usize,
+        auto_stashed: bool,
+    },
+    /// Git stopped partway with conflict markers in the working tree.
+    /// `REVERT_HEAD` is still in place — the caller must surface the
+    /// conflicts modal and let the user `Continue` / `Abort` through
+    /// the normal resolver flow.
+    Conflicts {
+        commits_reverted: usize,
+        conflicted_paths: Vec<PathBuf>,
+        auto_stashed: bool,
+    },
+    /// Something went wrong that we couldn't route to the conflicts
+    /// modal. We ran `git revert --abort` to restore the pre-op tree.
+    Aborted { reason: String },
+}
+
+/// Run `git revert --no-commit <oid1> <oid2> …` over the basket.
+///
+/// Synchronous; intended to be called from a worker thread. Flow:
+///   1. Probe the working tree for dirtiness; auto-stash if needed.
+///   2. Sort commits newest-first (reverse topological).
+///   3. `git revert --no-commit --no-edit` over the whole list.
+///   4. Classify outcome: Clean / Conflicts / Aborted.
+pub fn revert_to_working_tree(
+    repo_path: &Path,
+    commits: &[gix::ObjectId],
+) -> Result<RevertOutcome> {
+    if commits.is_empty() {
+        return Ok(RevertOutcome::Clean {
+            commits_reverted: 0,
+            auto_stashed: false,
+        });
+    }
+
+    let auto_stashed = match auto_stash_path(
+        repo_path,
+        "basket revert",
+        AutoStashOpts::default(),
+    )
+    .context("auto-stash before basket revert")?
+    {
+        AutoStashOutcome::Clean => false,
+        AutoStashOutcome::Stashed { .. } => true,
+        AutoStashOutcome::Refused { reason } => {
+            return Ok(RevertOutcome::Aborted {
+                reason: reason.to_string(),
+            });
+        }
+    };
+
+    let ordered = sort_reverse_topo(repo_path, commits)?;
+
+    let mut args: Vec<String> = vec![
+        "revert".to_owned(),
+        "--no-commit".to_owned(),
+        "--no-edit".to_owned(),
+    ];
+    args.extend(ordered.iter().map(|o| o.to_string()));
+
+    let output = super::cli::GitCommand::new(repo_path)
+        .args(&args)
+        .run_raw()
+        .context("spawn git revert")?;
+
+    if output.status.success() {
+        return Ok(RevertOutcome::Clean {
+            commits_reverted: commits.len(),
+            auto_stashed,
+        });
+    }
+
+    let conflicts = unmerged_paths(repo_path).unwrap_or_default();
+    if !conflicts.is_empty() {
+        let remaining = sequencer_remaining_count(repo_path).unwrap_or(0);
+        let commits_reverted = commits.len().saturating_sub(remaining + 1);
+        return Ok(RevertOutcome::Conflicts {
+            commits_reverted,
+            conflicted_paths: conflicts,
+            auto_stashed,
+        });
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let _ = super::cli::run(repo_path, ["revert", "--abort"]);
+    Ok(RevertOutcome::Aborted {
+        reason: if stderr.is_empty() {
+            format!("git revert exited with status {}", output.status)
+        } else {
+            stderr
+        },
+    })
+}
+
+/// Return the basket commits in reverse topological (newest-first) order.
+fn sort_reverse_topo(
+    repo_path: &Path,
+    commits: &[gix::ObjectId],
+) -> Result<Vec<gix::ObjectId>> {
+    if commits.len() <= 1 {
+        return Ok(commits.to_vec());
+    }
+    let mut args: Vec<String> = vec![
+        "rev-list".to_owned(),
+        "--topo-order".to_owned(),
+        "--no-walk".to_owned(),
+    ];
+    args.extend(commits.iter().map(|o| o.to_string()));
+    let out = match super::cli::GitCommand::new(repo_path).args(&args).run() {
+        Ok(out) => out,
+        Err(_) => return Ok(commits.to_vec()),
+    };
+    let mut sorted = Vec::with_capacity(commits.len());
+    for line in out.stdout_str().lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(oid) = gix::ObjectId::from_hex(trimmed.as_bytes()) {
+            if commits.contains(&oid) {
+                sorted.push(oid);
+            }
+        }
+    }
+    for oid in commits {
+        if !sorted.contains(oid) {
+            sorted.push(*oid);
+        }
+    }
+    Ok(sorted)
+}
+
+fn unmerged_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
+    let out = super::cli::run(
+        repo_path,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=no"],
+    )?;
+    Ok(parse_unmerged_z(&out.stdout))
+}
+
+/// Pure parser for `git status --porcelain=v1 -z` output, returning the
+/// paths git classifies as unmerged.
+fn parse_unmerged_z(data: &[u8]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        if pos + 3 > data.len() {
+            break;
+        }
+        let x = data[pos] as char;
+        let y = data[pos + 1] as char;
+        pos += 3;
+
+        let path_start = pos;
+        while pos < data.len() && data[pos] != 0 {
+            pos += 1;
+        }
+        if pos >= data.len() {
+            break;
+        }
+        let path = PathBuf::from(String::from_utf8_lossy(&data[path_start..pos]).as_ref());
+        pos += 1;
+
+        if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
+            while pos < data.len() && data[pos] != 0 {
+                pos += 1;
+            }
+            if pos < data.len() {
+                pos += 1;
+            }
+        }
+
+        let conflicted = matches!(
+            (x, y),
+            ('U', 'U')
+                | ('A', 'A')
+                | ('D', 'D')
+                | ('D', 'U')
+                | ('U', 'D')
+                | ('A', 'U')
+                | ('U', 'A')
+        );
+        if conflicted {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Count commits still pending in `.git/sequencer/todo`.
+fn sequencer_remaining_count(repo_path: &Path) -> Option<usize> {
+    let git_dir = repo_path.join(".git");
+    let todo = git_dir.join("sequencer").join("todo");
+    let text = std::fs::read_to_string(&todo).ok()?;
+    let count = text
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .count();
+    Some(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +660,71 @@ mod tests {
         let diff = mk_diff(&["src/a.rs"]);
         let focused = filter_combined_diff_to_path(&diff, "missing.rs");
         assert!(focused.files.is_empty());
+    }
+
+    #[test]
+    fn parse_unmerged_z_handles_empty_input() {
+        assert!(parse_unmerged_z(&[]).is_empty());
+    }
+
+    #[test]
+    fn parse_unmerged_z_extracts_uu_and_aa_rows() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"UU conflict.rs");
+        data.push(0);
+        data.extend_from_slice(b"M  clean.rs");
+        data.push(0);
+        data.extend_from_slice(b"AA both-added.rs");
+        data.push(0);
+
+        let paths = parse_unmerged_z(&data);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], PathBuf::from("conflict.rs"));
+        assert_eq!(paths[1], PathBuf::from("both-added.rs"));
+    }
+
+    #[test]
+    fn parse_unmerged_z_skips_rename_payload_cleanly() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"R  new");
+        data.push(0);
+        data.extend_from_slice(b"old");
+        data.push(0);
+        data.extend_from_slice(b"UU conflict.rs");
+        data.push(0);
+
+        let paths = parse_unmerged_z(&data);
+        assert_eq!(paths, vec![PathBuf::from("conflict.rs")]);
+    }
+
+    #[test]
+    fn parse_unmerged_z_recognises_all_conflict_codes() {
+        for code in ["UU", "AA", "DD", "DU", "UD", "AU", "UA"] {
+            let mut data = Vec::new();
+            data.extend_from_slice(code.as_bytes());
+            data.push(b' ');
+            data.extend_from_slice(b"file.rs");
+            data.push(0);
+            let paths = parse_unmerged_z(&data);
+            assert_eq!(paths, vec![PathBuf::from("file.rs")], "code={code}");
+        }
+    }
+
+    #[test]
+    fn revert_outcome_clean_carries_counts() {
+        let out = RevertOutcome::Clean {
+            commits_reverted: 3,
+            auto_stashed: true,
+        };
+        match out {
+            RevertOutcome::Clean {
+                commits_reverted,
+                auto_stashed,
+            } => {
+                assert_eq!(commits_reverted, 3);
+                assert!(auto_stashed);
+            }
+            _ => panic!("expected Clean"),
+        }
     }
 }
