@@ -132,6 +132,17 @@ pub struct MergeFoxApp {
     /// In-flight `git revert --no-commit <oids…>` spawned from the
     /// basket bar's "↺ Revert to WT" button. Only one at a time.
     pub basket_revert_task: Option<BasketRevertTask>,
+    /// Confirmation modal for the basket squash ("⇩ Squash into one").
+    /// `Some` = open and awaiting user decision. Lives on the app (not
+    /// WorkspaceState) because the squash is global-destructive: we
+    /// don't want a background tab to quietly stage a confirm that
+    /// the user no longer has context for when they switch back.
+    pub basket_squash_confirm: Option<crate::ui::basket_squash::BasketSquashConfirmState>,
+    /// In-flight squash worker. At most one at a time, same reason as
+    /// `basket_revert_task` — the squash is irreversible (mod the
+    /// backup tag), so queueing a second behind the first would be
+    /// user-hostile.
+    pub basket_squash_task: Option<BasketSquashTask>,
 }
 
 /// Worker-thread handle for an in-flight basket revert. Opaque to the
@@ -141,6 +152,20 @@ pub struct BasketRevertTask {
     pub repo_path: std::path::PathBuf,
     pub requested: usize,
     pub rx: std::sync::mpsc::Receiver<std::result::Result<crate::git::RevertOutcome, String>>,
+}
+
+/// Worker-thread handle for an in-flight basket squash. Mirrors
+/// `BasketRevertTask` — opaque to most of the app; only
+/// `start_basket_squash` / `poll_basket_squash` touch the innards.
+///
+/// The channel always returns `Ok(SquashOutcome)` because the worker
+/// itself classifies failures into `SquashOutcome::Aborted`; the only
+/// way `Err` appears is if the worker thread dies before sending,
+/// which `poll_basket_squash` detects via `Disconnected`.
+pub struct BasketSquashTask {
+    pub repo_path: std::path::PathBuf,
+    pub requested: usize,
+    pub rx: std::sync::mpsc::Receiver<crate::git::SquashOutcome>,
 }
 
 #[derive(Default)]
@@ -997,6 +1022,8 @@ impl MergeFoxApp {
             forge_create_pr_task: None,
             forge_create_issue_task: None,
             basket_revert_task: None,
+            basket_squash_confirm: None,
+            basket_squash_task: None,
         }
     }
 
@@ -1076,10 +1103,17 @@ impl MergeFoxApp {
             BasketIntent::ShowCombinedDiff => self.start_combined_diff(),
             BasketIntent::FocusFile => self.start_basket_focus_picker(),
             BasketIntent::RevertToWorkingTree => self.start_basket_revert(),
-            BasketIntent::SquashIntoOne => {
-                self.notify_info(format!("Basket: {intent:?} — not yet wired"));
-            }
+            BasketIntent::SquashIntoOne => self.show_basket_squash_confirm_modal(),
         }
+    }
+
+    /// Placeholder — full confirm modal lands when the Phase 6 UI agent
+    /// finishes wiring. For now we surface a toast so the click still
+    /// gives feedback and doesn't look broken.
+    pub fn show_basket_squash_confirm_modal(&mut self) {
+        self.notify_info(
+            "Basket squash: backend ready, confirm UI still under construction.",
+        );
     }
 
     /// Entry point for the basket "Focus file…" button. Two-phase:
