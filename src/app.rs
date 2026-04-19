@@ -1107,15 +1107,6 @@ impl MergeFoxApp {
         }
     }
 
-    /// Placeholder — full confirm modal lands when the Phase 6 UI agent
-    /// finishes wiring. For now we surface a toast so the click still
-    /// gives feedback and doesn't look broken.
-    pub fn show_basket_squash_confirm_modal(&mut self) {
-        self.notify_info(
-            "Basket squash: backend ready, confirm UI still under construction.",
-        );
-    }
-
     /// Entry point for the basket "Focus file…" button. Two-phase:
     ///
     /// 1. If there's already a combined diff loaded for the current
@@ -1505,6 +1496,209 @@ impl MergeFoxApp {
             }
             Err(err) => {
                 self.notify_err_with_detail("Basket revert failed to start.", err);
+            }
+        }
+    }
+
+    // ========================================================
+    // Basket Phase 6 — non-linear squash
+    // ========================================================
+
+    /// Open the confirmation modal for "Squash basket into one".
+    ///
+    /// WHY a dedicated open-path (vs spawning the worker directly like
+    /// revert does): squashing rewrites history, and an accidental
+    /// trigger is expensive to undo. The modal's backup-tag notice +
+    /// force-push warning + editable message are cheap UX investments
+    /// with a high safety payoff.
+    pub fn show_basket_squash_confirm_modal(&mut self) {
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        let ws = tabs.current();
+        if ws.commit_basket.len() < 2 {
+            return;
+        }
+        if self.basket_squash_task.is_some() {
+            self.notify_info("A squash is already in progress — wait for it to finish.");
+            return;
+        }
+        // Idempotent — a double-click shouldn't stack two modals.
+        if self.basket_squash_confirm.is_some() {
+            return;
+        }
+
+        // Pull commit summaries from the graph cache so the default
+        // message mirrors what the user sees in the graph pane. Falls
+        // back to OID shorts if the graph isn't loaded (shouldn't
+        // happen — the basket bar is only visible with a graph).
+        let summaries: Vec<String> = {
+            let basket: Vec<gix::ObjectId> = ws.commit_basket.iter().copied().collect();
+            match ws.graph_view.as_ref() {
+                Some(gv) => basket
+                    .iter()
+                    .map(|oid| {
+                        gv.graph
+                            .rows
+                            .iter()
+                            .find(|r| r.oid == *oid)
+                            .map(|r| r.summary.to_string())
+                            .unwrap_or_else(|| oid.to_string())
+                    })
+                    .collect(),
+                None => basket.iter().map(|o| o.to_string()).collect(),
+            }
+        };
+
+        let default_message =
+            crate::git::basket_ops::compose_default_squash_message(&summaries);
+        let backup_tag_preview = crate::git::basket_ops::backup_tag_name(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+
+        self.basket_squash_confirm =
+            Some(crate::ui::basket_squash::BasketSquashConfirmState {
+                message: default_message,
+                backup_tag_preview,
+                commit_count: ws.commit_basket.len(),
+            });
+    }
+
+    /// Render (and dispatch) the squash confirm modal. Safe to call
+    /// every frame; cheap no-op when closed.
+    pub fn handle_basket_squash_confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.basket_squash_confirm.as_mut() else {
+            return;
+        };
+        let outcome = crate::ui::basket_squash::show(ctx, state);
+        match outcome {
+            None => {}
+            Some(crate::ui::basket_squash::BasketSquashConfirmOutcome::Cancelled) => {
+                self.basket_squash_confirm = None;
+            }
+            Some(crate::ui::basket_squash::BasketSquashConfirmOutcome::Confirmed {
+                message,
+            }) => {
+                self.basket_squash_confirm = None;
+                self.start_basket_squash(message);
+            }
+        }
+    }
+
+    /// Spawn the squash worker on a background thread. The UI stays
+    /// responsive while cherry-picks replay — can take seconds on
+    /// baskets that span deep history.
+    pub fn start_basket_squash(&mut self, message: String) {
+        if self.basket_squash_task.is_some() {
+            self.notify_info("A squash is already in progress — wait for it to finish.");
+            return;
+        }
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        let ws = tabs.current();
+        if ws.commit_basket.len() < 2 {
+            return;
+        }
+
+        let repo_path = ws.repo.path().to_path_buf();
+        let commits: Vec<gix::ObjectId> = ws.commit_basket.iter().copied().collect();
+        let requested = commits.len();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx_clone = self.egui_ctx.clone();
+        let repo_thread = repo_path.clone();
+        std::thread::spawn(move || {
+            let outcome =
+                crate::git::squash_basket_into_one(&repo_thread, &commits, &message);
+            let _ = tx.send(outcome);
+            ctx_clone.request_repaint();
+        });
+
+        self.basket_squash_task = Some(BasketSquashTask {
+            repo_path,
+            requested,
+            rx,
+        });
+        self.notify_info(format!(
+            "Squashing {requested} commits — creating backup tag and rebuilding…"
+        ));
+    }
+
+    /// Drain the squash channel once per frame. Dispatches toasts and
+    /// rebuilds the graph on completion.
+    pub fn poll_basket_squash(&mut self) {
+        let Some(task) = self.basket_squash_task.as_ref() else {
+            return;
+        };
+        let outcome = match task.rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.basket_squash_task = None;
+                self.notify_err(
+                    "Basket squash worker died before reporting — check git state manually.",
+                );
+                return;
+            }
+        };
+
+        let repo_path = task.repo_path.clone();
+        let requested = task.requested;
+        self.basket_squash_task = None;
+
+        let is_active_tab = matches!(
+            &self.view,
+            View::Workspace(tabs) if !tabs.launcher_active
+                && tabs.current().repo.path() == repo_path
+        );
+
+        match outcome {
+            crate::git::SquashOutcome::Success {
+                new_head_oid,
+                backup_tag,
+            } => {
+                // Clear the basket (the squashed-in commits no longer
+                // exist) and rebuild the graph so the user immediately
+                // sees the rewritten history.
+                if let Some(ws) = self.workspace_by_path_mut(&repo_path) {
+                    ws.commit_basket.clear();
+                    ws.combined_diff_source = None;
+                    ws.combined_diff_full = None;
+                    ws.combined_diff_focus_path = None;
+                    ws.selected_commit = Some(new_head_oid);
+                    ws.selected_file_idx = None;
+                }
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                self.notify_ok(format!(
+                    "Squashed {requested} commits into one. Backup tag: {backup_tag}"
+                ));
+            }
+            crate::git::SquashOutcome::Aborted {
+                reason,
+                backup_tag_created,
+            } => {
+                // Rebuild the graph regardless — rollback may have
+                // touched refs, and the user needs a truthful view.
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                let detail = match backup_tag_created {
+                    Some(tag) => format!("{reason} (backup tag preserved: {tag})"),
+                    None => reason,
+                };
+                self.notify_err_with_detail("Basket squash aborted.", detail);
             }
         }
     }
@@ -5198,6 +5392,7 @@ impl eframe::App for MergeFoxApp {
         self.poll_diff_tasks();
         self.poll_graph_tasks();
         self.poll_basket_revert();
+        self.poll_basket_squash();
         self.drain_image_evictions(ctx);
         // Drain the async preview-decoder pool into its shared cache.
         // Cheap no-op when idle (bounded `try_recv` loop). Done before
@@ -5247,6 +5442,7 @@ impl eframe::App for MergeFoxApp {
         self.handle_commit_basket_bar(ctx);
         self.poll_combined_diff();
         self.handle_basket_focus_modal(ctx);
+        self.handle_basket_squash_confirm_modal(ctx);
 
         if self.clone_in_progress() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -5255,6 +5451,9 @@ impl eframe::App for MergeFoxApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         if self.basket_revert_task.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        if self.basket_squash_task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.provider_oauth_start_task.is_some() || self.provider_oauth_poll_task.is_some() {
