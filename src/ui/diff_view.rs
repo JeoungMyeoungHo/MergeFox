@@ -619,11 +619,15 @@ pub(crate) fn has_selected_file(ws: &WorkspaceState) -> bool {
     commit_file_selected || working_file_selected
 }
 
-pub(crate) fn show_selected_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceState) {
+pub(crate) fn show_selected_file_center(
+    ui: &mut egui::Ui,
+    ws: &mut WorkspaceState,
+    diff_prefs: &mut crate::config::DiffPrefs,
+) {
     // Working Tree file selected: render it inline
     if ws.selected_working_tree {
         if let Some(path) = ws.selected_working_file.clone() {
-            render_working_file_center(ui, ws, &path);
+            render_working_file_center(ui, ws, &path, diff_prefs);
             return;
         }
     }
@@ -668,6 +672,11 @@ pub(crate) fn show_selected_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceSta
             {
                 ws.selected_file_view = SelectedFileView::Diff;
             }
+            // Minimap toggle — only meaningful in Diff view, but
+            // kept visible in both so its presence doesn't flicker
+            // across toggles. A no-op click in File view is a
+            // cheaper trade than a jumping toolbar.
+            minimap_toggle_button(ui, diff_prefs);
         });
     });
     ui.small(&diff.title);
@@ -679,7 +688,7 @@ pub(crate) fn show_selected_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceSta
     // rows every frame. The image / binary / too-large branches use a
     // plain `ScrollArea::both` since their content is small.
     match ws.selected_file_view {
-        SelectedFileView::Diff => render_file_detail(ui, &file, image_cache.as_ref()),
+        SelectedFileView::Diff => render_file_detail(ui, &file, image_cache.as_ref(), diff_prefs),
         SelectedFileView::File => {
             render_file_snapshot(ui, ws, &file, image_cache.as_ref());
         }
@@ -687,7 +696,12 @@ pub(crate) fn show_selected_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceSta
 }
 
 /// Render a working tree file (staged or unstaged) in the center pane.
-fn render_working_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceState, path: &std::path::Path) {
+fn render_working_file_center(
+    ui: &mut egui::Ui,
+    ws: &mut WorkspaceState,
+    path: &std::path::Path,
+    diff_prefs: &mut crate::config::DiffPrefs,
+) {
     let Some(entry) = selected_working_entry(ws, path) else {
         ws.selected_working_file = None;
         ws.working_file_diff = None;
@@ -719,6 +733,7 @@ fn render_working_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceState, path: 
             {
                 ws.selected_file_view = SelectedFileView::Diff;
             }
+            minimap_toggle_button(ui, diff_prefs);
         });
     });
     ui.small(format!("Changes · {}", working_tree_stats_str(&entry)));
@@ -739,7 +754,7 @@ fn render_working_file_center(ui: &mut egui::Ui, ws: &mut WorkspaceState, path: 
     match ws.selected_file_view {
         SelectedFileView::Diff => {
             if let Some(file) = working_file.as_ref() {
-                render_file_detail(ui, file, image_cache.as_ref());
+                render_file_detail(ui, file, image_cache.as_ref(), diff_prefs);
             } else {
                 ui.weak("Could not compute diff for this file.");
             }
@@ -1557,10 +1572,51 @@ enum DiffRow<'a> {
 
 const DIFF_ROW_HEIGHT: f32 = 16.0;
 
+/// Width of the minimap column appended to the right of the diff
+/// scroll area. 14 px is narrow enough that even pane-split layouts
+/// don't lose noticeable text width; at the same time it leaves room
+/// for the viewport overlay + drag target.
+const MINIMAP_WIDTH: f32 = 14.0;
+
+/// Key for the one-shot pending scroll offset that the minimap writes
+/// and the diff scroll area consumes on the next frame. Stored in the
+/// egui data bag so multiple files can coexist without us threading a
+/// per-file scroll cache through `WorkspaceState`.
+fn pending_scroll_key() -> egui::Id {
+    egui::Id::new("diff_minimap::pending_scroll")
+}
+
+/// Tiny toolbar button that toggles the minimap. Kept inline rather
+/// than given its own widget module — the surface is one bool + one
+/// tooltip, not worth the indirection yet.
+fn minimap_toggle_button(ui: &mut egui::Ui, diff_prefs: &mut crate::config::DiffPrefs) {
+    // Unicode glyph chosen to read as "vertical strip / overview"
+    // without leaning on a raster icon pipeline. The active state
+    // uses SelectableLabel so the toggle affords its state the same
+    // way the file-view / diff-view toggles beside it do.
+    let label = "▮";
+    let hover = if diff_prefs.show_minimap {
+        "Hide diff minimap"
+    } else {
+        "Show diff minimap"
+    };
+    let btn_size = egui::vec2(26.0, 22.0);
+    let resp = ui
+        .add_sized(
+            btn_size,
+            egui::SelectableLabel::new(diff_prefs.show_minimap, label),
+        )
+        .on_hover_text(hover);
+    if resp.clicked() {
+        diff_prefs.show_minimap = !diff_prefs.show_minimap;
+    }
+}
+
 fn render_file_detail(
     ui: &mut egui::Ui,
     file: &FileDiff,
     image_cache: Option<&SelectedImageCache>,
+    diff_prefs: &mut crate::config::DiffPrefs,
 ) {
     match &file.kind {
         FileKind::Text {
@@ -1574,27 +1630,135 @@ fn render_file_detail(
             // egui's row-based virtualization. Previously we laid out every
             // hunk + every line every frame, which on thousand-line diffs
             // meant a full re-layout pass each paint.
+            //
+            // While walking the hunks, we also precompute intra-line
+            // word diffs for each adjacent Remove+Add pair so the
+            // per-row painter stays allocation-free. `intra_line_diff`
+            // returns `None` when the two lines are too dissimilar to
+            // align meaningfully; in that case the row falls back to
+            // the solid red/green rendering.
             let mut rows: Vec<DiffRow> = Vec::with_capacity(
                 hunks.iter().map(|h| h.lines.len() + 1).sum::<usize>() + usize::from(*truncated),
             );
+            let mut intra: Vec<Option<std::sync::Arc<crate::git::IntraLineDiff>>> =
+                Vec::with_capacity(rows.capacity());
             for hunk in hunks {
                 rows.push(DiffRow::HunkHeader(&hunk.header));
-                for line in &hunk.lines {
+                intra.push(None);
+                let lines = &hunk.lines;
+                let mut i = 0;
+                while i < lines.len() {
+                    let line = &lines[i];
+                    // Adjacent Remove+Add with matching hunk context
+                    // = candidate for intra-line alignment.
+                    let pair = if line.kind == LineKind::Remove && i + 1 < lines.len() {
+                        let next = &lines[i + 1];
+                        if next.kind == LineKind::Add {
+                            crate::git::intra_line_diff(&line.content, &next.content)
+                                .map(std::sync::Arc::new)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     rows.push(DiffRow::Line(line));
+                    intra.push(pair.clone());
+                    if pair.is_some() {
+                        // Consume the paired Add line in the same
+                        // iteration so the `intra` entry lines up 1:1
+                        // with `rows`.
+                        let added = &lines[i + 1];
+                        rows.push(DiffRow::Line(added));
+                        intra.push(pair);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
                 }
             }
             if *truncated {
                 rows.push(DiffRow::Truncated);
+                intra.push(None);
             }
             let total = rows.len();
-            ScrollArea::vertical()
-                .id_salt("diff_file_detail")
-                .auto_shrink([false, false])
-                .show_rows(ui, DIFF_ROW_HEIGHT, total, |ui, range| {
-                    for i in range {
-                        paint_diff_row(ui, &rows[i]);
+
+            // Compute the minimap rows up-front — cheap (one pass over
+            // the same data we already walked) and we need the length
+            // for the viewport overlay maths anyway.
+            let minimap_rows = if diff_prefs.show_minimap {
+                crate::ui::diff_minimap::rows_for_file(file)
+            } else {
+                Vec::new()
+            };
+            let show_minimap = diff_prefs.show_minimap && !minimap_rows.is_empty();
+
+            let total_y = DIFF_ROW_HEIGHT * total as f32;
+            let pending_scroll = ui.data(|d| d.get_temp::<f32>(pending_scroll_key()));
+
+            ui.horizontal(|ui| {
+                let minimap_width = if show_minimap { MINIMAP_WIDTH } else { 0.0 };
+                let scroll_width = (ui.available_width() - minimap_width).max(1.0);
+
+                // Child region with a fixed width so the ScrollArea
+                // doesn't shove the minimap off the right edge on
+                // narrow panels.
+                let scroll_rect = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    egui::vec2(scroll_width, ui.available_height()),
+                );
+                let mut scroll_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(scroll_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+
+                let mut scroll_area = ScrollArea::vertical()
+                    .id_salt("diff_file_detail")
+                    .auto_shrink([false, false]);
+                if let Some(y) = pending_scroll {
+                    scroll_area = scroll_area.scroll_offset(egui::vec2(0.0, y));
+                }
+                let output = scroll_area.show_rows(
+                    &mut scroll_ui,
+                    DIFF_ROW_HEIGHT,
+                    total,
+                    |ui, range| {
+                        for i in range {
+                            paint_diff_row_with_intra(ui, &rows[i], intra[i].as_deref());
+                        }
+                    },
+                );
+                // Reserve the rest of the horizontal slot so the
+                // minimap lands at the cursor rather than pushing
+                // through a phantom gap.
+                ui.advance_cursor_after_rect(output.inner_rect);
+
+                if show_minimap {
+                    let viewport_h = output.inner_rect.height();
+                    let scroll_y = output.state.offset.y;
+                    if let Some(new_y) = crate::ui::diff_minimap::show(
+                        ui,
+                        &minimap_rows,
+                        scroll_y,
+                        total_y,
+                        viewport_h,
+                        minimap_width,
+                    ) {
+                        ui.data_mut(|d| d.insert_temp(pending_scroll_key(), new_y));
+                    } else if pending_scroll.is_some() {
+                        // One-shot: consume the pending value so the
+                        // ScrollArea isn't pinned to the same offset
+                        // on every subsequent frame.
+                        ui.data_mut(|d| d.remove::<f32>(pending_scroll_key()));
                     }
-                });
+                } else if pending_scroll.is_some() {
+                    // Minimap turned off with a pending scroll in the
+                    // bag — clear it so toggling it back on doesn't
+                    // resurrect the stale target.
+                    ui.data_mut(|d| d.remove::<f32>(pending_scroll_key()));
+                }
+            });
         }
         FileKind::Image { ext } => {
             let (old_bytes, new_bytes) = image_cache
@@ -1631,7 +1795,11 @@ fn render_file_detail(
     }
 }
 
-fn paint_diff_row(ui: &mut egui::Ui, row: &DiffRow<'_>) {
+fn paint_diff_row_with_intra(
+    ui: &mut egui::Ui,
+    row: &DiffRow<'_>,
+    intra: Option<&crate::git::IntraLineDiff>,
+) {
     match row {
         DiffRow::HunkHeader(header) => {
             let (rect, _) = ui.allocate_exact_size(
@@ -1646,7 +1814,7 @@ fn paint_diff_row(ui: &mut egui::Ui, row: &DiffRow<'_>) {
                 Color32::from_rgb(110, 170, 220),
             );
         }
-        DiffRow::Line(line) => paint_diff_line(ui, line),
+        DiffRow::Line(line) => paint_diff_line_with_intra(ui, line, intra),
         DiffRow::Truncated => {
             let (rect, _) = ui.allocate_exact_size(
                 Vec2::new(ui.available_width(), DIFF_ROW_HEIGHT),
@@ -1829,11 +1997,23 @@ fn render_text_snapshot(ui: &mut egui::Ui, path: &str, text: &str, bounds: &[(u3
         });
 }
 
-fn paint_diff_line(ui: &mut egui::Ui, line: &DiffLine) {
+/// Paint one diff row, optionally layering intra-line word-diff
+/// highlights on top of the soft row background. Passing `None` gives
+/// the same solid red/green rendering the first MVP shipped with;
+/// passing `Some(diff)` picks the spans for this row's kind out of the
+/// `IntraLineDiff` pair and paints them as a stronger emphasis band.
+fn paint_diff_line_with_intra(
+    ui: &mut egui::Ui,
+    line: &DiffLine,
+    intra: Option<&crate::git::IntraLineDiff>,
+) {
     // Each line is rendered as a full-width row with a background colour
     // and a fixed-width gutter showing old/new line numbers, then the
-    // content in monospace. We don't try to do word-level intra-line
-    // diffing for MVP — column-oriented +/− is enough to read.
+    // content in monospace. Word-level highlights, when available, go
+    // as a second pass: the whole-line background stays soft so the
+    // row still reads as "this entire line was removed / added", and
+    // the RemovedWord / AddedWord spans get a stronger rectangle
+    // layered on top of the line background.
     let (bg, fg, prefix) = match line.kind {
         LineKind::Add => (
             Color32::from_rgba_unmultiplied(80, 180, 100, 38),
@@ -1859,7 +2039,9 @@ fn paint_diff_line(ui: &mut egui::Ui, line: &DiffLine) {
         .unwrap_or_else(|| "    ".into());
 
     let font = FontId::monospace(12.5);
-    let text = format!(" {old} {new} {prefix} {}", line.content);
+    let prefix_text = format!(" {old} {new} {prefix} ");
+    let body = line.content.as_str();
+    let full_text = format!("{prefix_text}{body}");
 
     // Allocate a full-width row, paint background, then draw text.
     let (rect, _) =
@@ -1867,13 +2049,64 @@ fn paint_diff_line(ui: &mut egui::Ui, line: &DiffLine) {
     if bg.a() > 0 {
         ui.painter().rect_filled(rect, 0.0, bg);
     }
+
+    // Intra-line emphasis: paint a second rectangle for each span that
+    // is a word-level change on this row. We measure via the monospace
+    // glyph advance so the highlights align with the text grid —
+    // egui's `painter().text` doesn't give us a per-span layout, so we
+    // lean on the fact that we're already guaranteed to be in a
+    // fixed-width font.
+    if let (Some(intra), true) = (intra, matches!(line.kind, LineKind::Add | LineKind::Remove)) {
+        let spans = match line.kind {
+            LineKind::Remove => &intra.removed_spans,
+            LineKind::Add => &intra.added_spans,
+            _ => unreachable!(),
+        };
+        let emphasis_bg = match line.kind {
+            LineKind::Remove => Color32::from_rgba_unmultiplied(235, 108, 108, 90),
+            LineKind::Add => Color32::from_rgba_unmultiplied(116, 192, 136, 90),
+            _ => Color32::TRANSPARENT,
+        };
+        let advance = monospace_advance(ui, &font);
+        let base_x = rect.min.x + 4.0 + advance * prefix_text.chars().count() as f32;
+        let mut cursor = 0usize;
+        for span in spans {
+            let (text, emphasized) = match span {
+                crate::git::IntraLineSpan::Unchanged(t) => (t.as_str(), false),
+                crate::git::IntraLineSpan::RemovedWord(t) => {
+                    (t.as_str(), matches!(line.kind, LineKind::Remove))
+                }
+                crate::git::IntraLineSpan::AddedWord(t) => {
+                    (t.as_str(), matches!(line.kind, LineKind::Add))
+                }
+            };
+            let width = advance * text.chars().count() as f32;
+            if emphasized && !text.is_empty() {
+                let x = base_x + advance * cursor as f32;
+                let stripe = egui::Rect::from_min_size(
+                    egui::pos2(x, rect.min.y),
+                    Vec2::new(width, rect.height()),
+                );
+                ui.painter().rect_filled(stripe, 0.0, emphasis_bg);
+            }
+            cursor += text.chars().count();
+        }
+    }
+
     ui.painter().text(
         rect.min + Vec2::new(4.0, 2.0),
         egui::Align2::LEFT_TOP,
-        text,
+        full_text,
         font,
         fg,
     );
+}
+
+/// Horizontal advance of one glyph in the given monospace font.
+/// Cheap enough to call once per row — egui's font system memoizes
+/// glyph metrics internally.
+fn monospace_advance(ui: &egui::Ui, font: &FontId) -> f32 {
+    ui.fonts(|fonts| fonts.glyph_width(font, 'M'))
 }
 
 /// Side-by-side image diff. Handles add (new only), delete (old only), and

@@ -7,6 +7,7 @@ pub mod columns;
 pub mod commit_basket;
 pub mod commit_modal;
 pub mod conflicts;
+pub mod diff_minimap;
 pub mod diff_view;
 pub mod file_preview;
 pub mod fonts;
