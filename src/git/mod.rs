@@ -1,16 +1,28 @@
 pub mod basket_ops;
 pub mod blame;
+pub mod find_fix_ops;
 pub mod reword_ops;
 pub mod cli;
 pub mod diff;
 pub mod graph;
 pub mod jobs;
 pub mod lfs;
+pub mod message_lint;
 pub mod ops;
 pub mod repo;
 
 pub use basket_ops::{
     revert_to_working_tree, squash_basket_into_one, RevertOutcome, SquashOutcome,
+};
+pub use find_fix_ops::{
+    apply as find_fix_apply, scan as find_fix_scan, ApplyOutcome as FindFixApplyOutcome, ApplyPlan
+    as FindFixApplyPlan, CommitMatch as FindFixCommitMatch, ScanResult as FindFixScanResult,
+    WorkingTreeMatch as FindFixWorkingTreeMatch,
+};
+pub use message_lint::{
+    auto_fix as lint_auto_fix, lint as lint_message, load_rules as load_message_lint_rules,
+    rules_file_path as message_lint_rules_path, Finding as LintFinding, RulesFile as LintRulesFile,
+    Scope as LintScope, Severity as LintSeverity,
 };
 pub use reword_ops::{reword_commit, RewordOutcome};
 pub use blame::{blame_file, BlameCommit, BlameLine, BlameResult};

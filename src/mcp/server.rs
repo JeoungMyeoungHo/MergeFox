@@ -71,6 +71,10 @@ pub fn run_stdio(repo_path: &Path) -> Result<()> {
     } else {
         tracing::info!(target: "mergefox::mcp", "MCP stdio server started (token auth)");
     }
+    // Destructive-op budget is per-session. Reset on every new stdio
+    // run so a fresh process starts with a clean counter even if the
+    // previous session hit the cap.
+    super::git_tools::reset_session_counters();
 
     while let Some(message) = read_message(&mut reader)? {
         let request: RpcRequest = serde_json::from_slice(&message).context("decode JSON-RPC")?;
@@ -170,51 +174,54 @@ fn handle_request(ctx: &mut SessionCtx, request: RpcRequest) -> Result<Option<Rp
             )
         }
         "ping" => ok(id, json!({})),
-        "tools/list" => ok(
-            id,
-            json!({
-                "tools": [
-                    tool_descriptor(
-                        "mergefox_activity_log",
-                        "Return the recent mergeFox activity log for this repository.",
-                        json!({
-                            "type": "object",
-                            "properties": {
-                                "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
-                                "only_kind": { "type": "string" },
-                                "only_source": { "type": "string", "enum": ["ui", "mcp", "external"] }
-                            }
-                        })
-                    ),
-                    tool_descriptor(
-                        "mergefox_action_preview",
-                        "Dry-run a mergeFox action and classify its risk without executing it. \
-                         Safe to call on any action; never mutates the repo.",
-                        json!({
-                            "type": "object",
-                            "properties": {
-                                "kind": { "type": "string" }
-                            },
-                            "required": ["kind"]
-                        })
-                    ),
-                    tool_descriptor(
-                        "mergefox_action_execute",
-                        "Execute a mergeFox action. By default this REFUSES — requests require \
-                         UI approval from the running mergeFox app, or an auto-approve tier \
-                         opt-in via `MERGEFOX_MCP_AUTO_APPROVE` (safe | recoverable | all). \
-                         Destructive actions additionally require `MERGEFOX_MCP_ALLOW_DESTRUCTIVE=1`.",
-                        json!({
-                            "type": "object",
-                            "properties": {
-                                "kind": { "type": "string" }
-                            },
-                            "required": ["kind"]
-                        })
-                    )
-                ]
-            }),
-        ),
+        "tools/list" => {
+            let mut tools = vec![
+                tool_descriptor(
+                    "mergefox_activity_log",
+                    "Return the recent mergeFox activity log for this repository.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+                            "only_kind": { "type": "string" },
+                            "only_source": { "type": "string", "enum": ["ui", "mcp", "external"] }
+                        }
+                    }),
+                ),
+                tool_descriptor(
+                    "mergefox_action_preview",
+                    "Dry-run a mergeFox action and classify its risk without executing it. \
+                     Safe to call on any action; never mutates the repo.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string" }
+                        },
+                        "required": ["kind"]
+                    }),
+                ),
+                tool_descriptor(
+                    "mergefox_action_execute",
+                    "Execute a mergeFox action. By default this REFUSES — requests require \
+                     UI approval from the running mergeFox app, or an auto-approve tier \
+                     opt-in via `MERGEFOX_MCP_AUTO_APPROVE` (safe | recoverable | all). \
+                     Destructive actions additionally require `MERGEFOX_MCP_ALLOW_DESTRUCTIVE=1`.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string" }
+                        },
+                        "required": ["kind"]
+                    }),
+                ),
+            ];
+            // Destructive-but-enveloped ops: reword, squash, find-and-fix,
+            // plus the rollback/list-backups pair. Lives in a sibling
+            // module so the tier-gate + rate-limit logic sits next to the
+            // git envelope it protects.
+            tools.extend(super::git_tools::tool_descriptors());
+            ok(id, json!({ "tools": tools }))
+        }
         "tools/call" => {
             let params = request.params.unwrap_or_default();
             let name = params
@@ -230,11 +237,30 @@ fn handle_request(ctx: &mut SessionCtx, request: RpcRequest) -> Result<Option<Rp
                 "mergefox_action_preview" => action_preview_tool(&ctx.repo_path, arguments)?,
                 "mergefox_action_execute" => action_execute_tool(&ctx.repo_path, arguments)?,
                 other => {
-                    return Ok(Some(err(
-                        id,
-                        -32601,
-                        format!("unknown mergefox tool `{other}`"),
-                    )));
+                    // Route the destructive git-tools family (reword,
+                    // squash, find-and-fix, rollback, list-backups)
+                    // through its own dispatcher. The tier gate there
+                    // mirrors the `action_execute` behaviour: require
+                    // `AUTO_APPROVE=all` AND `ALLOW_DESTRUCTIVE=1`.
+                    let tier_allows_destructive = matches!(
+                        auto_approve_tier(),
+                        AutoApproveTier::All
+                    ) && destructive_allowed();
+                    match super::git_tools::dispatch(
+                        &ctx.repo_path,
+                        other,
+                        arguments,
+                        tier_allows_destructive,
+                    )? {
+                        Some(payload) => payload,
+                        None => {
+                            return Ok(Some(err(
+                                id,
+                                -32601,
+                                format!("unknown mergefox tool `{other}`"),
+                            )));
+                        }
+                    }
                 }
             };
             ok(id, result)

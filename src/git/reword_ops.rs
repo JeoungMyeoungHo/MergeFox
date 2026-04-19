@@ -339,11 +339,18 @@ fn parse_ident(s: &str) -> (String, String, String) {
 /// Build a filesystem-safe backup tag name. Scoped under
 /// `mergefox/reword/` so it doesn't collide with squash backups.
 fn backup_tag_name() -> String {
+    backup_tag_name_for("reword")
+}
+
+/// Parametrised variant — the find-and-fix flow reuses the same
+/// ISO-UTC naming convention under a `mergefox/<namespace>/` prefix
+/// so backup tags group by operation in `git tag --list 'mergefox/*'`.
+pub fn backup_tag_name_for(namespace: &str) -> String {
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!("mergefox/reword/{}", format_iso_utc(unix as i64))
+    format!("mergefox/{namespace}/{}", format_iso_utc(unix as i64))
 }
 
 fn format_iso_utc(unix: i64) -> String {
