@@ -276,4 +276,12 @@ impl MergeFoxApp {
         self.notifications
             .push_with_detail(NotifSeverity::Error, msg, Some(detail.into()));
     }
+    /// Success toast with a secondary line for long-form context (e.g.
+    /// "backup tag X points at the pre-reset HEAD"). The summary is what
+    /// the user sees at a glance; the detail is revealed in the toast's
+    /// expanded view and never truncated.
+    pub fn notify_ok_with_detail(&mut self, msg: impl Into<String>, detail: impl Into<String>) {
+        self.notifications
+            .push_with_detail(NotifSeverity::Success, msg, Some(detail.into()));
+    }
 }

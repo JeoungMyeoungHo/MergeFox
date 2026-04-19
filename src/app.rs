@@ -143,6 +143,18 @@ pub struct MergeFoxApp {
     /// backup tag), so queueing a second behind the first would be
     /// user-hostile.
     pub basket_squash_task: Option<BasketSquashTask>,
+    /// Confirmation modal for the destructive "Reset to here" button
+    /// in the reflog recovery window. `Some` = open; holds the target
+    /// oid, its preview (lost commits, dirty flag), and the "I
+    /// understand" checkbox state. Lives on the app (not a workspace)
+    /// for the same reason as `basket_squash_confirm`: the rewind
+    /// mutates the active branch, so a half-confirmed modal that
+    /// lingers across tab switches would be a footgun.
+    pub reflog_rewind_confirm: Option<ReflogRewindConfirm>,
+    /// In-flight `git reset --hard` from the reflog rewind. Only one
+    /// at a time; same rationale as `basket_squash_task` (destructive
+    /// ops run serialised so the user can reason about state).
+    pub reflog_rewind_task: Option<ReflogRewindTask>,
 }
 
 /// Worker-thread handle for an in-flight basket revert. Opaque to the
@@ -166,6 +178,41 @@ pub struct BasketSquashTask {
     pub repo_path: std::path::PathBuf,
     pub requested: usize,
     pub rx: std::sync::mpsc::Receiver<crate::git::SquashOutcome>,
+}
+
+/// Persistent state for the reflog-rewind confirmation modal.
+///
+/// We keep the `preview` here rather than recomputing per-frame because
+/// the user can have a long list of lost commits scrolled open and we
+/// don't want every mouse movement to re-shell-out `git rev-list`. The
+/// preview is refreshed when the modal opens and on explicit refresh
+/// (e.g. a future "Recompute" affordance); for now we trust the one we
+/// captured at open time since reflog entries are immutable.
+///
+/// `understood` is a single checkbox ("I understand this rewrites
+/// history"). We picked the checkbox path over "two-click confirm"
+/// because (a) it's discoverable — the checkbox is visible from the
+/// first frame, so the user sees the guard without trial-and-error,
+/// and (b) destructive buttons that require double-click tend to
+/// surprise users who click-drag the mouse by habit.
+pub struct ReflogRewindConfirm {
+    pub repo_path: std::path::PathBuf,
+    pub target_oid: gix::ObjectId,
+    pub preview: crate::git::RewindPreview,
+    pub understood: bool,
+    /// Optional reflog message shown alongside the target oid — keeps
+    /// the modal copy concrete ("Reset HEAD to 3b1c2f0 — merge pr 42")
+    /// even though the underlying reflog window has been dismissed.
+    pub message: Option<String>,
+}
+
+/// Worker-thread handle for an in-flight reflog rewind. Mirrors
+/// `BasketSquashTask` — opaque to most of the app; only
+/// `start_reflog_rewind` / `poll_reflog_rewind_task` touch the innards.
+pub struct ReflogRewindTask {
+    pub repo_path: std::path::PathBuf,
+    pub target_oid: gix::ObjectId,
+    pub rx: std::sync::mpsc::Receiver<std::result::Result<crate::git::RewindOutcome, String>>,
 }
 
 #[derive(Default)]
@@ -1024,6 +1071,8 @@ impl MergeFoxApp {
             basket_revert_task: None,
             basket_squash_confirm: None,
             basket_squash_task: None,
+            reflog_rewind_confirm: None,
+            reflog_rewind_task: None,
         }
     }
 
@@ -1699,6 +1748,173 @@ impl MergeFoxApp {
                     None => reason,
                 };
                 self.notify_err_with_detail("Basket squash aborted.", detail);
+            }
+        }
+    }
+
+    /// Open the "Reset to here" confirmation modal for `target_oid`.
+    ///
+    /// Called from two places in `ui::reflog`:
+    ///   * the red "Reset to here" button on a reflog row,
+    ///   * a pill in the Quick-jump strip.
+    ///
+    /// Computes the preview synchronously — it's a single `rev-list`
+    /// capped at ~50 entries, so the UI thread cost is negligible even
+    /// on large repos. On failure we surface a toast and leave the
+    /// reflog window open so the user can pick a different entry.
+    pub fn show_reflog_rewind_confirm(
+        &mut self,
+        target_oid: gix::ObjectId,
+        message: Option<String>,
+    ) {
+        if self.reflog_rewind_task.is_some() {
+            self.notify_info("A reflog rewind is already in progress — wait for it to finish.");
+            return;
+        }
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        let repo_path = tabs.current().repo.path().to_path_buf();
+        match crate::git::preview_rewind(&repo_path, target_oid) {
+            Ok(preview) => {
+                self.reflog_rewind_confirm = Some(ReflogRewindConfirm {
+                    repo_path,
+                    target_oid,
+                    preview,
+                    understood: false,
+                    message,
+                });
+            }
+            Err(err) => {
+                self.notify_err_with_detail(
+                    "Couldn't compute rewind preview.",
+                    format!("{err:#}"),
+                );
+            }
+        }
+    }
+
+    /// Kick off the worker thread that performs the reflog rewind.
+    /// Consumes the confirm modal (success OR failure — the user
+    /// doesn't stay on the modal while we work). The worker communicates
+    /// through a mpsc channel polled by `poll_reflog_rewind_task`.
+    pub fn start_reflog_rewind(&mut self) {
+        if self.reflog_rewind_task.is_some() {
+            return;
+        }
+        let Some(confirm) = self.reflog_rewind_confirm.take() else {
+            return;
+        };
+        let repo_path = confirm.repo_path.clone();
+        let target_oid = confirm.target_oid;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx_clone = self.egui_ctx.clone();
+        let repo_thread = repo_path.clone();
+        std::thread::spawn(move || {
+            // `rewind_to` already classifies its own failures into the
+            // `Aborted` variant; an `Err` here only appears if the
+            // underlying call propagated (e.g. a panic from gix).
+            // Stringify it so the receiver doesn't need anyhow.
+            let outcome = crate::git::rewind_to(&repo_thread, target_oid)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(outcome);
+            ctx_clone.request_repaint();
+        });
+
+        self.reflog_rewind_task = Some(ReflogRewindTask {
+            repo_path,
+            target_oid,
+            rx,
+        });
+        self.notify_info("Resetting HEAD — creating backup tag and resetting working tree…");
+    }
+
+    /// Drain the rewind channel once per frame. On success rebuilds the
+    /// graph, clears any commit selection (the prior selection may now
+    /// be unreachable), closes both the confirm modal AND the reflog
+    /// panel, and posts a success toast that names the backup tag. On
+    /// failure posts an error toast and leaves the reflog panel open so
+    /// the user can try a different entry.
+    pub fn poll_reflog_rewind_task(&mut self) {
+        let Some(task) = self.reflog_rewind_task.as_ref() else {
+            return;
+        };
+        let outcome = match task.rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.reflog_rewind_task = None;
+                self.notify_err(
+                    "Reflog rewind worker died before reporting — check git state manually.",
+                );
+                return;
+            }
+        };
+
+        let repo_path = task.repo_path.clone();
+        self.reflog_rewind_task = None;
+
+        let is_active_tab = matches!(
+            &self.view,
+            View::Workspace(tabs) if !tabs.launcher_active
+                && tabs.current().repo.path() == repo_path
+        );
+
+        match outcome {
+            Ok(crate::git::RewindOutcome::Success {
+                new_head,
+                backup_tag,
+                auto_stashed,
+            }) => {
+                // The previously-selected commit may now be unreachable
+                // (it could have been one of the commits we just cut
+                // off). Drop selection / diff so the UI doesn't show
+                // stale content that refers to a ghost oid.
+                if let Some(ws) = self.workspace_by_path_mut(&repo_path) {
+                    ws.selected_commit = None;
+                    ws.current_diff = None;
+                    ws.selected_file_idx = None;
+                }
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                self.reflog_open = false;
+
+                let short = {
+                    let s = new_head.to_string();
+                    s[..7.min(s.len())].to_string()
+                };
+                let mut detail = format!(
+                    "Backup tag {backup_tag} points at the pre-reset HEAD. \
+                     Use `git reset --hard {backup_tag}` to undo."
+                );
+                if auto_stashed {
+                    detail.push_str(" Auto-stash was restored on top of the new HEAD.");
+                }
+                self.notify_ok_with_detail(format!("Reset to {short}"), detail);
+            }
+            Ok(crate::git::RewindOutcome::Aborted {
+                reason,
+                backup_tag_created,
+            }) => {
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                let detail = match backup_tag_created {
+                    Some(tag) => format!("{reason} (backup tag preserved: {tag})"),
+                    None => reason,
+                };
+                self.notify_err_with_detail("Reset aborted.", detail);
+            }
+            Err(detail) => {
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                self.notify_err_with_detail("Reset failed to start.", detail);
             }
         }
     }
@@ -5393,6 +5609,7 @@ impl eframe::App for MergeFoxApp {
         self.poll_graph_tasks();
         self.poll_basket_revert();
         self.poll_basket_squash();
+        self.poll_reflog_rewind_task();
         self.drain_image_evictions(ctx);
         // Drain the async preview-decoder pool into its shared cache.
         // Cheap no-op when idle (bounded `try_recv` loop). Done before
@@ -5454,6 +5671,9 @@ impl eframe::App for MergeFoxApp {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.basket_squash_task.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        if self.reflog_rewind_task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.provider_oauth_start_task.is_some() || self.provider_oauth_poll_task.is_some() {
