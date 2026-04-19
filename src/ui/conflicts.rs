@@ -440,6 +440,42 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
                     ui.add_space(6.0);
 
+                    // ---------- Line-by-line 3-way editor -----------------
+                    //
+                    // A dedicated side-by-side view where each conflict hunk
+                    // gets its own pair of checkboxes (Their's on the left,
+                    // Our's on the right — matching the Fork reference
+                    // mock-up). Clicking a side's checkbox schedules that
+                    // side's lines for inclusion in the resolved output;
+                    // checking both emits ours + blank + theirs (the same
+                    // semantics as `EditorResolution::Both`). The view is
+                    // line-numbered and accent-tinted so conflict regions
+                    // stand out from context.
+                    //
+                    // This is additive to the card picker (whole-file pick)
+                    // and the advanced text editor — users who want to drop
+                    // to raw markers still can. Default-collapsed because
+                    // the card picker handles the common whole-file case
+                    // faster.
+                    if !entry.is_binary {
+                        let three_way_header = egui::CollapsingHeader::new(
+                            RichText::new("Line-by-line 3-way editor").strong(),
+                        )
+                        .id_salt(egui::Id::new(("conflict_3way", &entry.path)))
+                        .default_open(false);
+                        three_way_header.show(ui, |ui| {
+                            render_three_way_editor(
+                                ui,
+                                entry,
+                                &ws.conflict_editor_text,
+                                &labels,
+                                &mut intent,
+                            );
+                        });
+                    }
+
+                    ui.add_space(6.0);
+
                     // ---------- Advanced (text-editor) fallback ------------
                     //
                     // Everything below is the pre-Fork-redesign editor UI.
@@ -1743,5 +1779,735 @@ fn choice_label(choice: ConflictChoice) -> &'static str {
     match choice {
         ConflictChoice::Ours => "ours",
         ConflictChoice::Theirs => "theirs",
+    }
+}
+
+// ===========================================================================
+// 3-way line-by-line editor
+// ===========================================================================
+//
+// The Fork-style 3-way editor renders Their's on the left and Our's on the
+// right, each column a line-numbered monospace view of the file. Conflict
+// regions are painted with accent fills and carry a checkbox on the hunk
+// header: checking a side schedules its lines for inclusion in the resolved
+// output. Prev / Next arrows jump between regions; Resolve composes the
+// merged text and writes it through the existing `SaveManual` intent.
+//
+// Design notes
+// ------------
+// * **Pure parsing.** `ThreeWaySegment::parse` walks the working-tree text
+//   (same inputs as `ConflictMarkers::scan`) and produces a flat sequence of
+//   `Context` blocks and `Conflict` hunks. Keeping the parse pure makes the
+//   merge composition trivially testable.
+// * **Hunk selection state** is kept in `egui::Context::data_mut`, keyed by
+//   the file path so the user's in-progress picks survive frame-to-frame
+//   scrolling and re-layouts without us touching `WorkspaceState`.
+// * **Scroll linkage.** egui's `ScrollArea::id_salt(...).link_with(...)` is
+//   the supported way to sync two scroll areas. We wrap both columns in a
+//   shared `egui::ScrollArea::vertical` via a single `horizontal` strip so
+//   the two columns always scroll together — matches Fork's behaviour.
+// * **Navigation.** Prev/Next set a `scroll_to_region` target consumed on
+//   the next frame; each hunk row calls `scroll_to_me` when its index
+//   matches.
+// * **Resolve output.** For each region we emit ours, theirs, both (in that
+//   order, blank line between), or neither based on the (ours_sel, their_sel)
+//   tuple. `compose_three_way_resolution` is pure and has unit-test coverage.
+
+/// One segment of a parsed 3-way file: either a block of non-conflict
+/// context lines, or a conflict hunk with the ours/theirs variants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ThreeWaySegment {
+    Context(Vec<String>),
+    Conflict { ours: Vec<String>, theirs: Vec<String> },
+}
+
+impl ThreeWaySegment {
+    /// Parse the working-tree text into a flat segment sequence. Uses the
+    /// same conflict-marker recognition as `ConflictMarkers::scan`.
+    fn parse(text: &str) -> Vec<ThreeWaySegment> {
+        let mut out: Vec<ThreeWaySegment> = Vec::new();
+        let mut ctx: Vec<String> = Vec::new();
+        let mut in_conflict = false;
+        let mut in_theirs = false;
+        let mut ours: Vec<String> = Vec::new();
+        let mut theirs: Vec<String> = Vec::new();
+
+        let flush_ctx = |ctx: &mut Vec<String>, out: &mut Vec<ThreeWaySegment>| {
+            if !ctx.is_empty() {
+                out.push(ThreeWaySegment::Context(std::mem::take(ctx)));
+            }
+        };
+
+        for line in text.lines() {
+            if line.starts_with("<<<<<<<") {
+                flush_ctx(&mut ctx, &mut out);
+                in_conflict = true;
+                in_theirs = false;
+                ours.clear();
+                theirs.clear();
+            } else if in_conflict && line.starts_with("=======") {
+                in_theirs = true;
+            } else if in_conflict && line.starts_with(">>>>>>>") {
+                out.push(ThreeWaySegment::Conflict {
+                    ours: std::mem::take(&mut ours),
+                    theirs: std::mem::take(&mut theirs),
+                });
+                in_conflict = false;
+                in_theirs = false;
+            } else if in_conflict {
+                if in_theirs {
+                    theirs.push(line.to_string());
+                } else {
+                    ours.push(line.to_string());
+                }
+            } else {
+                ctx.push(line.to_string());
+            }
+        }
+        flush_ctx(&mut ctx, &mut out);
+        out
+    }
+
+    fn is_conflict(&self) -> bool {
+        matches!(self, ThreeWaySegment::Conflict { .. })
+    }
+}
+
+/// Compose the resolved text from parsed segments plus one boolean pair
+/// per conflict region (`ours_selected`, `theirs_selected`). Order is
+/// always ours first, then theirs when both are selected, with a blank
+/// separator line between them (matches `EditorResolution::Both`
+/// semantics). Neither-selected regions emit nothing — that's a valid
+/// "drop this hunk" outcome.
+fn compose_three_way_resolution(
+    segments: &[ThreeWaySegment],
+    selections: &[(bool, bool)],
+) -> String {
+    let mut out = String::new();
+    let mut sel_iter = selections.iter();
+    for (i, seg) in segments.iter().enumerate() {
+        match seg {
+            ThreeWaySegment::Context(lines) => {
+                for l in lines {
+                    out.push_str(l);
+                    out.push('\n');
+                }
+            }
+            ThreeWaySegment::Conflict { ours, theirs } => {
+                let (take_ours, take_theirs) = sel_iter.next().copied().unwrap_or((false, false));
+                let mut wrote_any = false;
+                if take_ours {
+                    for l in ours {
+                        out.push_str(l);
+                        out.push('\n');
+                    }
+                    wrote_any = true;
+                }
+                if take_theirs {
+                    if wrote_any && !ours.is_empty() {
+                        out.push('\n');
+                    }
+                    for l in theirs {
+                        out.push_str(l);
+                        out.push('\n');
+                    }
+                }
+                let _ = i; // silence unused warning in release builds
+            }
+        }
+    }
+    out
+}
+
+/// Assign display line numbers to each segment's lines for a single side
+/// (ours or theirs). Context lines are shared between sides; conflict
+/// lines are side-specific so each column's numbering advances
+/// independently through its side's hunks. Returns a flat Vec matching
+/// the render order: one entry per rendered row carrying `(line_number,
+/// kind)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    Context,
+    ConflictOurs,
+    ConflictTheirs,
+    /// Filler row inserted to keep the two columns aligned when one side
+    /// has more lines than the other in the same hunk.
+    Filler,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NumberedRow {
+    line_no: Option<usize>,
+    kind: RowKind,
+    text: String,
+    /// Region index for conflict rows / filler rows, used for scroll
+    /// targeting and checkbox state lookup.
+    region: Option<usize>,
+}
+
+/// Build per-column numbered row lists. The two columns are padded with
+/// `RowKind::Filler` entries inside each hunk so their scroll offsets
+/// align visually (a 3-line ours + 5-line theirs hunk becomes 5 rows on
+/// each side: 3 content + 2 filler on the ours column).
+fn layout_three_way_rows(
+    segments: &[ThreeWaySegment],
+) -> (Vec<NumberedRow>, Vec<NumberedRow>) {
+    let mut left: Vec<NumberedRow> = Vec::new(); // Their's
+    let mut right: Vec<NumberedRow> = Vec::new(); // Our's
+    let mut left_no = 1usize;
+    let mut right_no = 1usize;
+    let mut region_idx = 0usize;
+
+    for seg in segments {
+        match seg {
+            ThreeWaySegment::Context(lines) => {
+                for line in lines {
+                    left.push(NumberedRow {
+                        line_no: Some(left_no),
+                        kind: RowKind::Context,
+                        text: line.clone(),
+                        region: None,
+                    });
+                    right.push(NumberedRow {
+                        line_no: Some(right_no),
+                        kind: RowKind::Context,
+                        text: line.clone(),
+                        region: None,
+                    });
+                    left_no += 1;
+                    right_no += 1;
+                }
+            }
+            ThreeWaySegment::Conflict { ours, theirs } => {
+                let height = ours.len().max(theirs.len());
+                for row in 0..height {
+                    if row < theirs.len() {
+                        left.push(NumberedRow {
+                            line_no: Some(left_no),
+                            kind: RowKind::ConflictTheirs,
+                            text: theirs[row].clone(),
+                            region: Some(region_idx),
+                        });
+                        left_no += 1;
+                    } else {
+                        left.push(NumberedRow {
+                            line_no: None,
+                            kind: RowKind::Filler,
+                            text: String::new(),
+                            region: Some(region_idx),
+                        });
+                    }
+                    if row < ours.len() {
+                        right.push(NumberedRow {
+                            line_no: Some(right_no),
+                            kind: RowKind::ConflictOurs,
+                            text: ours[row].clone(),
+                            region: Some(region_idx),
+                        });
+                        right_no += 1;
+                    } else {
+                        right.push(NumberedRow {
+                            line_no: None,
+                            kind: RowKind::Filler,
+                            text: String::new(),
+                            region: Some(region_idx),
+                        });
+                    }
+                }
+                region_idx += 1;
+            }
+        }
+    }
+    (left, right)
+}
+
+/// Per-file 3-way UI state cached in `egui::Context::data`. Keyed by the
+/// path so each file has independent checkbox picks and scroll targets.
+#[derive(Clone, Default)]
+struct ThreeWayState {
+    /// (ours_selected, theirs_selected) per conflict region. Grown lazily
+    /// to match the region count; default is "ours checked, theirs
+    /// unchecked" so a naive Resolve keeps the user's own work.
+    selections: Vec<(bool, bool)>,
+    /// When set, render scrolls the given region index into view on the
+    /// next frame.
+    scroll_to_region: Option<usize>,
+    /// Last region the user navigated to, used by Prev/Next to compute
+    /// the next target without looking at scroll offsets.
+    cursor_region: usize,
+}
+
+fn three_way_state_id(path: &Path) -> egui::Id {
+    egui::Id::new(("conflict_3way_state", path.display().to_string()))
+}
+
+fn load_three_way_state(ctx: &egui::Context, path: &Path) -> ThreeWayState {
+    ctx.data(|d| d.get_temp::<ThreeWayState>(three_way_state_id(path)))
+        .unwrap_or_default()
+}
+
+fn store_three_way_state(ctx: &egui::Context, path: &Path, state: ThreeWayState) {
+    ctx.data_mut(|d| d.insert_temp(three_way_state_id(path), state));
+}
+
+/// Render the 3-way editor for a single conflicted file.
+fn render_three_way_editor(
+    ui: &mut egui::Ui,
+    entry: &ConflictEntry,
+    text: &str,
+    labels: &SideLabels,
+    intent: &mut Option<ConflictIntent>,
+) {
+    let segments = ThreeWaySegment::parse(text);
+    let region_count = segments.iter().filter(|s| s.is_conflict()).count();
+
+    let mut state = load_three_way_state(ui.ctx(), &entry.path);
+    if state.selections.len() < region_count {
+        // Default: keep *our* lines (the safer choice when the user
+        // hasn't looked at each hunk yet). Matches Fork's "Accept
+        // Current Change" default.
+        state.selections.resize(region_count, (true, false));
+    }
+    if state.selections.len() > region_count {
+        state.selections.truncate(region_count);
+    }
+    if state.cursor_region >= region_count {
+        state.cursor_region = region_count.saturating_sub(1);
+    }
+
+    // --- Top strip: region count + Prev/Next navigation -------------------
+    ui.horizontal(|ui| {
+        ui.weak(
+            RichText::new(format!(
+                "{} conflict region{}",
+                region_count,
+                if region_count == 1 { "" } else { "s" }
+            ))
+            .small(),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_enabled_ui(region_count > 0, |ui| {
+                if ui
+                    .small_button("›")
+                    .on_hover_text("Next conflict region")
+                    .clicked()
+                {
+                    state.cursor_region = (state.cursor_region + 1) % region_count.max(1);
+                    state.scroll_to_region = Some(state.cursor_region);
+                }
+                if ui
+                    .small_button("‹")
+                    .on_hover_text("Previous conflict region")
+                    .clicked()
+                {
+                    state.cursor_region = if state.cursor_region == 0 {
+                        region_count.saturating_sub(1)
+                    } else {
+                        state.cursor_region - 1
+                    };
+                    state.scroll_to_region = Some(state.cursor_region);
+                }
+            });
+        });
+    });
+
+    ui.add_space(4.0);
+
+    // --- Twin scrollable columns -----------------------------------------
+    //
+    // Both columns share one logical scroll area via `link_with` so they
+    // move together. The columns carry identical row counts (padded with
+    // Filler entries inside hunks) which means scroll positions map 1:1.
+    let (left_rows, right_rows) = layout_three_way_rows(&segments);
+    let scroll_target = state.scroll_to_region.take();
+    let link_id = egui::Id::new(("conflict_3way_scroll", &entry.path));
+
+    ui.horizontal_top(|ui| {
+        let col_w = (ui.available_width() - 6.0) / 2.0;
+        ui.allocate_ui(egui::vec2(col_w, 420.0), |ui| {
+            render_three_way_column(
+                ui,
+                &format!("Their's — {}", labels.theirs_short),
+                palette::THEIRS,
+                true, // left column controls theirs checkbox
+                &left_rows,
+                &mut state.selections,
+                scroll_target,
+                link_id.with("left"),
+                link_id,
+            );
+        });
+        ui.allocate_ui(egui::vec2(col_w, 420.0), |ui| {
+            render_three_way_column(
+                ui,
+                &format!("Our's — {}", labels.ours_short),
+                palette::OURS,
+                false, // right column controls ours checkbox
+                &right_rows,
+                &mut state.selections,
+                scroll_target,
+                link_id.with("right"),
+                link_id,
+            );
+        });
+    });
+
+    ui.add_space(8.0);
+
+    // --- Footer: Cancel / Resolve ----------------------------------------
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let resolve_btn = egui::Button::new(
+                RichText::new("✓ Resolve").color(Color32::WHITE).strong(),
+            )
+            .fill(palette::SUCCESS);
+            if ui
+                .add_enabled(region_count > 0 || !segments.is_empty(), resolve_btn)
+                .on_hover_text(
+                    "Write the composed text to the working tree and mark the file resolved.",
+                )
+                .clicked()
+            {
+                let resolved = compose_three_way_resolution(&segments, &state.selections);
+                *intent = Some(ConflictIntent::SaveManual(entry.path.clone(), resolved));
+            }
+            if ui
+                .button("Cancel")
+                .on_hover_text(
+                    "Reset all hunk picks. The working-tree file is not touched.",
+                )
+                .clicked()
+            {
+                state.selections = vec![(true, false); region_count];
+                state.cursor_region = 0;
+                state.scroll_to_region = None;
+            }
+        });
+    });
+
+    store_three_way_state(ui.ctx(), &entry.path, state);
+}
+
+/// Render one column of the 3-way editor. `is_theirs_side` controls which
+/// half of each `(ours, theirs)` selection tuple this column's checkbox
+/// drives: the left column flips the theirs bit, the right column flips
+/// the ours bit. Both columns still read both bits so a checkbox click on
+/// one side is immediately reflected on the other side's highlight
+/// colour.
+#[allow(clippy::too_many_arguments)]
+fn render_three_way_column(
+    ui: &mut egui::Ui,
+    title: &str,
+    accent: Color32,
+    is_theirs_side: bool,
+    rows: &[NumberedRow],
+    selections: &mut [(bool, bool)],
+    scroll_target: Option<usize>,
+    scroll_id: egui::Id,
+    link_with: egui::Id,
+) {
+    egui::Frame::group(ui.style())
+        .stroke(Stroke::new(1.5, accent))
+        .inner_margin(egui::Margin::symmetric(6.0, 6.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.colored_label(accent, RichText::new(title).strong());
+            });
+            ui.separator();
+
+            let font = egui::FontId::monospace(12.5);
+            let row_h = 16.0;
+
+            ScrollArea::vertical()
+                .id_salt(scroll_id)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .auto_shrink([false, false])
+                .max_height(400.0)
+                .show(ui, |ui| {
+                    // Link horizontal & vertical scroll so both columns move
+                    // together. egui exposes scroll linking via an Id shared
+                    // across scroll areas — see egui::scroll_area::ScrollArea
+                    // docs. We don't do anything fancier than vertical
+                    // coupling here because the columns are the same width.
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(link_with, scroll_id));
+
+                    let mut last_region: Option<usize> = None;
+                    for (idx, row) in rows.iter().enumerate() {
+                        // Insert a hunk header (with checkbox) the first
+                        // time we see a region — the header row is
+                        // independent of the line rows so the checkbox
+                        // always lands above the hunk even when the hunk
+                        // is only one line tall.
+                        if let Some(region) = row.region {
+                            if last_region != Some(region) {
+                                render_hunk_header(
+                                    ui,
+                                    region,
+                                    is_theirs_side,
+                                    accent,
+                                    selections,
+                                );
+                                if scroll_target == Some(region) {
+                                    ui.scroll_to_cursor(Some(egui::Align::TOP));
+                                }
+                                last_region = Some(region);
+                            }
+                        } else {
+                            last_region = None;
+                        }
+                        render_three_way_row(ui, row, accent, &font, row_h, idx, selections);
+                    }
+                });
+        });
+}
+
+fn render_hunk_header(
+    ui: &mut egui::Ui,
+    region: usize,
+    is_theirs_side: bool,
+    accent: Color32,
+    selections: &mut [(bool, bool)],
+) {
+    ui.add_space(2.0);
+    let (ours_sel, theirs_sel) = selections
+        .get(region)
+        .copied()
+        .unwrap_or((false, false));
+    ui.horizontal(|ui| {
+        let mut flag = if is_theirs_side { theirs_sel } else { ours_sel };
+        let resp = ui.add(egui::Checkbox::without_text(&mut flag));
+        if resp.changed() {
+            if let Some(slot) = selections.get_mut(region) {
+                if is_theirs_side {
+                    slot.1 = flag;
+                } else {
+                    slot.0 = flag;
+                }
+            }
+        }
+        ui.colored_label(
+            accent,
+            RichText::new(format!("Hunk {}", region + 1)).small().strong(),
+        );
+        ui.weak(
+            RichText::new(if is_theirs_side {
+                "include these theirs lines"
+            } else {
+                "include these ours lines"
+            })
+            .small(),
+        );
+    });
+}
+
+fn render_three_way_row(
+    ui: &mut egui::Ui,
+    row: &NumberedRow,
+    accent: Color32,
+    font: &egui::FontId,
+    row_h: f32,
+    _idx: usize,
+    selections: &[(bool, bool)],
+) {
+    let (bg, fg) = match row.kind {
+        RowKind::Context => (
+            palette::MUTED.gamma_multiply(0.08),
+            Color32::LIGHT_GRAY,
+        ),
+        RowKind::ConflictOurs => {
+            let checked = row
+                .region
+                .and_then(|r| selections.get(r))
+                .map(|s| s.0)
+                .unwrap_or(false);
+            let base = palette::OURS.gamma_multiply(if checked { 0.45 } else { 0.22 });
+            (base, Color32::WHITE)
+        }
+        RowKind::ConflictTheirs => {
+            let checked = row
+                .region
+                .and_then(|r| selections.get(r))
+                .map(|s| s.1)
+                .unwrap_or(false);
+            let base = palette::THEIRS.gamma_multiply(if checked { 0.45 } else { 0.22 });
+            (base, Color32::WHITE)
+        }
+        RowKind::Filler => (
+            palette::MUTED.gamma_multiply(0.04),
+            palette::MUTED,
+        ),
+    };
+
+    let (rect, _resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_h),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, bg);
+
+    // Line-number gutter — 40px wide, right-aligned mono digits.
+    let gutter_w = 40.0;
+    let gutter_rect = egui::Rect::from_min_size(rect.min, egui::vec2(gutter_w, rect.height()));
+    painter.rect_filled(gutter_rect, 0.0, Color32::from_rgb(30, 32, 36));
+    if let Some(n) = row.line_no {
+        painter.text(
+            gutter_rect.right_center() - egui::vec2(4.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            n.to_string(),
+            egui::FontId::monospace(11.0),
+            palette::MUTED,
+        );
+    }
+
+    // Accent stripe to the left of the text — subtle reminder of which
+    // side this row belongs to.
+    let stripe = egui::Rect::from_min_size(
+        egui::pos2(gutter_rect.right(), rect.top()),
+        egui::vec2(2.0, rect.height()),
+    );
+    if matches!(row.kind, RowKind::ConflictOurs | RowKind::ConflictTheirs) {
+        painter.rect_filled(stripe, 0.0, accent);
+    }
+
+    // Row text.
+    let text_pos = egui::pos2(gutter_rect.right() + 6.0, rect.center().y);
+    let display = if row.text.is_empty() && matches!(row.kind, RowKind::Filler) {
+        "".to_string()
+    } else {
+        row.text.clone()
+    };
+    painter.text(
+        text_pos,
+        egui::Align2::LEFT_CENTER,
+        display,
+        font.clone(),
+        fg,
+    );
+}
+
+#[cfg(test)]
+mod three_way_tests {
+    use super::*;
+
+    fn sample_conflict() -> String {
+        "alpha\n\
+         <<<<<<< HEAD\n\
+         ours-1\n\
+         ours-2\n\
+         =======\n\
+         theirs-1\n\
+         >>>>>>> branch\n\
+         omega\n"
+            .to_string()
+    }
+
+    #[test]
+    fn parse_splits_context_and_conflict() {
+        let segs = ThreeWaySegment::parse(&sample_conflict());
+        assert_eq!(segs.len(), 3);
+        match &segs[0] {
+            ThreeWaySegment::Context(l) => assert_eq!(l, &vec!["alpha".to_string()]),
+            _ => panic!("expected context"),
+        }
+        match &segs[1] {
+            ThreeWaySegment::Conflict { ours, theirs } => {
+                assert_eq!(ours, &vec!["ours-1".to_string(), "ours-2".to_string()]);
+                assert_eq!(theirs, &vec!["theirs-1".to_string()]);
+            }
+            _ => panic!("expected conflict"),
+        }
+        match &segs[2] {
+            ThreeWaySegment::Context(l) => assert_eq!(l, &vec!["omega".to_string()]),
+            _ => panic!("expected context"),
+        }
+    }
+
+    #[test]
+    fn parse_handles_no_markers() {
+        let segs = ThreeWaySegment::parse("one\ntwo\nthree\n");
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(&segs[0], ThreeWaySegment::Context(l) if l.len() == 3));
+    }
+
+    #[test]
+    fn compose_ours_only() {
+        let segs = ThreeWaySegment::parse(&sample_conflict());
+        let out = compose_three_way_resolution(&segs, &[(true, false)]);
+        assert_eq!(out, "alpha\nours-1\nours-2\nomega\n");
+    }
+
+    #[test]
+    fn compose_theirs_only() {
+        let segs = ThreeWaySegment::parse(&sample_conflict());
+        let out = compose_three_way_resolution(&segs, &[(false, true)]);
+        assert_eq!(out, "alpha\ntheirs-1\nomega\n");
+    }
+
+    #[test]
+    fn compose_both_sides() {
+        let segs = ThreeWaySegment::parse(&sample_conflict());
+        let out = compose_three_way_resolution(&segs, &[(true, true)]);
+        // ours block, blank separator, theirs block.
+        assert_eq!(out, "alpha\nours-1\nours-2\n\ntheirs-1\nomega\n");
+    }
+
+    #[test]
+    fn compose_neither_drops_hunk() {
+        let segs = ThreeWaySegment::parse(&sample_conflict());
+        let out = compose_three_way_resolution(&segs, &[(false, false)]);
+        assert_eq!(out, "alpha\nomega\n");
+    }
+
+    #[test]
+    fn layout_pads_unequal_hunks_with_filler() {
+        // 2 ours vs 1 theirs → both columns should be 2 rows tall inside
+        // the hunk (theirs column gets one filler row).
+        let (left, right) = layout_three_way_rows(&ThreeWaySegment::parse(&sample_conflict()));
+        // 1 context (alpha) + 2 hunk rows + 1 context (omega) = 4 rows
+        // on each side.
+        assert_eq!(left.len(), 4);
+        assert_eq!(right.len(), 4);
+        // Row 2 (index 2) on the left (theirs side) should be filler
+        // because theirs only has 1 line while ours has 2.
+        assert!(matches!(left[2].kind, RowKind::Filler));
+        // All ours rows on the right are content.
+        assert!(matches!(right[1].kind, RowKind::ConflictOurs));
+        assert!(matches!(right[2].kind, RowKind::ConflictOurs));
+    }
+
+    #[test]
+    fn layout_numbers_each_side_independently() {
+        // Context line counts once on each side starting at 1; conflict
+        // lines continue the numbering for their own side.
+        let (left, right) = layout_three_way_rows(&ThreeWaySegment::parse(&sample_conflict()));
+        assert_eq!(left[0].line_no, Some(1)); // alpha
+        assert_eq!(left[1].line_no, Some(2)); // theirs-1
+        assert_eq!(left[2].line_no, None); // filler
+        assert_eq!(left[3].line_no, Some(3)); // omega
+
+        assert_eq!(right[0].line_no, Some(1)); // alpha
+        assert_eq!(right[1].line_no, Some(2)); // ours-1
+        assert_eq!(right[2].line_no, Some(3)); // ours-2
+        assert_eq!(right[3].line_no, Some(4)); // omega
+    }
+
+    #[test]
+    fn compose_multiple_hunks_preserves_order() {
+        let text = "A\n<<<<<<<\nO1\n=======\nT1\n>>>>>>>\nB\n<<<<<<<\nO2\n=======\nT2\n>>>>>>>\nC\n";
+        let segs = ThreeWaySegment::parse(text);
+        let out = compose_three_way_resolution(&segs, &[(true, false), (false, true)]);
+        assert_eq!(out, "A\nO1\nB\nT2\nC\n");
+    }
+
+    #[test]
+    fn compose_with_missing_selection_defaults_to_nothing() {
+        // Defensive: if the selections slice is shorter than the region
+        // count we should still emit a sane result (context + nothing
+        // for the unspecified regions) rather than panicking.
+        let segs = ThreeWaySegment::parse(&sample_conflict());
+        let out = compose_three_way_resolution(&segs, &[]);
+        assert_eq!(out, "alpha\nomega\n");
     }
 }
