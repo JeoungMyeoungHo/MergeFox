@@ -52,6 +52,12 @@ pub enum CommitAction {
     MoveCommitUp(Oid),
     MoveCommitDown(Oid),
 
+    // --- split commit ---
+    /// Open the split-commit wizard against the given commit. The
+    /// dispatcher discovers hunks synchronously (cheap — one `git
+    /// show` call) and opens the modal with the resulting plan skeleton.
+    SplitCommit(Oid),
+
     // --- branch-tip ops ---
     Pull {
         branch: String,
@@ -142,6 +148,7 @@ impl CommitAction {
             Self::DropCommitPrompt(o) => format!("drop commit {}", short(o)),
             Self::MoveCommitUp(o) => format!("move {} up", short(o)),
             Self::MoveCommitDown(o) => format!("move {} down", short(o)),
+            Self::SplitCommit(o) => format!("split commit {}", short(o)),
             Self::Pull { branch } => format!("pull {branch}"),
             Self::Push { branch, force } => {
                 format!("{} {branch}", if *force { "force-push" } else { "push" })

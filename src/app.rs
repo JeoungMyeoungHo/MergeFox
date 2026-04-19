@@ -143,6 +143,16 @@ pub struct MergeFoxApp {
     /// backup tag), so queueing a second behind the first would be
     /// user-hostile.
     pub basket_squash_task: Option<BasketSquashTask>,
+
+    /// Split-commit wizard — `Some` = the modal is open, the user is
+    /// assigning hunks to new parts. Mirrors the
+    /// `basket_squash_confirm` / `basket_squash_task` pairing: the
+    /// modal is the editor; the task is the worker spawned on confirm.
+    pub split_commit_modal: Option<crate::ui::split_commit::SplitCommitModalState>,
+    /// Running split-commit worker. Only one at a time; starting a
+    /// second while one is running produces an info toast instead of
+    /// racing the first to completion.
+    pub split_commit_task: Option<SplitCommitTask>,
 }
 
 /// Worker-thread handle for an in-flight basket revert. Opaque to the
@@ -166,6 +176,19 @@ pub struct BasketSquashTask {
     pub repo_path: std::path::PathBuf,
     pub requested: usize,
     pub rx: std::sync::mpsc::Receiver<crate::git::SquashOutcome>,
+}
+
+/// Worker-thread handle for an in-flight split-commit operation.
+/// Same shape as `BasketSquashTask`: we always receive a
+/// `SplitOutcome` (the worker itself classifies failures into the
+/// `Aborted` variant); `Err` on the channel means the worker thread
+/// died, which `poll_split_commit` surfaces via a toast.
+pub struct SplitCommitTask {
+    pub repo_path: std::path::PathBuf,
+    /// Number of parts the user asked for — handy for toast copy
+    /// ("Split into 3 commits…") without having to rehydrate the plan.
+    pub part_count: usize,
+    pub rx: std::sync::mpsc::Receiver<anyhow::Result<crate::git::SplitOutcome>>,
 }
 
 #[derive(Default)]
@@ -1024,6 +1047,8 @@ impl MergeFoxApp {
             basket_revert_task: None,
             basket_squash_confirm: None,
             basket_squash_task: None,
+            split_commit_modal: None,
+            split_commit_task: None,
         }
     }
 
@@ -1699,6 +1724,201 @@ impl MergeFoxApp {
                     None => reason,
                 };
                 self.notify_err_with_detail("Basket squash aborted.", detail);
+            }
+        }
+    }
+
+    // ============================================================
+    // Split-commit wizard (see ui::split_commit + git::split_ops)
+    // ============================================================
+
+    /// Open the split-commit modal for `target_oid`. Discovers the
+    /// commit's hunks synchronously (one `git show`) and seeds the
+    /// modal with every hunk assigned to part 0 + two empty parts.
+    /// No-op if the modal is already open or a worker is running.
+    pub fn show_split_commit_modal(&mut self, target_oid: gix::ObjectId) {
+        if self.split_commit_task.is_some() {
+            self.notify_info("A split is already in progress — wait for it to finish.");
+            return;
+        }
+        if self.split_commit_modal.is_some() {
+            return;
+        }
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        let ws = tabs.current();
+        let repo_path = ws.repo.path().to_path_buf();
+
+        // Pull subject + short OID so the header matches what the
+        // user saw in the graph. Fall back to raw OID display if the
+        // graph isn't loaded.
+        let (short_oid, subject) = commit_header_for(ws, &target_oid);
+
+        let hunks = match crate::git::discover_hunks(&repo_path, target_oid) {
+            Ok(v) => v,
+            Err(e) => {
+                self.notify_err_with_detail(
+                    "Couldn't read target commit's hunks.",
+                    format!("{e:#}"),
+                );
+                return;
+            }
+        };
+        if hunks.is_empty() {
+            self.notify_err(
+                "This commit has no splittable hunks (binary-only or empty diff).",
+            );
+            return;
+        }
+
+        self.split_commit_modal = Some(
+            crate::ui::split_commit::SplitCommitModalState::new(
+                target_oid,
+                short_oid,
+                subject,
+                hunks,
+            ),
+        );
+    }
+
+    /// Render (and dispatch) the split-commit modal. Cheap no-op when
+    /// closed.
+    pub fn handle_split_commit_modal(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.split_commit_modal.as_mut() else {
+            return;
+        };
+        let outcome = crate::ui::split_commit::show(ctx, state);
+        match outcome {
+            None => {}
+            Some(crate::ui::split_commit::SplitCommitModalOutcome::Cancelled) => {
+                self.split_commit_modal = None;
+            }
+            Some(crate::ui::split_commit::SplitCommitModalOutcome::Confirmed(plan)) => {
+                self.split_commit_modal = None;
+                self.start_split_commit(plan);
+            }
+        }
+    }
+
+    /// Spawn the split-commit worker on a background thread. The UI
+    /// stays responsive while cherry-picks / commits run — can take a
+    /// few seconds on deep branches because the "replay descendants"
+    /// step is O(descendants).
+    pub fn start_split_commit(&mut self, plan: crate::git::SplitPlan) {
+        if self.split_commit_task.is_some() {
+            self.notify_info("A split is already in progress — wait for it to finish.");
+            return;
+        }
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        let ws = tabs.current();
+        let repo_path = ws.repo.path().to_path_buf();
+        let part_count = plan.parts.len();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx_clone = self.egui_ctx.clone();
+        let repo_thread = repo_path.clone();
+        std::thread::spawn(move || {
+            let outcome = crate::git::split_commit(&repo_thread, plan);
+            let _ = tx.send(outcome);
+            ctx_clone.request_repaint();
+        });
+
+        self.split_commit_task = Some(SplitCommitTask {
+            repo_path,
+            part_count,
+            rx,
+        });
+        self.notify_info(format!(
+            "Splitting commit into {part_count} parts — creating backup tag and rebuilding…"
+        ));
+    }
+
+    /// Drain the split-commit channel once per frame. Dispatches
+    /// toasts and rebuilds the graph on completion.
+    pub fn poll_split_commit(&mut self) {
+        let Some(task) = self.split_commit_task.as_ref() else {
+            return;
+        };
+        let result = match task.rx.try_recv() {
+            Ok(res) => res,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.split_commit_task = None;
+                self.notify_err(
+                    "Split-commit worker died before reporting — check git state manually.",
+                );
+                return;
+            }
+        };
+
+        let repo_path = task.repo_path.clone();
+        let part_count = task.part_count;
+        self.split_commit_task = None;
+
+        let is_active_tab = matches!(
+            &self.view,
+            View::Workspace(tabs) if !tabs.launcher_active
+                && tabs.current().repo.path() == repo_path
+        );
+
+        match result {
+            Ok(crate::git::SplitOutcome::Success {
+                new_head_oid,
+                new_commit_oids,
+                backup_tag,
+            }) => {
+                if let Some(ws) = self.workspace_by_path_mut(&repo_path) {
+                    // Jump the selection to the newest of the new
+                    // commits so the user sees their result highlighted
+                    // in the graph immediately.
+                    ws.selected_commit = Some(new_head_oid);
+                    ws.selected_file_idx = None;
+                }
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                let created = new_commit_oids.len();
+                self.notify_ok_with_detail(
+                    format!("Split into {created} commits."),
+                    format!(
+                        "New tip: {new_head_oid}. Backup tag: {backup_tag}. \
+                         Restore with `git reset --hard {backup_tag}` if you want the old history back."
+                    ),
+                );
+            }
+            Ok(crate::git::SplitOutcome::Aborted {
+                reason,
+                backup_tag_created,
+            }) => {
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                let detail = match backup_tag_created {
+                    Some(tag) => format!("{reason} (backup tag preserved: {tag})"),
+                    None => reason,
+                };
+                self.notify_err_with_detail(
+                    format!("Split ({part_count} parts) aborted."),
+                    detail,
+                );
+            }
+            Err(e) => {
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                self.notify_err_with_detail(
+                    "Split-commit failed.",
+                    format!("{e:#}"),
+                );
             }
         }
     }
@@ -5166,6 +5386,22 @@ fn render_opening_repo(ctx: &egui::Context, app: &mut MergeFoxApp) {
     ctx.request_repaint_after(std::time::Duration::from_millis(200));
 }
 
+/// Look up a human-friendly "short-oid + subject" pair for a commit
+/// in the active workspace. Falls back to a raw OID + empty subject
+/// if the graph cache doesn't have the row (rare; only happens when
+/// the graph is mid-rebuild). Used by the split-commit modal header
+/// so the user sees what they saw in the graph pane.
+fn commit_header_for(ws: &WorkspaceState, oid: &gix::ObjectId) -> (String, String) {
+    let short = short_sha(oid);
+    let subject = ws
+        .graph_view
+        .as_ref()
+        .and_then(|gv| gv.graph.rows.iter().find(|r| r.oid == *oid))
+        .map(|r| r.summary.to_string())
+        .unwrap_or_default();
+    (short, subject)
+}
+
 fn short_sha(oid: &gix::ObjectId) -> String {
     let s = oid.to_string();
     s[..7.min(s.len())].to_string()
@@ -5443,6 +5679,8 @@ impl eframe::App for MergeFoxApp {
         self.poll_combined_diff();
         self.handle_basket_focus_modal(ctx);
         self.handle_basket_squash_confirm_modal(ctx);
+        self.handle_split_commit_modal(ctx);
+        self.poll_split_commit();
 
         if self.clone_in_progress() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -5454,6 +5692,9 @@ impl eframe::App for MergeFoxApp {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.basket_squash_task.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        if self.split_commit_task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.provider_oauth_start_task.is_some() || self.provider_oauth_poll_task.is_some() {
