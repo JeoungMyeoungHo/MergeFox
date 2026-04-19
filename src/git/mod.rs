@@ -11,6 +11,7 @@ pub mod jobs;
 pub mod lfs;
 pub mod message_lint;
 pub mod ops;
+pub mod reflog_rewind;
 pub mod repo;
 pub mod split_ops;
 
@@ -26,6 +27,10 @@ pub use message_lint::{
     auto_fix as lint_auto_fix, lint as lint_message, load_rules as load_message_lint_rules,
     rules_file_path as message_lint_rules_path, Finding as LintFinding, RulesFile as LintRulesFile,
     Scope as LintScope, Severity as LintSeverity,
+};
+pub use reflog_rewind::{
+    pick_quick_jumps, preview_rewind, rewind_to, LostCommitSummary, QuickJumpTarget,
+    RewindOutcome, RewindPreview,
 };
 pub use reword_ops::{reword_commit, RewordOutcome};
 pub use split_ops::{
