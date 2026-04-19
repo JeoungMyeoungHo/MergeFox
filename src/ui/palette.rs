@@ -56,6 +56,11 @@ pub enum PaletteAction {
     /// Force an immediate CI/check-run refresh for the first N
     /// visible commits, bypassing the 2-minute heartbeat throttle.
     RefreshCiStatus,
+    /// Open the split-commit wizard for the commit currently
+    /// highlighted in the graph. No-op with a notification if
+    /// nothing is selected — the palette doesn't have enough
+    /// context to guess.
+    OpenSplitCommitForSelected,
 }
 
 #[derive(Debug, Clone)]
@@ -312,6 +317,11 @@ fn collect(app: &MergeFoxApp) -> Vec<PaletteCommand> {
             hint: None,
             action: PaletteAction::ExportJournal,
         });
+        out.push(PaletteCommand {
+            label: "Split selected commit…".into(),
+            hint: Some("break into N commits".into()),
+            action: PaletteAction::OpenSplitCommitForSelected,
+        });
 
         // Tags: one row per local tag + one "push all" shortcut. We
         // pull the tag list directly from the repo because the graph
@@ -500,6 +510,23 @@ fn execute(app: &mut MergeFoxApp, action: PaletteAction) {
         }
         PaletteAction::RefreshCiStatus => {
             app.refresh_ci_status(false);
+        }
+        PaletteAction::OpenSplitCommitForSelected => {
+            let oid = if let View::Workspace(tabs) = &app.view {
+                if tabs.launcher_active {
+                    None
+                } else {
+                    tabs.current().selected_commit
+                }
+            } else {
+                None
+            };
+            match oid {
+                Some(oid) => app.show_split_commit_modal(oid),
+                None => app.notify_info(
+                    "No commit selected — click a commit in the graph first.",
+                ),
+            }
         }
     }
 }

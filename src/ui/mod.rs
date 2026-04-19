@@ -28,6 +28,9 @@ pub mod reword;
 pub mod settings;
 pub mod shortcuts;
 pub mod sidebar;
+/// Split-commit wizard — picks a commit and breaks it into N smaller
+/// commits, each carrying a subset of the original's hunks.
+pub mod split_commit;
 pub mod syntax;
 pub mod tabs;
 pub mod theme;
