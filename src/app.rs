@@ -151,15 +151,13 @@ pub struct MergeFoxApp {
     pub ci_status_cache: std::collections::HashMap<gix::ObjectId, providers::CheckSummary>,
     pub ci_status_refresh_task: Option<CiStatusRefreshTask>,
     pub ci_status_last_refresh: Option<Instant>,
-    /// Split-commit wizard — `Some` = the modal is open, the user is
-    /// assigning hunks to new parts. Mirrors the
-    /// `basket_squash_confirm` / `basket_squash_task` pairing: the
-    /// modal is the editor; the task is the worker spawned on confirm.
     pub split_commit_modal: Option<crate::ui::split_commit::SplitCommitModalState>,
-    /// Running split-commit worker. Only one at a time; starting a
-    /// second while one is running produces an info toast instead of
-    /// racing the first to completion.
     pub split_commit_task: Option<SplitCommitTask>,
+    /// Confirmation modal for the destructive "Reset to here" button
+    /// in the reflog recovery window.
+    pub reflog_rewind_confirm: Option<ReflogRewindConfirm>,
+    /// In-flight `git reset --hard` from the reflog rewind.
+    pub reflog_rewind_task: Option<ReflogRewindTask>,
 }
 
 /// Worker-thread handle for an in-flight basket revert. Opaque to the
@@ -226,16 +224,31 @@ pub struct CiStatusRefreshTask {
 }
 
 /// Worker-thread handle for an in-flight split-commit operation.
-/// Same shape as `BasketSquashTask`: we always receive a
-/// `SplitOutcome` (the worker itself classifies failures into the
-/// `Aborted` variant); `Err` on the channel means the worker thread
-/// died, which `poll_split_commit` surfaces via a toast.
 pub struct SplitCommitTask {
     pub repo_path: std::path::PathBuf,
-    /// Number of parts the user asked for — handy for toast copy
-    /// ("Split into 3 commits…") without having to rehydrate the plan.
     pub part_count: usize,
     pub rx: std::sync::mpsc::Receiver<anyhow::Result<crate::git::SplitOutcome>>,
+}
+
+/// Persistent state for the reflog-rewind confirmation modal. `understood`
+/// is a single checkbox guarding the destructive "Reset to here" action —
+/// chosen over a double-click confirm because the checkbox is visible from
+/// the first frame so the safety guard is discoverable, and click-drag
+/// habits don't accidentally arm the button.
+pub struct ReflogRewindConfirm {
+    pub repo_path: std::path::PathBuf,
+    pub target_oid: gix::ObjectId,
+    pub preview: crate::git::RewindPreview,
+    pub understood: bool,
+    /// Optional reflog message shown alongside the target oid.
+    pub message: Option<String>,
+}
+
+/// Worker-thread handle for an in-flight reflog rewind.
+pub struct ReflogRewindTask {
+    pub repo_path: std::path::PathBuf,
+    pub target_oid: gix::ObjectId,
+    pub rx: std::sync::mpsc::Receiver<std::result::Result<crate::git::RewindOutcome, String>>,
 }
 
 #[derive(Default)]
@@ -1132,6 +1145,8 @@ impl MergeFoxApp {
             ci_status_last_refresh: None,
             split_commit_modal: None,
             split_commit_task: None,
+            reflog_rewind_confirm: None,
+            reflog_rewind_task: None,
         }
     }
 
@@ -2236,10 +2251,7 @@ impl MergeFoxApp {
     // Split-commit wizard (see ui::split_commit + git::split_ops)
     // ============================================================
 
-    /// Open the split-commit modal for `target_oid`. Discovers the
-    /// commit's hunks synchronously (one `git show`) and seeds the
-    /// modal with every hunk assigned to part 0 + two empty parts.
-    /// No-op if the modal is already open or a worker is running.
+    /// Open the split-commit modal for `target_oid`.
     pub fn show_split_commit_modal(&mut self, target_oid: gix::ObjectId) {
         if self.split_commit_task.is_some() {
             self.notify_info("A split is already in progress — wait for it to finish.");
@@ -2257,9 +2269,6 @@ impl MergeFoxApp {
         let ws = tabs.current();
         let repo_path = ws.repo.path().to_path_buf();
 
-        // Pull subject + short OID so the header matches what the
-        // user saw in the graph. Fall back to raw OID display if the
-        // graph isn't loaded.
         let (short_oid, subject) = commit_header_for(ws, &target_oid);
 
         let hunks = match crate::git::discover_hunks(&repo_path, target_oid) {
@@ -2308,10 +2317,6 @@ impl MergeFoxApp {
         }
     }
 
-    /// Spawn the split-commit worker on a background thread. The UI
-    /// stays responsive while cherry-picks / commits run — can take a
-    /// few seconds on deep branches because the "replay descendants"
-    /// step is O(descendants).
     pub fn start_split_commit(&mut self, plan: crate::git::SplitPlan) {
         if self.split_commit_task.is_some() {
             self.notify_info("A split is already in progress — wait for it to finish.");
@@ -2346,8 +2351,6 @@ impl MergeFoxApp {
         ));
     }
 
-    /// Drain the split-commit channel once per frame. Dispatches
-    /// toasts and rebuilds the graph on completion.
     pub fn poll_split_commit(&mut self) {
         let Some(task) = self.split_commit_task.as_ref() else {
             return;
@@ -2381,9 +2384,6 @@ impl MergeFoxApp {
                 backup_tag,
             }) => {
                 if let Some(ws) = self.workspace_by_path_mut(&repo_path) {
-                    // Jump the selection to the newest of the new
-                    // commits so the user sees their result highlighted
-                    // in the graph immediately.
                     ws.selected_commit = Some(new_head_oid);
                     ws.selected_file_idx = None;
                 }
@@ -2423,6 +2423,150 @@ impl MergeFoxApp {
                     "Split-commit failed.",
                     format!("{e:#}"),
                 );
+            }
+        }
+    }
+
+    // ============================================================
+    // Reflog rewind (see ui::reflog + git::reflog_rewind)
+    // ============================================================
+
+    /// Open the "Reset to here" confirmation modal for `target_oid`.
+    pub fn show_reflog_rewind_confirm(
+        &mut self,
+        target_oid: gix::ObjectId,
+        message: Option<String>,
+    ) {
+        if self.reflog_rewind_task.is_some() {
+            self.notify_info("A reflog rewind is already in progress — wait for it to finish.");
+            return;
+        }
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        let repo_path = tabs.current().repo.path().to_path_buf();
+        match crate::git::preview_rewind(&repo_path, target_oid) {
+            Ok(preview) => {
+                self.reflog_rewind_confirm = Some(ReflogRewindConfirm {
+                    repo_path,
+                    target_oid,
+                    preview,
+                    understood: false,
+                    message,
+                });
+            }
+            Err(err) => {
+                self.notify_err_with_detail(
+                    "Couldn't compute rewind preview.",
+                    format!("{err:#}"),
+                );
+            }
+        }
+    }
+
+    pub fn start_reflog_rewind(&mut self) {
+        if self.reflog_rewind_task.is_some() {
+            return;
+        }
+        let Some(confirm) = self.reflog_rewind_confirm.take() else {
+            return;
+        };
+        let repo_path = confirm.repo_path.clone();
+        let target_oid = confirm.target_oid;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx_clone = self.egui_ctx.clone();
+        let repo_thread = repo_path.clone();
+        std::thread::spawn(move || {
+            let outcome = crate::git::rewind_to(&repo_thread, target_oid)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(outcome);
+            ctx_clone.request_repaint();
+        });
+
+        self.reflog_rewind_task = Some(ReflogRewindTask {
+            repo_path,
+            target_oid,
+            rx,
+        });
+        self.notify_info("Resetting HEAD — creating backup tag and resetting working tree…");
+    }
+
+    pub fn poll_reflog_rewind_task(&mut self) {
+        let Some(task) = self.reflog_rewind_task.as_ref() else {
+            return;
+        };
+        let outcome = match task.rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.reflog_rewind_task = None;
+                self.notify_err(
+                    "Reflog rewind worker died before reporting — check git state manually.",
+                );
+                return;
+            }
+        };
+
+        let repo_path = task.repo_path.clone();
+        self.reflog_rewind_task = None;
+
+        let is_active_tab = matches!(
+            &self.view,
+            View::Workspace(tabs) if !tabs.launcher_active
+                && tabs.current().repo.path() == repo_path
+        );
+
+        match outcome {
+            Ok(crate::git::RewindOutcome::Success {
+                new_head,
+                backup_tag,
+                auto_stashed,
+            }) => {
+                if let Some(ws) = self.workspace_by_path_mut(&repo_path) {
+                    ws.selected_commit = None;
+                    ws.current_diff = None;
+                    ws.selected_file_idx = None;
+                }
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                self.reflog_open = false;
+
+                let short = {
+                    let s = new_head.to_string();
+                    s[..7.min(s.len())].to_string()
+                };
+                let mut detail = format!(
+                    "Backup tag {backup_tag} points at the pre-reset HEAD. \
+                     Use `git reset --hard {backup_tag}` to undo."
+                );
+                if auto_stashed {
+                    detail.push_str(" Auto-stash was restored on top of the new HEAD.");
+                }
+                self.notify_ok_with_detail(format!("Reset to {short}"), detail);
+            }
+            Ok(crate::git::RewindOutcome::Aborted {
+                reason,
+                backup_tag_created,
+            }) => {
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                let detail = match backup_tag_created {
+                    Some(tag) => format!("{reason} (backup tag preserved: {tag})"),
+                    None => reason,
+                };
+                self.notify_err_with_detail("Reset aborted.", detail);
+            }
+            Err(detail) => {
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                self.notify_err_with_detail("Reset failed to start.", detail);
             }
         }
     }
@@ -6523,6 +6667,7 @@ impl eframe::App for MergeFoxApp {
         self.poll_basket_squash();
         self.poll_ci_status_task();
         self.tick_ci_status_heartbeat();
+        self.poll_reflog_rewind_task();
         self.drain_image_evictions(ctx);
         // Drain the async preview-decoder pool into its shared cache.
         // Cheap no-op when idle (bounded `try_recv` loop). Done before
@@ -6600,6 +6745,9 @@ impl eframe::App for MergeFoxApp {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.split_commit_task.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        if self.reflog_rewind_task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.provider_oauth_start_task.is_some() || self.provider_oauth_poll_task.is_some() {
