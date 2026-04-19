@@ -6,10 +6,15 @@ pub mod graph;
 pub mod jobs;
 pub mod lfs;
 pub mod ops;
+pub mod reflog_rewind;
 pub mod repo;
 
 pub use basket_ops::{
     revert_to_working_tree, squash_basket_into_one, RevertOutcome, SquashOutcome,
+};
+pub use reflog_rewind::{
+    pick_quick_jumps, preview_rewind, rewind_to, LostCommitSummary, QuickJumpTarget,
+    RewindOutcome, RewindPreview,
 };
 pub use blame::{blame_file, BlameCommit, BlameLine, BlameResult};
 pub use cli::{
