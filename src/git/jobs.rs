@@ -339,7 +339,7 @@ fn build_cmd_with_creds(
         //    `credential.helper=osxkeychain` baked into the system
         //    gitconfig (Xcode CLT). Without clearing, osxkeychain runs
         //    first and may return a DIFFERENT account's token (e.g.
-        //    one stored by GitKraken or `gh auth`), causing pushes to
+        //    one stored by another GUI client or `gh auth`), causing pushes to
         //    authenticate as the wrong user.
         //
         // 2. ADD our inline helper as the sole credential source.

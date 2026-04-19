@@ -1,6 +1,6 @@
 //! Interactive-rebase planning modal.
 //!
-//! Visual model (Tower-inspired, see user screenshot):
+//! Visual model:
 //!   ┌─ Rebase: <branch>              On:  <base sha> <base subject>──┐
 //!   │ ● Pick ▾ ↕  subject              …  author   sha   date        │
 //!   │ ● Reword ▾ ↕  subject            …  author   sha   date        │
@@ -332,8 +332,8 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     }
 
     if confirm_no_backup.0 {
-        // Tower/Fork use an inline secondary dialog for this; we use a
-        // small modal Window centered above the main one.
+        // Other GUI clients use an inline secondary dialog for this;
+        // we use a small modal Window centered above the main one.
         let mut confirm_open = true;
         egui::Window::new("Rewrite history without a backup?")
             .collapsible(false)

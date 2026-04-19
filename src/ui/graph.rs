@@ -221,9 +221,8 @@ impl GraphView {
     /// `prefs` controls column visibility + widths; drag handles mutate
     /// it in place.
     ///
-    /// Column order is Sourcetree-style: the graph is anchored to the
-    /// far left so it stays put regardless of how wide the refs column
-    /// grows. The commit-message column absorbs any flex; everything
+    /// Column order: the graph is anchored to the far left so it stays
+    /// put regardless of how wide the refs column grows. The commit-message column absorbs any flex; everything
     /// else has an explicit (user-draggable) width.
     ///
     ///   `[ graph | refs | message (flex) | author | date | sha ]`
@@ -945,9 +944,9 @@ fn paint_graph_cell(
     // Merge commits (>1 parent, hence >1 outgoing edge) render as a
     // hollow ring so they're visually distinct from linear commits.
     // Convention we match: a solid dot "is" a commit; a ring "joins"
-    // multiple lines of history. This is the same idiom used by
-    // GitKraken, Sourcetree, and `gitk --topo-order` when it shades
-    // merge nodes differently.
+    // multiple lines of history. This is the same idiom used across
+    // common graph-based git viewers (including `gitk --topo-order`,
+    // which shades merge nodes differently).
     let dot_pos = Pos2::new(lane_x(row.lane), mid_y);
     let base_color = lane_color(row.lane);
     let is_merge = row.edges_out.len() > 1;

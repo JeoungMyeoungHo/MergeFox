@@ -128,9 +128,9 @@ fn apply_impl(ctx: &Context, settings: &ThemeSettings) {
     // minimum hit-target matched macOS system dialog feel, but on a
     // git client with 6+ toolbar buttons + top-bar + tab strip + side
     // panel controls it ate the horizontal space so the main view wrapped
-    // every line. Tightened to something closer to Fork / GitKraken /
-    // JetBrains density while still meeting Apple's 24-px minimum hit
-    // target on y-axis.
+    // every line. Tightened to something closer to an IDE-density
+    // baseline while still meeting Apple's 24-px minimum hit target
+    // on the y-axis.
     style.spacing.button_padding = egui::vec2(7.0, 4.0);
     style.spacing.interact_size = egui::vec2(28.0, 24.0);
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
