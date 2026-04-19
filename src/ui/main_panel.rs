@@ -841,6 +841,12 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
             return out;
         }
 
+        // ---- split commit ----
+        CommitAction::SplitCommit(oid) => {
+            app.show_split_commit_modal(oid);
+            return out;
+        }
+
         // ---- not yet implemented ----
         CommitAction::DropCommitPrompt(oid)
         | CommitAction::MoveCommitUp(oid)

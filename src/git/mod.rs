@@ -10,6 +10,7 @@ pub mod lfs;
 pub mod message_lint;
 pub mod ops;
 pub mod repo;
+pub mod split_ops;
 
 pub use basket_ops::{
     revert_to_working_tree, squash_basket_into_one, RevertOutcome, SquashOutcome,
@@ -25,6 +26,9 @@ pub use message_lint::{
     Scope as LintScope, Severity as LintSeverity,
 };
 pub use reword_ops::{reword_commit, RewordOutcome};
+pub use split_ops::{
+    discover_hunks, split_commit, DiscoveredHunk, HunkRef, SplitOutcome, SplitPart, SplitPlan,
+};
 pub use blame::{blame_file, BlameCommit, BlameLine, BlameResult};
 pub use cli::{
     classify_git_error, probe_git_capability, recent_git_log, GitCapability, GitErrorKind,

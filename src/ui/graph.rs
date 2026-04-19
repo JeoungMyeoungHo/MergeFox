@@ -749,6 +749,11 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
         ui.close_menu();
     }
 
+    if ui.button("Split commit…").clicked() {
+        action = Some(CommitAction::SplitCommit(row.oid));
+        ui.close_menu();
+    }
+
     // ---- Edit message (available for any reachable commit) ----
     //
     // HEAD path uses `commit --amend`; non-HEAD path uses the
