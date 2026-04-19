@@ -114,6 +114,17 @@ pub struct PreviewManager {
     job_tx: Sender<PreviewJob>,
     result_rx: Mutex<Receiver<PreviewResult>>,
     cache: Mutex<HashMap<PreviewKey, PreviewState>>,
+    /// Decoded RGBA → `egui::TextureHandle` cache. Creating a texture is
+    /// cheap (microseconds) but *not* free — doing it every frame for a
+    /// visible row noticeably shows up in frame profiles. We keep one
+    /// handle per `PreviewKey` so the same oid+mode resolves to the same
+    /// GPU texture across frames until the underlying `PreviewState`
+    /// changes (which it only does on first-decode completion).
+    ///
+    /// Parked behind a `Mutex` because the UI calls from the main thread
+    /// only, but the `Arc<PreviewManager>` is `Sync` so we need interior
+    /// mutability. No contention in practice.
+    textures: Mutex<HashMap<PreviewKey, egui::TextureHandle>>,
 }
 
 struct PreviewJob {
@@ -154,7 +165,52 @@ impl PreviewManager {
             job_tx,
             result_rx: Mutex::new(result_rx),
             cache: Mutex::new(HashMap::new()),
+            textures: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Non-mutating lookup. Returns the cached state if we've seen this
+    /// key before, else `None` without queuing a decode. UI rows call
+    /// this first so they can avoid the `Arc<[u8]>` clone / blob read on
+    /// the hot path when the thumbnail is already materialized.
+    pub fn peek(&self, key: &PreviewKey) -> Option<PreviewState> {
+        self.cache.lock().ok().and_then(|c| c.get(key).cloned())
+    }
+
+    /// Peek at or create a `TextureHandle` for a `PreviewState::Ready`
+    /// payload. Returns `None` for any other state (including missing
+    /// entries) so the caller can render a placeholder.
+    ///
+    /// `name_hint` is the texture label egui logs in debug dumps —
+    /// useful when staring at a profiler trace that mentions textures
+    /// by name. Not load-bearing for correctness.
+    ///
+    /// We intentionally keep one handle per `PreviewKey`; the inline
+    /// thumbnail and the full-resolution pane have distinct keys so they
+    /// each get their own GPU texture and reuse them across frames.
+    pub fn texture_for(
+        &self,
+        ctx: &egui::Context,
+        key: &PreviewKey,
+        name_hint: &str,
+    ) -> Option<egui::TextureHandle> {
+        // Fast path: already promoted.
+        if let Some(tex) = self.textures.lock().ok().and_then(|m| m.get(key).cloned()) {
+            return Some(tex);
+        }
+        let state = self.peek(key)?;
+        let PreviewState::Ready(img) = state else {
+            return None;
+        };
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [img.width as usize, img.height as usize],
+            &img.rgba,
+        );
+        let tex = ctx.load_texture(name_hint, color, egui::TextureOptions::LINEAR);
+        if let Ok(mut m) = self.textures.lock() {
+            m.entry(key.clone()).or_insert_with(|| tex.clone());
+        }
+        Some(tex)
     }
 
     /// Lookup or request a preview. On a miss, queues a decode job
@@ -226,15 +282,31 @@ impl PreviewManager {
     }
 
     /// Drain completed decodes into the cache. Called once per UI
-    /// frame — cheap no-op when idle.
-    pub fn pump(&self) {
-        let Ok(rx) = self.result_rx.lock() else { return };
-        let Ok(mut cache) = self.cache.lock() else {
-            return;
+    /// frame — cheap no-op when idle. Returns `true` if any results
+    /// landed this frame; the caller can forward that to
+    /// `ctx.request_repaint()` so the just-arrived thumbnail appears
+    /// without waiting on the next input event.
+    pub fn pump(&self) -> bool {
+        let Ok(rx) = self.result_rx.lock() else {
+            return false;
         };
+        let Ok(mut cache) = self.cache.lock() else {
+            return false;
+        };
+        let mut got_any = false;
         while let Ok(result) = rx.try_recv() {
+            // If this key had a stale texture from a prior state, drop
+            // it so the next `texture_for` call re-promotes from the
+            // freshly-decoded RGBA. In practice we only ever transition
+            // Pending → Ready / Failed / etc., so this is defence in
+            // depth rather than a path we exercise often.
+            if let Ok(mut texs) = self.textures.lock() {
+                texs.remove(&result.key);
+            }
             cache.insert(result.key, result.state);
+            got_any = true;
         }
+        got_any
     }
 }
 
@@ -614,6 +686,10 @@ impl FormatKind {
         }
     }
 
+    fn has_inprocess_decoder(self) -> bool {
+        matches!(self, FormatKind::Image | FormatKind::Psd)
+    }
+
     fn placeholder_label(self) -> &'static str {
         match self {
             FormatKind::OpaqueAsset(l) => l,
@@ -622,6 +698,16 @@ impl FormatKind {
             FormatKind::Image => "image",
         }
     }
+}
+
+/// Does this extension point at a format we'll attempt to render
+/// in-process (i.e. not a `qlmanage`-only opaque asset and not a plain
+/// binary / text)? The file-list UI uses this to decide whether to
+/// reserve a thumbnail slot for a row — we skip the reservation for
+/// `.rs`/`.txt`/`.fbx` so row layout doesn't stutter under formats we
+/// can't actually decode synchronously in the worker pool.
+pub fn is_previewable_ext(ext: &str) -> bool {
+    FormatKind::from_ext(&ext.to_ascii_lowercase()).has_inprocess_decoder()
 }
 
 fn decode(kind: FormatKind, bytes: &[u8], mode: PreviewMode) -> Result<Option<DecodedImage>> {
@@ -777,6 +863,27 @@ mod tests {
         assert_eq!(img.width, 4);
         assert_eq!(img.height, 3);
         assert_eq!(img.rgba.len(), 4 * 3 * 4);
+    }
+
+    #[test]
+    fn is_previewable_covers_images_and_psd_only() {
+        // Any image format the `image` crate handles natively is previewable.
+        for ext in ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "exr", "qoi"] {
+            assert!(is_previewable_ext(ext), "{ext} should be previewable");
+        }
+        // PSD has an embedded-jpeg decoder so it's previewable.
+        assert!(is_previewable_ext("psd"));
+        // Upper-case is accepted — UI passes raw OS extensions.
+        assert!(is_previewable_ext("PNG"));
+        // Opaque assets (3D, video, audio) are NOT in-process previewable:
+        // they route through platform thumbnailer elsewhere, so file-list
+        // rows shouldn't reserve a thumbnail slot for them.
+        for ext in ["fbx", "blend", "mp4", "mov", "wav"] {
+            assert!(!is_previewable_ext(ext), "{ext} should NOT be previewable in-process");
+        }
+        // Plain code / unknown files are skipped.
+        assert!(!is_previewable_ext("rs"));
+        assert!(!is_previewable_ext(""));
     }
 
     #[test]

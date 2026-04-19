@@ -5165,6 +5165,16 @@ impl eframe::App for MergeFoxApp {
         self.poll_graph_tasks();
         self.poll_basket_revert();
         self.drain_image_evictions(ctx);
+        // Drain the async preview-decoder pool into its shared cache.
+        // Cheap no-op when idle (bounded `try_recv` loop). Done before
+        // any UI pass so thumbnails requested on the previous frame are
+        // visible this frame without an extra repaint round-trip. When
+        // decodes land we schedule a short follow-up repaint: egui sits
+        // idle between input events, so without this the freshly-decoded
+        // thumbnail wouldn't appear until the user moved the mouse.
+        if crate::ui::file_preview::PreviewManager::global().pump() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         self.poll_working_tree_changes();
 
         match &mut self.view {
