@@ -48,6 +48,13 @@ pub enum CommitAction {
 
     // --- HEAD/amend ops ---
     AmendMessagePrompt,
+    /// Reword the message of any reachable commit (not just HEAD).
+    /// Opens a modal; on confirm the worker thread runs
+    /// `git::reword_commit`, which auto-stashes, creates a backup tag,
+    /// rewrites the target commit's message, and rebases the
+    /// descendants on top. Valid for any commit reachable from the
+    /// current branch.
+    RewordPrompt(Oid),
     DropCommitPrompt(Oid),
     MoveCommitUp(Oid),
     MoveCommitDown(Oid),
@@ -139,6 +146,7 @@ impl CommitAction {
                 format!("reset {branch} [{mode:?}] → {}", short(target))
             }
             Self::AmendMessagePrompt => "amend commit message".to_string(),
+            Self::RewordPrompt(o) => format!("reword commit {}", short(o)),
             Self::DropCommitPrompt(o) => format!("drop commit {}", short(o)),
             Self::MoveCommitUp(o) => format!("move {} up", short(o)),
             Self::MoveCommitDown(o) => format!("move {} down", short(o)),

@@ -22,6 +22,7 @@ pub mod prompt;
 pub mod publish_remote;
 pub mod rebase;
 pub mod reflog;
+pub mod reword;
 pub mod settings;
 pub mod shortcuts;
 pub mod sidebar;

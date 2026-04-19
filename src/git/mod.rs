@@ -1,5 +1,6 @@
 pub mod basket_ops;
 pub mod blame;
+pub mod reword_ops;
 pub mod cli;
 pub mod diff;
 pub mod graph;
@@ -11,6 +12,7 @@ pub mod repo;
 pub use basket_ops::{
     revert_to_working_tree, squash_basket_into_one, RevertOutcome, SquashOutcome,
 };
+pub use reword_ops::{reword_commit, RewordOutcome};
 pub use blame::{blame_file, BlameCommit, BlameLine, BlameResult};
 pub use cli::{
     classify_git_error, probe_git_capability, recent_git_log, GitCapability, GitErrorKind,

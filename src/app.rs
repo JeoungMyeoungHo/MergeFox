@@ -143,6 +143,15 @@ pub struct MergeFoxApp {
     /// backup tag), so queueing a second behind the first would be
     /// user-hostile.
     pub basket_squash_task: Option<BasketSquashTask>,
+    /// "Edit commit message" modal state (opened from the graph's
+    /// right-click menu on any reachable commit). Owns an editable
+    /// message buffer; the actual reword runs on a worker when
+    /// confirmed.
+    pub reword_modal: Option<crate::ui::reword::RewordModalState>,
+    /// In-flight reword worker. At most one at a time — the operation
+    /// is a history rewrite and queueing a second would create a
+    /// race on the branch ref.
+    pub reword_task: Option<RewordTask>,
 }
 
 /// Worker-thread handle for an in-flight basket revert. Opaque to the
@@ -152,6 +161,15 @@ pub struct BasketRevertTask {
     pub repo_path: std::path::PathBuf,
     pub requested: usize,
     pub rx: std::sync::mpsc::Receiver<std::result::Result<crate::git::RevertOutcome, String>>,
+}
+
+/// Worker-thread handle for an in-flight reword. Carries the target
+/// oid + repo path so the poll routine can route the outcome back to
+/// the correct workspace even if the user switches tabs mid-operation.
+pub struct RewordTask {
+    pub repo_path: std::path::PathBuf,
+    pub target_oid: gix::ObjectId,
+    pub rx: std::sync::mpsc::Receiver<std::result::Result<crate::git::RewordOutcome, String>>,
 }
 
 /// Worker-thread handle for an in-flight basket squash. Mirrors
@@ -1024,6 +1042,8 @@ impl MergeFoxApp {
             basket_revert_task: None,
             basket_squash_confirm: None,
             basket_squash_task: None,
+            reword_modal: None,
+            reword_task: None,
         }
     }
 
@@ -1511,6 +1531,175 @@ impl MergeFoxApp {
     /// trigger is expensive to undo. The modal's backup-tag notice +
     /// force-push warning + editable message are cheap UX investments
     /// with a high safety payoff.
+    /// Populate the reword modal's state for `target_oid`: snapshot
+    /// the commit's current message + a heuristic upstream-published
+    /// warning, then flip the modal open. The worker spawn happens on
+    /// Confirm (see `start_reword`).
+    pub fn show_reword_modal(&mut self, target_oid: gix::ObjectId) {
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        let ws = tabs.current();
+        let repo_path = ws.repo.path().to_path_buf();
+        let head_oid = ws.repo.head_oid();
+
+        // Pull the commit's current full message via `git log -1`. Using
+        // the CLI (vs gix) keeps trailing newline / encoding exactly as
+        // the user will type back into the editor.
+        let current = crate::git::cli::run(
+            &repo_path,
+            ["log", "-1", "--format=%B", &target_oid.to_string()],
+        )
+        .map(|out| out.stdout_str().trim_end_matches('\n').to_string())
+        .unwrap_or_default();
+
+        // Upstream-published preflight — if the commit is already on any
+        // remote ref, rewriting means force-push. We reuse the existing
+        // amend-preflight by pointing it at this oid instead of HEAD.
+        // `contains` from git's plumbing is the cheapest probe.
+        let upstream_warning =
+            commit_reachable_from_remote(&repo_path, target_oid).then(|| {
+                "This commit is already on a remote. After rewording you'll \
+                 need to force-push — readers tracking this branch will see \
+                 it move."
+                    .to_string()
+            });
+
+        let short = {
+            let s = target_oid.to_string();
+            s[..7.min(s.len())].to_string()
+        };
+        self.reword_modal = Some(crate::ui::reword::RewordModalState {
+            target_oid,
+            short_oid: short,
+            original_message: current.clone(),
+            edited_message: current,
+            upstream_warning,
+            head_warning: head_oid == Some(target_oid),
+            busy: false,
+        });
+    }
+
+    /// Kick off the reword worker. Safe to call from the modal's
+    /// Confirm button without re-validating the oid — we re-check
+    /// the modal state here so a stale Confirm after a tab switch
+    /// doesn't fire an empty reword.
+    pub fn start_reword(&mut self) {
+        let Some(state) = self.reword_modal.clone() else {
+            return;
+        };
+        if self.reword_task.is_some() {
+            self.notify_info("Reword already in progress — wait for it to finish.");
+            return;
+        }
+        if state.edited_message.trim().is_empty() {
+            self.notify_err("Reword aborted — the new message is empty.");
+            return;
+        }
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        let repo_path = tabs.current().repo.path().to_path_buf();
+
+        // Flip the modal into "busy" mode so the Confirm button
+        // disables + the spinner lights up while the worker runs.
+        if let Some(m) = self.reword_modal.as_mut() {
+            m.busy = true;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.egui_ctx.clone();
+        let target = state.target_oid;
+        let new_msg = state.edited_message.clone();
+        let worker_path = repo_path.clone();
+        std::thread::spawn(move || {
+            let result = crate::git::reword_commit(&worker_path, target, &new_msg)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.reword_task = Some(RewordTask {
+            repo_path,
+            target_oid: target,
+            rx,
+        });
+    }
+
+    /// Drain the reword channel. Calls `rebuild_graph` on success and
+    /// moves the selected-commit cursor to the rewritten commit so the
+    /// diff panel doesn't point at an orphaned OID.
+    pub fn poll_reword_task(&mut self) {
+        let Some(task) = self.reword_task.as_ref() else {
+            return;
+        };
+        let outcome = match task.rx.try_recv() {
+            Ok(o) => o,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.reword_task = None;
+                if let Some(m) = self.reword_modal.as_mut() {
+                    m.busy = false;
+                }
+                self.notify_err("Reword worker died before reporting — no changes applied.");
+                return;
+            }
+        };
+        let repo_path = task.repo_path.clone();
+        self.reword_task = None;
+
+        match outcome {
+            Ok(crate::git::RewordOutcome::Success {
+                new_head_oid,
+                new_target_oid,
+                backup_tag,
+            }) => {
+                // Move the diff panel to the rewritten commit so the
+                // currently-open diff doesn't stale to an orphan oid.
+                if let Some(ws) = self.workspace_by_path_mut(&repo_path) {
+                    ws.selected_commit = Some(new_target_oid);
+                    ws.current_diff = None;
+                    ws.selected_file_idx = None;
+                }
+                let scope = self.active_graph_scope();
+                self.rebuild_graph(scope);
+                self.reword_modal = None;
+                self.notify_ok_with_detail(
+                    "Commit message rewritten.",
+                    format!(
+                        "Backup tag {backup_tag} points at the pre-reword HEAD. \
+                         New HEAD: {}.",
+                        short_oid_string(&new_head_oid)
+                    ),
+                );
+            }
+            Ok(crate::git::RewordOutcome::Aborted {
+                reason,
+                backup_tag_created,
+            }) => {
+                if let Some(m) = self.reword_modal.as_mut() {
+                    m.busy = false;
+                }
+                let detail = match backup_tag_created {
+                    Some(tag) => format!(
+                        "Reason: {reason}\n\nBackup tag {tag} still points at the \
+                         pre-reword HEAD — the tree has been reset to it."
+                    ),
+                    None => format!("Reason: {reason}"),
+                };
+                self.notify_err_with_detail("Reword aborted.", detail);
+            }
+            Err(err) => {
+                if let Some(m) = self.reword_modal.as_mut() {
+                    m.busy = false;
+                }
+                self.notify_err_with_detail("Reword failed to start.", err);
+            }
+        }
+    }
+
     pub fn show_basket_squash_confirm_modal(&mut self) {
         let View::Workspace(tabs) = &self.view else {
             return;
@@ -5202,6 +5391,28 @@ fn spawn_graph_task(ws: &mut WorkspaceState, scope: GraphScope, ctx: &egui::Cont
 /// "+N more" suffix when truncated. Used by toasts that want to
 /// hint which files were affected without dumping 400 paths into
 /// the notification center.
+/// Short hex representation of a gix OID — matches the 7-char form
+/// used throughout the UI (graph rows, detail header, tag names).
+fn short_oid_string(oid: &gix::ObjectId) -> String {
+    let s = oid.to_string();
+    s[..7.min(s.len())].to_string()
+}
+
+/// Cheap check for "is this commit already on any remote-tracking ref".
+/// Runs a single `git branch -r --contains <oid>`; non-empty stdout
+/// means at least one remote ref reaches it, which is the trigger for
+/// the "force-push needed" warning in destructive history-rewrite
+/// modals.
+fn commit_reachable_from_remote(repo_path: &std::path::Path, oid: gix::ObjectId) -> bool {
+    match crate::git::cli::run(
+        repo_path,
+        ["branch", "-r", "--contains", &oid.to_string()],
+    ) {
+        Ok(out) => !out.stdout_str().trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
 fn sample_paths(paths: &[std::path::PathBuf], max: usize) -> String {
     if paths.is_empty() {
         return String::new();
@@ -5392,6 +5603,7 @@ impl eframe::App for MergeFoxApp {
         self.poll_diff_tasks();
         self.poll_graph_tasks();
         self.poll_basket_revert();
+        self.poll_reword_task();
         self.poll_basket_squash();
         self.drain_image_evictions(ctx);
         // Drain the async preview-decoder pool into its shared cache.
@@ -5439,6 +5651,7 @@ impl eframe::App for MergeFoxApp {
         ui::forge::show(ctx, self);
         ui::rebase::show(ctx, self);
         ui::conflicts::show(ctx, self);
+        ui::reword::show(ctx, self);
         self.handle_commit_basket_bar(ctx);
         self.poll_combined_diff();
         self.handle_basket_focus_modal(ctx);

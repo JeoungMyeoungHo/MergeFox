@@ -276,4 +276,8 @@ impl MergeFoxApp {
         self.notifications
             .push_with_detail(NotifSeverity::Error, msg, Some(detail.into()));
     }
+    pub fn notify_ok_with_detail(&mut self, msg: impl Into<String>, detail: impl Into<String>) {
+        self.notifications
+            .push_with_detail(NotifSeverity::Success, msg, Some(detail.into()));
+    }
 }
