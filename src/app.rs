@@ -375,6 +375,91 @@ pub struct WelcomeState {
     /// which account to treat as the default upstream identity. Cleared
     /// once the user picks or skips.
     pub pending_init_pick: Option<PendingInitPick>,
+    /// UI state for the "Large repository mode (advanced)" collapsible.
+    /// Persists across re-renders so the user's radio selection and
+    /// sparse-dirs textarea survive while they type into the URL field.
+    /// Resets to defaults only on tab close — intentional, so "clone a
+    /// few repos with blob:none" isn't a per-clone re-tick.
+    pub large_repo_mode: LargeRepoModeState,
+}
+
+/// Clone-wizard advanced options state, living on `WelcomeState` so the
+/// radio / textarea choices survive UI re-renders. `Default` follows
+/// `CloneDefaults` semantics — the welcome page seeds this from config
+/// the first time the panel is expanded.
+#[derive(Default)]
+pub struct LargeRepoModeState {
+    /// Panel open? Closed by default so the wizard reads simply for
+    /// anyone who doesn't care about this feature.
+    pub expanded: bool,
+    /// Seeded from `CloneDefaults` on first expansion so the panel
+    /// reflects persisted preferences but can then drift per-clone.
+    pub seeded: bool,
+    pub mode: LargeRepoMode,
+    /// Shallow depth when `mode` is Shallow or any Partial variant +
+    /// the user checks "also shallow". Mirrors
+    /// `CloneDefaults::shallow_depth` on first seed.
+    pub shallow_depth: u32,
+    /// True → append `--depth=N` even when `mode` isn't Shallow. Allows
+    /// the documented `--depth=1 --filter=blob:none` CI pattern.
+    pub combine_shallow: bool,
+    /// Threshold for `BlobLimit`. Stored as-typed (number + unit) so
+    /// the user's input round-trips cleanly; only converted to bytes at
+    /// clone dispatch.
+    pub blob_limit_value: u32,
+    pub blob_limit_unit: BlobLimitUnit,
+    /// Free-form sparse-checkout pattern list — one directory per
+    /// line. Used verbatim except that blank lines are stripped.
+    pub sparse_dirs_text: String,
+    /// Most recent validation failure, surfaced inline below the
+    /// Clone button. `None` clears the inline message.
+    pub validation_error: Option<String>,
+}
+
+/// Radio option in the Large-repo panel. The four real choices map
+/// onto `CloneFilter` variants plus a "Shallow only" shortcut.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LargeRepoMode {
+    #[default]
+    Full,
+    /// `--depth=N` only — a full history is still paid for on the
+    /// server side, the client just stops early.
+    Shallow,
+    PartialBlobNone,
+    PartialBlobLimit,
+    /// Forces sparse-checkout to be non-empty. UI refuses to dispatch
+    /// the clone otherwise.
+    PartialTreeZero,
+}
+
+/// Unit picker for the `BlobLimit` threshold input. Deliberately tiny
+/// — KB and MB cover every plausible threshold (bytes are silly for a
+/// lazy-fetch cutoff, GB lazy-fetches ~nothing).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BlobLimitUnit {
+    Kb,
+    #[default]
+    Mb,
+}
+
+impl BlobLimitUnit {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Kb => "KB",
+            Self::Mb => "MB",
+        }
+    }
+
+    /// Convert `(value, unit)` → bytes, saturating on overflow. The
+    /// u32 `value` × 1 MiB comfortably fits in u64, so saturation is
+    /// defence-in-depth only.
+    pub fn to_bytes(self, value: u32) -> u64 {
+        let mul: u64 = match self {
+            Self::Kb => 1024,
+            Self::Mb => 1024 * 1024,
+        };
+        (value as u64).saturating_mul(mul)
+    }
 }
 
 /// "We just ran `git init` on this path; waiting on the user to tell us
@@ -2535,12 +2620,16 @@ impl MergeFoxApp {
             Ok(outcome) => {
                 // Probe picked an account — lock it in as the repo's
                 // default so push / pull don't re-ask.
-                if let Some(slug) = outcome.account_slug {
+                if let Some(slug) = outcome.account_slug.clone() {
                     let mut settings = self.config.repo_settings_for(&outcome.path);
                     settings.provider_account = Some(slug);
                     self.config.set_repo_settings(&outcome.path, settings);
                     let _ = self.config.save();
                 }
+                // Surface a post-clone banner when the user opted into
+                // partial / sparse. Full clones stay silent — adding a
+                // toast for every clone would spam the common path.
+                emit_clone_success_banner(self, &outcome);
                 self.open_repo(&outcome.path);
             }
             Err(err) => self.set_git_error("Cloning a repository", err),
@@ -6015,6 +6104,68 @@ fn auto_provider_selection_is_ambiguous(
         .iter()
         .filter(|acc| provider_matches_host(&acc.id.kind, host))
         .any(|acc| acc.id.username.eq_ignore_ascii_case(remote_owner))
+}
+
+/// Emit the "Partial clone succeeded" toast when the outcome warrants
+/// one. Stays silent for vanilla full / shallow clones — a success
+/// banner for every clone would add no new information.
+///
+/// Detail line combines three facts the user cares about:
+///   * Which filter level was applied (so they know what was actually
+///     sent to the server).
+///   * A short preview of the sparse set, if any — first 3 entries
+///     plus "+N more" when the list is longer. Keeps the banner
+///     readable; the full list lives in the repo's sparse-checkout
+///     settings panel.
+///   * The on-disk size from `git count-objects -v` (best-effort).
+fn emit_clone_success_banner(app: &mut MergeFoxApp, outcome: &crate::clone::CloneOutcome) {
+    let filter_is_partial = outcome.filter.is_enabled();
+    let has_sparse = !outcome.sparse_dirs.is_empty();
+    if !filter_is_partial && !has_sparse {
+        return;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("filter {}", outcome.filter.display_label()));
+    if has_sparse {
+        let preview_limit = 3usize;
+        let shown: Vec<String> = outcome
+            .sparse_dirs
+            .iter()
+            .take(preview_limit)
+            .cloned()
+            .collect();
+        let remainder = outcome.sparse_dirs.len().saturating_sub(preview_limit);
+        let mut sparse_line = format!("sparse: {}", shown.join(", "));
+        if remainder > 0 {
+            sparse_line.push_str(&format!(" (+{remainder} more)"));
+        }
+        parts.push(sparse_line);
+    }
+    if let Some(bytes) = outcome.downloaded_bytes {
+        parts.push(format!("{} downloaded", format_bytes_banner(bytes)));
+    }
+    parts.push("manage patterns under Settings → Repository".to_string());
+    let detail = parts.join(" · ");
+    app.notify_ok_with_detail("Partial clone complete", detail);
+}
+
+/// Local copy of the byte-formatter — mirrors `clone::format_bytes`
+/// but lives here because `clone::format_bytes` is private. Kept small
+/// and separate rather than exposing the private helper just to save
+/// five lines.
+fn format_bytes_banner(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if n >= GB {
+        format!("{:.1} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{} MB", n / MB)
+    } else if n >= KB {
+        format!("{} KB", n / KB)
+    } else {
+        format!("{} B", n)
+    }
 }
 
 #[cfg(test)]
