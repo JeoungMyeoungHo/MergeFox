@@ -8,6 +8,7 @@ pub mod lfs;
 pub mod ops;
 pub mod repo;
 
+pub use basket_ops::{revert_to_working_tree, RevertOutcome};
 pub use blame::{blame_file, BlameCommit, BlameLine, BlameResult};
 pub use cli::{
     classify_git_error, probe_git_capability, recent_git_log, GitCapability, GitErrorKind,

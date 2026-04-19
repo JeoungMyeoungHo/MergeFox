@@ -129,6 +129,18 @@ pub struct MergeFoxApp {
         Option<providers::runtime::ProviderTask<providers::ProviderResult<ForgeCreatePrResult>>>,
     pub forge_create_issue_task:
         Option<providers::runtime::ProviderTask<providers::ProviderResult<ForgeCreateIssueResult>>>,
+    /// In-flight `git revert --no-commit <oids…>` spawned from the
+    /// basket bar's "↺ Revert to WT" button. Only one at a time.
+    pub basket_revert_task: Option<BasketRevertTask>,
+}
+
+/// Worker-thread handle for an in-flight basket revert. Opaque to the
+/// rest of the app — only `start_basket_revert` / `poll_basket_revert`
+/// touch the innards.
+pub struct BasketRevertTask {
+    pub repo_path: std::path::PathBuf,
+    pub requested: usize,
+    pub rx: std::sync::mpsc::Receiver<std::result::Result<crate::git::RevertOutcome, String>>,
 }
 
 #[derive(Default)]
@@ -984,6 +996,7 @@ impl MergeFoxApp {
             forge_refresh_task: None,
             forge_create_pr_task: None,
             forge_create_issue_task: None,
+            basket_revert_task: None,
         }
     }
 
@@ -1062,7 +1075,8 @@ impl MergeFoxApp {
             }
             BasketIntent::ShowCombinedDiff => self.start_combined_diff(),
             BasketIntent::FocusFile => self.start_basket_focus_picker(),
-            BasketIntent::RevertToWorkingTree | BasketIntent::SquashIntoOne => {
+            BasketIntent::RevertToWorkingTree => self.start_basket_revert(),
+            BasketIntent::SquashIntoOne => {
                 self.notify_info(format!("Basket: {intent:?} — not yet wired"));
             }
         }
@@ -1332,6 +1346,140 @@ impl MergeFoxApp {
         ws.combined_diff_focus_path = None;
         ws.selected_file_idx = None;
         ws.set_image_cache(None);
+    }
+
+    /// Kick off the basket → working-tree revert on a worker thread.
+    pub fn start_basket_revert(&mut self) {
+        if self.basket_revert_task.is_some() {
+            self.notify_info("Basket revert already in progress — wait for it to finish.");
+            return;
+        }
+
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        if tabs.launcher_active {
+            return;
+        }
+        let ws = tabs.current();
+        if ws.commit_basket.len() < 2 {
+            return;
+        }
+
+        let repo_path = ws.repo.path().to_path_buf();
+        let commits: Vec<gix::ObjectId> = ws.commit_basket.iter().copied().collect();
+        let requested = commits.len();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx_clone = self.egui_ctx.clone();
+        let repo_path_thread = repo_path.clone();
+        std::thread::spawn(move || {
+            let result = crate::git::revert_to_working_tree(&repo_path_thread, &commits)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+            ctx_clone.request_repaint();
+        });
+
+        self.basket_revert_task = Some(BasketRevertTask {
+            repo_path,
+            requested,
+            rx,
+        });
+        self.notify_info(format!(
+            "Reverting {requested} commits to the working tree…"
+        ));
+    }
+
+    /// Drain the basket-revert channel and surface the outcome.
+    pub fn poll_basket_revert(&mut self) {
+        let Some(task) = self.basket_revert_task.as_ref() else {
+            return;
+        };
+        let outcome = match task.rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.basket_revert_task = None;
+                self.notify_err("Basket revert worker died before reporting — no changes applied.");
+                return;
+            }
+        };
+
+        let repo_path = task.repo_path.clone();
+        let requested = task.requested;
+        self.basket_revert_task = None;
+
+        let is_active_tab = matches!(
+            &self.view,
+            View::Workspace(tabs) if !tabs.launcher_active
+                && tabs.current().repo.path() == repo_path
+        );
+
+        match outcome {
+            Ok(crate::git::RevertOutcome::Clean {
+                commits_reverted,
+                auto_stashed,
+            }) => {
+                if let Some(ws) = self.workspace_by_path_mut(&repo_path) {
+                    ws.commit_basket.clear();
+                }
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                let stash_note = if auto_stashed {
+                    " (auto-stashed prior changes)"
+                } else {
+                    ""
+                };
+                self.notify_ok(format!(
+                    "Reverted {commits_reverted} commits to working tree{stash_note}."
+                ));
+            }
+            Ok(crate::git::RevertOutcome::Conflicts {
+                commits_reverted,
+                conflicted_paths,
+                auto_stashed,
+            }) => {
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                let stash_note = if auto_stashed {
+                    " (prior changes auto-stashed)"
+                } else {
+                    ""
+                };
+                let path_sample = sample_paths(&conflicted_paths, 3);
+                self.notify_err_with_detail(
+                    format!(
+                        "Revert hit conflicts after {commits_reverted} of {requested} commits{stash_note}. Resolve in the Conflicts panel."
+                    ),
+                    if path_sample.is_empty() {
+                        format!("{} conflicted paths", conflicted_paths.len())
+                    } else {
+                        format!("Conflicted: {path_sample}")
+                    },
+                );
+            }
+            Ok(crate::git::RevertOutcome::Aborted { reason }) => {
+                if is_active_tab {
+                    self.rebuild_graph(self.active_graph_scope());
+                }
+                self.notify_err_with_detail(
+                    "Basket revert aborted — no changes applied.",
+                    reason,
+                );
+            }
+            Err(err) => {
+                self.notify_err_with_detail("Basket revert failed to start.", err);
+            }
+        }
+    }
+
+    fn active_graph_scope(&self) -> crate::git::GraphScope {
+        match &self.view {
+            View::Workspace(tabs) if !tabs.launcher_active => tabs.current().graph_scope,
+            _ => crate::git::GraphScope::CurrentBranch,
+        }
     }
 
     pub fn set_git_error(&mut self, action: &str, err: impl std::fmt::Display) {
@@ -4822,6 +4970,26 @@ fn spawn_graph_task(ws: &mut WorkspaceState, scope: GraphScope, ctx: &egui::Cont
     ws.graph_task = Some(GraphTask { scope, rx });
 }
 
+/// Format up to `max` paths as a comma-separated sample, with a
+/// "+N more" suffix when truncated. Used by toasts that want to
+/// hint which files were affected without dumping 400 paths into
+/// the notification center.
+fn sample_paths(paths: &[std::path::PathBuf], max: usize) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let shown = paths.len().min(max);
+    let mut pieces: Vec<String> = paths
+        .iter()
+        .take(shown)
+        .map(|p| p.display().to_string())
+        .collect();
+    if paths.len() > shown {
+        pieces.push(format!("+{} more", paths.len() - shown));
+    }
+    pieces.join(", ")
+}
+
 fn reset_forge_state(forge: &mut ForgeState) {
     forge.repo = None;
     forge.pull_requests.clear();
@@ -4995,6 +5163,7 @@ impl eframe::App for MergeFoxApp {
         self.poll_nav_tasks();
         self.poll_diff_tasks();
         self.poll_graph_tasks();
+        self.poll_basket_revert();
         self.drain_image_evictions(ctx);
         self.poll_working_tree_changes();
 
@@ -5040,6 +5209,9 @@ impl eframe::App for MergeFoxApp {
         }
         if self.hud.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if self.basket_revert_task.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.provider_oauth_start_task.is_some() || self.provider_oauth_poll_task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(120));
