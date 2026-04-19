@@ -54,6 +54,15 @@ pub struct Config {
     /// Defaults that apply to clone flows (size prompt, shallow depth).
     #[serde(default)]
     pub clone_defaults: CloneDefaults,
+    /// Diff-viewer UI preferences persisted across sessions.
+    ///
+    /// Stored as a struct (rather than a flat boolean field) so new
+    /// diff toggles can be added later without another schema bump.
+    /// `#[serde(default)]` means existing config files silently pick
+    /// up the struct defaults the first time they're loaded by a
+    /// newer binary.
+    #[serde(default)]
+    pub diff_prefs: DiffPrefs,
     // NOTE: the `secrets_backend` field was removed along with the OS
     // keychain dependency. Old config files that still have it will be
     // silently ignored by serde. Going forward the secret store is
@@ -72,6 +81,32 @@ impl Default for Config {
             provider_accounts: Vec::new(),
             ai_endpoint: None,
             clone_defaults: CloneDefaults::default(),
+            diff_prefs: DiffPrefs::default(),
+        }
+    }
+}
+
+/// Persisted diff-viewer preferences. New toggles should live here so
+/// they migrate in automatically via `#[serde(default)]` on the field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffPrefs {
+    /// Whether to render the minimap column alongside long text
+    /// diffs. Defaults on — the minimap is mostly invisible for
+    /// short diffs (the viewport overlay covers the whole strip) and
+    /// adds a real overview for long ones, so the default-on bias is
+    /// "no surprise for short diffs, discovery win for long ones".
+    #[serde(default = "default_show_minimap")]
+    pub show_minimap: bool,
+}
+
+fn default_show_minimap() -> bool {
+    true
+}
+
+impl Default for DiffPrefs {
+    fn default() -> Self {
+        Self {
+            show_minimap: default_show_minimap(),
         }
     }
 }
@@ -452,6 +487,7 @@ impl Config {
             provider_accounts: &self.provider_accounts,
             ai_endpoint: self.ai_endpoint.as_ref(),
             clone_defaults: &self.clone_defaults,
+            diff_prefs: &self.diff_prefs,
         };
         write_config(&path, &to_write)
     }
@@ -533,6 +569,7 @@ struct SerConfig<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     ai_endpoint: Option<&'a crate::ai::Endpoint>,
     clone_defaults: &'a CloneDefaults,
+    diff_prefs: &'a DiffPrefs,
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -647,6 +684,7 @@ fn save_config_to_path(path: &Path, cfg: &Config) -> Result<()> {
         provider_accounts: &cfg.provider_accounts,
         ai_endpoint: cfg.ai_endpoint.as_ref(),
         clone_defaults: &cfg.clone_defaults,
+        diff_prefs: &cfg.diff_prefs,
     };
     write_config(path, &to_write)
 }
