@@ -52,6 +52,9 @@ pub enum PaletteAction {
     CheckoutBranch(String),
     SetGraphScope(GraphScope),
     Fetch(String),
+    /// Force an immediate CI/check-run refresh for the first N
+    /// visible commits, bypassing the 2-minute heartbeat throttle.
+    RefreshCiStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +329,11 @@ fn collect(app: &MergeFoxApp) -> Vec<PaletteCommand> {
             }
         }
         out.push(PaletteCommand {
+            label: "Refresh CI status".into(),
+            hint: Some("Re-fetch check-runs now".into()),
+            action: PaletteAction::RefreshCiStatus,
+        });
+        out.push(PaletteCommand {
             label: "Graph scope: Current branch".into(),
             hint: None,
             action: PaletteAction::SetGraphScope(GraphScope::CurrentBranch),
@@ -480,6 +488,9 @@ fn execute(app: &mut MergeFoxApp, action: PaletteAction) {
         }
         PaletteAction::Fetch(remote) => {
             app.start_fetch(&remote);
+        }
+        PaletteAction::RefreshCiStatus => {
+            app.refresh_ci_status(false);
         }
     }
 }
