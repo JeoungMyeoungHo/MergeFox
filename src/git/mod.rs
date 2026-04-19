@@ -31,8 +31,8 @@ pub use cli::{
 };
 pub use diff::{
     diff_for_commit, diff_for_commit_in, diff_text_for_working_entry,
-    file_diff_for_working_entry, DeltaStatus, DiffLine, FileDiff, FileKind, Hunk, LineKind,
-    RepoDiff,
+    file_diff_for_working_entry, intra_line_diff, DeltaStatus, DiffLine, FileDiff, FileKind, Hunk,
+    IntraLineDiff, IntraLineSpan, LineKind, RepoDiff,
 };
 pub use graph::{CommitGraph, GraphRow, GraphScope, RefKind, RefLabel};
 pub use jobs::{GitJob, GitJobKind, JobProgress, PullStrategy};

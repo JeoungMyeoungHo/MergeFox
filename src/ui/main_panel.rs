@@ -29,23 +29,28 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let panic_active = app.panic_detector_active();
 
     let mut commit_clicked: Option<gix::ObjectId> = None;
+    // Track whether the diff-prefs toggle changed so we can persist
+    // the config once the UI closure releases its borrow on `app`.
+    let prev_diff_prefs = app.config.diff_prefs.clone();
     {
         // Split the borrow explicitly: the UI closure takes `&mut app.view`
         // exclusively while we still need read access to `ci_status_cache`
-        // so the graph renderer can look up badges. Destructuring through
-        // a pattern (rather than `&mut app.view` inside the closure) lets
-        // Rust see the two accesses are to disjoint fields. Scoped into
-        // its own block so the borrows release before `app` is reused
-        // for the post-click diff dispatch below.
+        // (for the graph's CI badges) and `&mut app.config.diff_prefs`
+        // (for the diff-view's minimap toggle). Destructuring through a
+        // pattern lets Rust see all three are disjoint fields. Scoped
+        // into its own block so the borrows release before `app` is
+        // reused for the post-click diff dispatch below.
         let MergeFoxApp {
             view,
             ci_status_cache,
+            config,
             ..
         } = &mut *app;
         let ci_status_cache: &std::collections::HashMap<
             gix::ObjectId,
             crate::providers::CheckSummary,
         > = ci_status_cache;
+        let diff_prefs = &mut config.diff_prefs;
 
         egui::CentralPanel::default().show(ctx, |ui| {
         let View::Workspace(tabs) = view else {
@@ -54,7 +59,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         let ws = tabs.current_mut();
 
         if crate::ui::diff_view::has_selected_file(ws) {
-            crate::ui::diff_view::show_selected_file_center(ui, ws);
+            crate::ui::diff_view::show_selected_file_center(ui, ws, diff_prefs);
             return;
         }
 
@@ -369,6 +374,13 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     }
     if let Some(scope) = intent.new_scope {
         app.rebuild_graph(scope);
+    }
+
+    // Persist diff-viewer prefs across sessions. Saving from the UI
+    // thread is fine — the Config writer serializes a few KB of JSON
+    // and only runs when a toggle actually changed.
+    if app.config.diff_prefs != prev_diff_prefs {
+        let _ = app.config.save();
     }
 }
 
