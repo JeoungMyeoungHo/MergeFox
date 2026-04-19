@@ -26,9 +26,47 @@ use egui::{Color32, FontId, Layout, RichText, ScrollArea, Stroke, Vec2};
 use crate::app::{
     MergeFoxApp, SelectedFileView, SelectedImageCache, SnapshotCache, View, WorkspaceState,
 };
+use crate::git::hunk_staging::{self, DiffSide};
 use crate::git::{
     DeltaStatus, DiffLine, EntryKind, FileDiff, FileKind, LineKind, RepoDiff, StatusEntry,
 };
+
+/// A hunk-level user intent collected while rendering the diff panel.
+///
+/// The diff view can't perform the actual git operation inline — it
+/// borrows `WorkspaceState` mutably for rendering, and the operations
+/// need to refresh the working-tree cache afterwards (which borrows
+/// `MergeFoxApp`). Instead, we record what the user asked for here and
+/// let the outer `MergeFoxApp::update` loop apply it after the paint
+/// closure releases its borrow.
+#[derive(Debug, Clone)]
+pub enum HunkAction {
+    /// Stage a single hunk (or line subset) from the unstaged side.
+    StageHunk {
+        file: std::path::PathBuf,
+        hunk_index: usize,
+        line_indices: Vec<usize>,
+    },
+    /// Unstage a single hunk from the staged side.
+    UnstageHunk {
+        file: std::path::PathBuf,
+        hunk_index: usize,
+        line_indices: Vec<usize>,
+    },
+    /// Discard a hunk from the working tree. Surfaced through a
+    /// confirmation prompt before the op actually runs.
+    DiscardHunk {
+        file: std::path::PathBuf,
+        hunk_index: usize,
+        line_indices: Vec<usize>,
+    },
+    /// "Stage selected lines" toolbar: apply each affected hunk with
+    /// the current `HunkSelectionState` as-is, then clear the
+    /// selection.
+    StageSelectedLines { file: std::path::PathBuf },
+    /// Symmetric — unstage only the currently-selected lines.
+    UnstageSelectedLines { file: std::path::PathBuf },
+}
 
 const PANEL_MIN_WIDTH: f32 = 280.0;
 const PANEL_DEFAULT_WIDTH: f32 = 340.0;
@@ -351,8 +389,13 @@ fn render_working_tree_flat(ui: &mut egui::Ui, ws: &mut WorkspaceState, entries:
                         ws.working_file_diff = None;
                     } else {
                         ws.selected_working_file = Some(entry.path.clone());
-                        ws.working_file_diff =
-                            crate::git::diff_text_for_working_entry(ws.repo.path(), entry).ok();
+                        // Leave the side-specific diff text empty so
+                        // `render_working_file_center` fetches the
+                        // right side (unstaged vs staged) on next
+                        // paint. Computing a combined HEAD-diff here
+                        // would be wasted work and would desync from
+                        // the hunk-staging flow.
+                        ws.working_file_diff = None;
                     }
                     ws.selected_file_view = SelectedFileView::Diff;
                     ws.set_image_cache(None);
@@ -705,6 +748,7 @@ fn render_working_file_center(
     let Some(entry) = selected_working_entry(ws, path) else {
         ws.selected_working_file = None;
         ws.working_file_diff = None;
+        ws.hunk_selection.reset_to(None, DiffSide::Unstaged);
         ui.vertical_centered(|ui| {
             ui.weak("Select a file from the right panel to open its diff or file view.")
         });
@@ -712,11 +756,47 @@ fn render_working_file_center(
     };
     let path_str = path.display().to_string();
 
+    // Keep the line-selection buffer anchored on the currently-shown
+    // (file, side). Switching files or toggling staged ↔ unstaged
+    // should NOT carry stale picks forward, otherwise "Stage 3 lines"
+    // could silently reach into a file the user no longer sees.
+    let needs_reset = ws
+        .hunk_selection
+        .file
+        .as_deref()
+        .map(|f| f != path)
+        .unwrap_or(true)
+        || ws.hunk_selection.side != ws.working_diff_side;
+    if needs_reset {
+        ws.hunk_selection
+            .reset_to(Some(path.to_path_buf()), ws.working_diff_side);
+    }
+
+    // Which sides actually have content? An unstaged-only file has
+    // nothing on the staged side, so the toggle for Staged is hidden
+    // to avoid giving the user a dead tab. Pure-staged files have the
+    // inverse layout.
+    let has_unstaged = entry.unstaged || matches!(entry.kind, EntryKind::Untracked);
+    let has_staged = entry.staged;
+    // If the current side has no content, prefer the other.
+    if ws.working_diff_side == DiffSide::Staged && !has_staged && has_unstaged {
+        ws.working_diff_side = DiffSide::Unstaged;
+        ws.hunk_selection
+            .reset_to(Some(path.to_path_buf()), DiffSide::Unstaged);
+        ws.working_file_diff = None; // force refetch
+    } else if ws.working_diff_side == DiffSide::Unstaged && !has_unstaged && has_staged {
+        ws.working_diff_side = DiffSide::Staged;
+        ws.hunk_selection
+            .reset_to(Some(path.to_path_buf()), DiffSide::Staged);
+        ws.working_file_diff = None;
+    }
+
     ui.horizontal(|ui| {
         if ui.button("← Changes").clicked() {
             ws.selected_working_file = None;
             ws.set_image_cache(None);
             ws.working_file_diff = None;
+            ws.hunk_selection.reset_to(None, DiffSide::Unstaged);
         }
         ui.separator();
         ui.label(RichText::new(&path_str).strong());
@@ -737,10 +817,43 @@ fn render_working_file_center(
         });
     });
     ui.small(format!("Changes · {}", working_tree_stats_str(&entry)));
+
+    // Staged / Unstaged toggle — only render when both sides exist.
+    // Partial-stage files (edits both staged AND unstaged) benefit
+    // most from this: the user can review what's already staged, then
+    // flip to "Unstaged" to pick the next hunk.
+    if has_unstaged && has_staged {
+        ui.horizontal(|ui| {
+            ui.label("View:");
+            for (label, side) in [
+                ("Unstaged", DiffSide::Unstaged),
+                ("Staged", DiffSide::Staged),
+            ] {
+                if ui
+                    .selectable_label(ws.working_diff_side == side, label)
+                    .clicked()
+                    && ws.working_diff_side != side
+                {
+                    ws.working_diff_side = side;
+                    ws.hunk_selection
+                        .reset_to(Some(path.to_path_buf()), side);
+                    ws.working_file_diff = None; // force refetch on next branch
+                }
+            }
+        });
+    }
+
     ui.separator();
 
     if ws.working_file_diff.is_none() {
-        ws.working_file_diff = crate::git::diff_text_for_working_entry(ws.repo.path(), &entry).ok();
+        ws.working_file_diff = match ws.working_diff_side {
+            DiffSide::Unstaged => {
+                crate::git::diff_text_unstaged_only(ws.repo.path(), &entry).ok()
+            }
+            DiffSide::Staged => {
+                crate::git::diff_text_staged_only(ws.repo.path(), &entry).ok()
+            }
+        };
     }
 
     let working_file = ws
@@ -754,7 +867,7 @@ fn render_working_file_center(
     match ws.selected_file_view {
         SelectedFileView::Diff => {
             if let Some(file) = working_file.as_ref() {
-                render_file_detail(ui, file, image_cache.as_ref(), diff_prefs);
+                render_working_diff_with_staging(ui, ws, &entry, file, image_cache.as_ref(), diff_prefs);
             } else {
                 ui.weak("Could not compute diff for this file.");
             }
@@ -767,6 +880,267 @@ fn render_working_file_center(
             }
         }
     }
+}
+
+/// Render the unified diff for a working-tree file with per-hunk and
+/// per-line staging controls.
+///
+/// Unlike `render_file_detail`, which uses egui's row-virtualized
+/// renderer for maximum throughput on large commit diffs, this path
+/// uses regular widgets for each hunk: buttons, checkboxes, and
+/// interactive labels that live inside egui's hit-testing tree. That
+/// trades a little raw scroll speed for genuine interactivity — and
+/// working-tree diffs are almost always orders of magnitude smaller
+/// than commit diffs, so the tradeoff is worth it in practice.
+fn render_working_diff_with_staging(
+    ui: &mut egui::Ui,
+    ws: &mut WorkspaceState,
+    entry: &StatusEntry,
+    file: &FileDiff,
+    image_cache: Option<&SelectedImageCache>,
+    diff_prefs: &mut crate::config::DiffPrefs,
+) {
+    // Fall back to the standard renderer for non-text / disabled
+    // cases — binary files and images have no hunk concept.
+    if let Some(reason) = hunk_staging::hunk_staging_block_reason(file) {
+        ui.horizontal(|ui| {
+            ui.colored_label(
+                Color32::from_rgb(210, 170, 90),
+                format!("Hunk staging disabled: {reason}"),
+            );
+        });
+        render_file_detail(ui, file, image_cache, diff_prefs);
+        return;
+    }
+    if entry.conflicted {
+        ui.colored_label(
+            Color32::from_rgb(240, 90, 90),
+            "Resolve conflicts first — hunk staging is disabled for conflicted files.",
+        );
+        render_file_detail(ui, file, image_cache, diff_prefs);
+        return;
+    }
+
+    let hunks = match &file.kind {
+        FileKind::Text { hunks, .. } => hunks,
+        _ => {
+            render_file_detail(ui, file, image_cache, diff_prefs);
+            return;
+        }
+    };
+    if hunks.is_empty() {
+        ui.weak("(no textual changes — file might be a pure rename)");
+        return;
+    }
+
+    let side = ws.working_diff_side;
+    let path = file
+        .new_path
+        .clone()
+        .or_else(|| file.old_path.clone())
+        .unwrap_or_else(|| entry.path.clone());
+
+    // Selection-scoped toolbar — only shown when the user has ticked
+    // at least one line checkbox. Keeps the regular case uncluttered.
+    let total_selected = ws.hunk_selection.total_selected();
+    if total_selected > 0 {
+        ui.horizontal(|ui| {
+            ui.weak(format!("{total_selected} line(s) selected"));
+            ui.separator();
+            let action_label = match side {
+                DiffSide::Unstaged => format!("Stage {total_selected} lines"),
+                DiffSide::Staged => format!("Unstage {total_selected} lines"),
+            };
+            if ui.button(action_label).clicked() {
+                let act = match side {
+                    DiffSide::Unstaged => HunkAction::StageSelectedLines {
+                        file: path.clone(),
+                    },
+                    DiffSide::Staged => HunkAction::UnstageSelectedLines {
+                        file: path.clone(),
+                    },
+                };
+                ws.pending_hunk_action = Some(act);
+            }
+            if ui.button("Clear selection").clicked() {
+                ws.hunk_selection.selected_lines.clear();
+            }
+        });
+        ui.separator();
+    }
+
+    // Per-hunk rendering — one `CollapsingHeader`-style strip per
+    // hunk, with action buttons on the right and a checkbox gutter on
+    // every Add/Remove line.
+    ScrollArea::vertical()
+        .id_salt(("working_diff_with_staging", path.display().to_string()))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (hunk_idx, hunk) in hunks.iter().enumerate() {
+                render_hunk_with_controls(ui, ws, &path, side, hunk_idx, hunk);
+            }
+        });
+}
+
+fn render_hunk_with_controls(
+    ui: &mut egui::Ui,
+    ws: &mut WorkspaceState,
+    path: &std::path::Path,
+    side: DiffSide,
+    hunk_idx: usize,
+    hunk: &crate::git::Hunk,
+) {
+    // Hunk header strip: blue header text on the left, action buttons
+    // on the right. The header row is one row high (DIFF_ROW_HEIGHT)
+    // for visual consistency with the commit-diff renderer.
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(&hunk.header)
+                .monospace()
+                .color(Color32::from_rgb(110, 170, 220)),
+        );
+        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+            match side {
+                DiffSide::Unstaged => {
+                    if ui
+                        .button(RichText::new("Discard hunk").color(Color32::from_rgb(212, 92, 92)))
+                        .on_hover_text("Throw away this hunk from the working tree (cannot be undone)")
+                        .clicked()
+                    {
+                        ws.pending_hunk_action = Some(HunkAction::DiscardHunk {
+                            file: path.to_path_buf(),
+                            hunk_index: hunk_idx,
+                            line_indices: Vec::new(),
+                        });
+                    }
+                    if ui
+                        .button("Stage hunk")
+                        .on_hover_text("Move this hunk into the index (`git apply --cached`)")
+                        .clicked()
+                    {
+                        ws.pending_hunk_action = Some(HunkAction::StageHunk {
+                            file: path.to_path_buf(),
+                            hunk_index: hunk_idx,
+                            line_indices: Vec::new(),
+                        });
+                    }
+                }
+                DiffSide::Staged => {
+                    if ui
+                        .button("Unstage hunk")
+                        .on_hover_text("Move this hunk back out of the index")
+                        .clicked()
+                    {
+                        ws.pending_hunk_action = Some(HunkAction::UnstageHunk {
+                            file: path.to_path_buf(),
+                            hunk_index: hunk_idx,
+                            line_indices: Vec::new(),
+                        });
+                    }
+                }
+            }
+        });
+    });
+
+    // Per-line rows with a checkbox gutter for Add/Remove lines.
+    for (line_idx, line) in hunk.lines.iter().enumerate() {
+        paint_diff_line_with_checkbox(ui, ws, hunk_idx, line_idx, line);
+    }
+    ui.add_space(4.0);
+}
+
+fn paint_diff_line_with_checkbox(
+    ui: &mut egui::Ui,
+    ws: &mut WorkspaceState,
+    hunk_idx: usize,
+    line_idx: usize,
+    line: &DiffLine,
+) {
+    let (bg, fg, prefix) = match line.kind {
+        LineKind::Add => (
+            Color32::from_rgba_unmultiplied(80, 180, 100, 38),
+            Color32::from_rgb(170, 230, 180),
+            '+',
+        ),
+        LineKind::Remove => (
+            Color32::from_rgba_unmultiplied(220, 110, 110, 42),
+            Color32::from_rgb(240, 180, 180),
+            '-',
+        ),
+        LineKind::Meta => (Color32::TRANSPARENT, Color32::DARK_GRAY, '·'),
+        LineKind::Context => (Color32::TRANSPARENT, Color32::LIGHT_GRAY, ' '),
+    };
+
+    let is_staggered = matches!(line.kind, LineKind::Add | LineKind::Remove);
+
+    let old = line
+        .old_lineno
+        .map(|n| format!("{n:>4}"))
+        .unwrap_or_else(|| "    ".into());
+    let new = line
+        .new_lineno
+        .map(|n| format!("{n:>4}"))
+        .unwrap_or_else(|| "    ".into());
+    let text = format!(" {old} {new} {prefix} {}", line.content);
+
+    let row_height = 16.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), row_height),
+        egui::Sense::click(),
+    );
+    if bg.a() > 0 {
+        ui.painter().rect_filled(rect, 0.0, bg);
+    }
+
+    // Left gutter: 18 px reserved for checkbox on stage-able rows. On
+    // context / meta rows the gutter stays blank so the prefix column
+    // still lines up.
+    const CHECKBOX_W: f32 = 18.0;
+    let mid_y = rect.center().y;
+
+    if is_staggered {
+        let selected = ws.hunk_selection.is_selected(hunk_idx, line_idx);
+        let cb_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + 2.0, mid_y - 7.0),
+            Vec2::new(14.0, 14.0),
+        );
+        let cb_resp = ui.interact(
+            cb_rect,
+            ui.id().with(("hunk_line_cb", hunk_idx, line_idx)),
+            egui::Sense::click(),
+        );
+        let glyph = if selected { "☑" } else { "☐" };
+        let col = if selected {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        ui.painter().text(
+            cb_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            FontId::monospace(13.0),
+            col,
+        );
+        // Checkbox OR whole-row click toggles — but only once per
+        // click (egui surfaces both `cb_resp.clicked()` and
+        // `resp.clicked()` when the pointer is inside the checkbox
+        // rect, so we treat the checkbox as the authoritative hit
+        // when it reports one).
+        if cb_resp.clicked() {
+            ws.hunk_selection.toggle_line(hunk_idx, line_idx);
+        } else if resp.clicked() {
+            ws.hunk_selection.toggle_line(hunk_idx, line_idx);
+        }
+    }
+
+    ui.painter().text(
+        rect.min + Vec2::new(CHECKBOX_W + 4.0, 2.0),
+        egui::Align2::LEFT_TOP,
+        text,
+        FontId::monospace(12.5),
+        fg,
+    );
 }
 
 fn selected_working_entry(
