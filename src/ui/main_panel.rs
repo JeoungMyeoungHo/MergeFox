@@ -29,8 +29,26 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let panic_active = app.panic_detector_active();
 
     let mut commit_clicked: Option<gix::ObjectId> = None;
-    egui::CentralPanel::default().show(ctx, |ui| {
-        let View::Workspace(tabs) = &mut app.view else {
+    {
+        // Split the borrow explicitly: the UI closure takes `&mut app.view`
+        // exclusively while we still need read access to `ci_status_cache`
+        // so the graph renderer can look up badges. Destructuring through
+        // a pattern (rather than `&mut app.view` inside the closure) lets
+        // Rust see the two accesses are to disjoint fields. Scoped into
+        // its own block so the borrows release before `app` is reused
+        // for the post-click diff dispatch below.
+        let MergeFoxApp {
+            view,
+            ci_status_cache,
+            ..
+        } = &mut *app;
+        let ci_status_cache: &std::collections::HashMap<
+            gix::ObjectId,
+            crate::providers::CheckSummary,
+        > = ci_status_cache;
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+        let View::Workspace(tabs) = view else {
             return;
         };
         let ws = tabs.current_mut();
@@ -216,6 +234,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 &mut ws.selected_working_tree,
                 &mut ws.working_tree_expanded,
                 &ws.commit_basket,
+                ci_status_cache,
             );
             if let Some(action) = result.action {
                 intent.action = Some(action);
@@ -263,6 +282,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             }
         }
     });
+    }
 
     // After the closure releases the `&mut ws` borrow, kick off an async
     // diff computation for the clicked commit.
