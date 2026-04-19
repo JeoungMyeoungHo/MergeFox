@@ -163,6 +163,19 @@ pub struct MergeFoxApp {
     /// In-flight find-and-fix apply worker. Destructive; we cap at one
     /// at a time for the same reason as the reword task.
     pub find_fix_apply_task: Option<FindFixApplyTask>,
+    /// Per-commit CI/check summaries, keyed by oid. Populated by the
+    /// `ci_status_refresh_task` background fetch. Absence from the
+    /// map means "no badge" (not Unknown), so commits the forge
+    /// never checked stay visually quiet.
+    pub ci_status_cache: std::collections::HashMap<gix::ObjectId, providers::CheckSummary>,
+    /// Most recent CI fetch, one at a time. The worker operates on
+    /// a snapshot of the first N visible commits from the graph;
+    /// caller is responsible for re-queueing when the set changes.
+    pub ci_status_refresh_task: Option<CiStatusRefreshTask>,
+    /// Wall-clock of the last successful CI refresh. Drives the
+    /// "refresh every 2 minutes" heartbeat on top of the on-rebuild
+    /// trigger. `None` until the first fetch lands.
+    pub ci_status_last_refresh: Option<Instant>,
 }
 
 /// Worker-thread handle for an in-flight basket revert. Opaque to the
@@ -215,6 +228,24 @@ pub struct BasketSquashTask {
     pub repo_path: std::path::PathBuf,
     pub requested: usize,
     pub rx: std::sync::mpsc::Receiver<crate::git::SquashOutcome>,
+}
+
+/// Worker-thread handle for an in-flight CI/check-run bulk fetch.
+///
+/// Wraps a tokio `ProviderTask` that resolves to a map of per-oid
+/// summaries. Kept as its own struct (rather than inlining the
+/// `ProviderTask<…>` type on `MergeFoxApp`) so the ugly generic
+/// signature isn't repeated at every call site, and so we can grow
+/// "start_time / repo_path / owner / repo" diagnostic fields
+/// later without refactoring the storage slot.
+pub struct CiStatusRefreshTask {
+    pub repo_path: std::path::PathBuf,
+    pub started_at: Instant,
+    pub task: providers::runtime::ProviderTask<
+        providers::ProviderResult<
+            std::collections::HashMap<gix::ObjectId, providers::CheckSummary>,
+        >,
+    >,
 }
 
 #[derive(Default)]
@@ -1078,6 +1109,9 @@ impl MergeFoxApp {
             find_fix_modal: None,
             find_fix_scan_task: None,
             find_fix_apply_task: None,
+            ci_status_cache: std::collections::HashMap::new(),
+            ci_status_refresh_task: None,
+            ci_status_last_refresh: None,
         }
     }
 
@@ -4577,6 +4611,147 @@ impl MergeFoxApp {
         }
     }
 
+    /// Minimum gap between successful CI refreshes. Two minutes is the
+    /// sweet spot: short enough that a user watching a build turn
+    /// green doesn't have to manually refresh; long enough that a
+    /// background tab doesn't eat rate-limit budget while the user
+    /// is off doing something else.
+    const CI_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
+
+    /// Kick off a fresh CI/check summary fetch for the first
+    /// `providers::ci_status::MAX_OIDS` visible commits of the active
+    /// workspace's graph.
+    ///
+    /// No-op under any of the following:
+    ///   * no active workspace;
+    ///   * no graph built yet;
+    ///   * no forge configured (`resolve_repo` returns `None`);
+    ///   * a fetch is already in flight;
+    ///   * caller passed `respect_throttle` and we refreshed recently.
+    ///
+    /// On completion, `poll_ci_status_task` merges results into
+    /// `ci_status_cache` and requests a repaint.
+    pub fn refresh_ci_status(&mut self, respect_throttle: bool) {
+        if self.ci_status_refresh_task.is_some() {
+            return;
+        }
+        if respect_throttle {
+            if let Some(last) = self.ci_status_last_refresh {
+                if last.elapsed() < Self::CI_STATUS_REFRESH_INTERVAL {
+                    return;
+                }
+            }
+        }
+
+        // Pull: (repo_path, forge context, first N oids from graph).
+        // Everything after this point runs on a worker thread and only
+        // sees owned data.
+        let (repo_path, context, oids) = {
+            let View::Workspace(tabs) = &self.view else {
+                return;
+            };
+            if tabs.launcher_active {
+                return;
+            }
+            let ws = tabs.current();
+            let Some(gv) = ws.graph_view.as_ref() else {
+                return;
+            };
+            let Some(context) = crate::forge::resolve_repo(&self.config, &ws.repo) else {
+                return;
+            };
+            let take_n = gv.graph.rows.len().min(providers::ci_status::MAX_OIDS);
+            let oids: Vec<gix::ObjectId> = gv.graph.rows[..take_n]
+                .iter()
+                .map(|r| r.oid)
+                .collect();
+            if oids.is_empty() {
+                return;
+            }
+            (ws.repo.path().to_path_buf(), context, oids)
+        };
+
+        let ctx = self.egui_ctx.clone();
+        let task = providers::runtime::ProviderTask::spawn(async move {
+            let client = providers::default_http_client();
+            // Token is optional: public repos on public forges answer
+            // `/status` + `/check-runs` anonymously (subject to the
+            // 60 req/h anonymous rate limit). If a PAT is configured,
+            // we use it for the higher 5000 req/h bucket.
+            let token = providers::pat::load_pat(&context.account_id)
+                .ok()
+                .flatten();
+            let result = providers::ci_status::fetch_check_summaries(
+                &context.kind,
+                &client,
+                token.as_ref(),
+                &context.owner,
+                &context.repo,
+                &oids,
+            )
+            .await;
+            ctx.request_repaint();
+            result
+        });
+
+        self.ci_status_refresh_task = Some(CiStatusRefreshTask {
+            repo_path,
+            started_at: Instant::now(),
+            task,
+        });
+    }
+
+    /// Drain a finished CI fetch. Merges results into the cache on
+    /// success; on failure, clears the task so the next poll can
+    /// re-queue, and logs at debug level without surfacing to the
+    /// user — CI badges are best-effort, not load-bearing.
+    fn poll_ci_status_task(&mut self) {
+        let Some(handle) = self.ci_status_refresh_task.as_mut() else {
+            return;
+        };
+        let Some(result) = handle.task.poll() else {
+            return;
+        };
+        let repo_path = handle.repo_path.clone();
+        self.ci_status_refresh_task = None;
+
+        match result {
+            Ok(map) => {
+                // Scope to the currently-visible graph: we evict any
+                // cache entry whose oid is no longer in the graph, so
+                // stale entries don't pile up forever across hundreds
+                // of graph rebuilds.
+                let visible: std::collections::HashSet<gix::ObjectId> = self
+                    .workspace_by_path(&repo_path)
+                    .and_then(|ws| ws.graph_view.as_ref())
+                    .map(|gv| gv.graph.rows.iter().map(|r| r.oid).collect())
+                    .unwrap_or_default();
+                if !visible.is_empty() {
+                    self.ci_status_cache.retain(|oid, _| visible.contains(oid));
+                }
+                for (oid, summary) in map {
+                    self.ci_status_cache.insert(oid, summary);
+                }
+                self.ci_status_last_refresh = Some(Instant::now());
+                self.egui_ctx.request_repaint();
+            }
+            Err(err) => {
+                tracing::debug!(
+                    target = "mergefox::ci",
+                    "ci status refresh failed for {}: {err}",
+                    repo_path.display()
+                );
+            }
+        }
+    }
+
+    /// Heartbeat called once per frame that re-queues a CI refresh
+    /// when the 2-minute throttle has elapsed. Cheap no-op on every
+    /// frame between heartbeats.
+    fn tick_ci_status_heartbeat(&mut self) {
+        self.refresh_ci_status(true);
+    }
+
     pub fn workspace_by_path_mut(&mut self, repo_path: &Path) -> Option<&mut WorkspaceState> {
         let View::Workspace(tabs) = &mut self.view else {
             return None;
@@ -5470,6 +5645,7 @@ impl MergeFoxApp {
                 completed.push((idx, scope, result));
             }
         }
+        let mut installed_any = false;
         for (tab_idx, scope, result) in completed {
             let View::Workspace(tabs) = &mut self.view else {
                 return;
@@ -5489,11 +5665,20 @@ impl MergeFoxApp {
                             graph_view.graph.rows.iter().position(|row| row.oid == oid);
                     }
                     tab.graph_view = Some(graph_view);
+                    installed_any = true;
                 }
                 Err(e) => {
                     self.last_error = Some(format!("graph rebuild: {e}"));
                 }
             }
+        }
+        if installed_any {
+            // A fresh graph is the definitive moment to refresh CI:
+            // the top-of-graph oid set might have shifted (new HEAD,
+            // scope change, post-rebase), so whatever was cached is
+            // now likely out of date. Bypass the 2-minute throttle
+            // here — the user just asked for fresh data.
+            self.refresh_ci_status(false);
         }
     }
 
@@ -5893,6 +6078,8 @@ impl eframe::App for MergeFoxApp {
         self.poll_find_fix_scan();
         self.poll_find_fix_apply();
         self.poll_basket_squash();
+        self.poll_ci_status_task();
+        self.tick_ci_status_heartbeat();
         self.drain_image_evictions(ctx);
         // Drain the async preview-decoder pool into its shared cache.
         // Cheap no-op when idle (bounded `try_recv` loop). Done before
