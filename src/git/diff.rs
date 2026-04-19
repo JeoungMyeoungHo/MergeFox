@@ -843,3 +843,378 @@ fn is_image_ext(ext: &str) -> bool {
         | "tga" | "psd" | "exr" | "hdr" | "qoi"
     )
 }
+
+// ---- intra-line (word-level) diff ----
+//
+// The unified diff tells us "this whole line was removed" and "this
+// whole line was added", but when the two lines are really the same
+// statement with a one-character tweak (`let x = 1;` → `let y = 1;`)
+// painting both lines solid red/green makes the reader hunt for the
+// actual change. Word-level highlighting keeps the line backgrounds
+// soft so the row still reads as a remove+add pair, and layers a
+// stronger emphasis on just the tokens that moved.
+//
+// Design notes:
+//   * Tokenization splits on a minimal grammar — identifier-ish runs
+//     (`[A-Za-z0-9_]+`) are one token, every other byte is its own
+//     token — so identifier renames stay atomic but punctuation
+//     (`;`, `(`, `,`) still aligns piece-by-piece. Whitespace tokens
+//     are emitted individually so LCS can align around indentation.
+//   * Alignment is a straight O(n·m) LCS. Lines in source files are
+//     rarely more than a few dozen tokens long; the allocation cost of
+//     something smarter (Myers proper, Patience, Hunt–McIlroy) would
+//     dominate the actual work.
+//   * We refuse to emphasize when the common subsequence is too short
+//     relative to the longer side. Two unrelated edits happening to
+//     share a few keywords (`return`, `}`) would otherwise paint
+//     confetti instead of readable highlights. `lcs_len * 3 <
+//     max(len_a, len_b)` is the current similarity gate — empirically
+//     tight enough to suppress noise on reflowed paragraphs while
+//     still catching typical one-token edits.
+//   * No new crate dependency. `similar` / `diff` are nicer for prose
+//     but overkill for per-line alignment at this size.
+
+/// One run of characters in a rendered intra-line diff. The UI paints
+/// `Unchanged` with only the soft line background, and `RemovedWord` /
+/// `AddedWord` with a stronger emphasis background.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntraLineSpan {
+    Unchanged(String),
+    RemovedWord(String),
+    AddedWord(String),
+}
+
+/// Paired span lists for a removed+added line. `removed_spans`
+/// reconstructs the removed line exactly (`RemovedWord` + `Unchanged`);
+/// `added_spans` reconstructs the added line (`AddedWord` +
+/// `Unchanged`). The two span lists share the same `Unchanged` text in
+/// the same order so the caller can render them as a visually aligned
+/// pair.
+pub struct IntraLineDiff {
+    pub removed_spans: Vec<IntraLineSpan>,
+    pub added_spans: Vec<IntraLineSpan>,
+}
+
+/// Compute a word-level diff between a removed and an added line.
+///
+/// Returns `None` when the two lines share too little content to align
+/// meaningfully — the caller should fall back to whole-line red/green
+/// rendering in that case. "Too little" here means the length of the
+/// longest common subsequence of tokens is less than a third of the
+/// longer side; totally unrelated edits trip that gate and bail out.
+pub fn intra_line_diff(removed: &str, added: &str) -> Option<IntraLineDiff> {
+    let a = tokenize_line(removed);
+    let b = tokenize_line(added);
+
+    let max_len = a.len().max(b.len());
+    if max_len == 0 {
+        // Empty inputs carry no structure to align on. Bail out early
+        // so the caller falls back to whole-line rendering (there's
+        // nothing visual to highlight anyway, so the distinction is
+        // moot, but Some(empty) would be a misleading success signal).
+        return None;
+    }
+
+    // Identical lines shouldn't normally reach this path — the diff
+    // driver wouldn't emit them as remove+add — but be defensive.
+    if a == b {
+        let spans: Vec<IntraLineSpan> = a
+            .iter()
+            .map(|t| IntraLineSpan::Unchanged((*t).to_string()))
+            .collect();
+        return Some(IntraLineDiff {
+            removed_spans: spans.clone(),
+            added_spans: spans,
+        });
+    }
+
+    let (lcs_len, lcs_table) = lcs_table(&a, &b);
+    // Similarity gate: the most common shape we want to reject is an
+    // entirely rewritten line. If less than ~33% of the longer line's
+    // tokens survive the alignment, whole-line red/green is more
+    // honest than sprinkling highlights across both halves. The
+    // inequality is `<=` (strict fallback) so a line pair that shares
+    // *only* its whitespace tokens — the classic "unrelated edit
+    // happens to both start with indentation" — still fails the gate.
+    if lcs_len.saturating_mul(3) <= max_len {
+        return None;
+    }
+
+    let (removed_spans, added_spans) = backtrack_spans(&a, &b, &lcs_table);
+    Some(IntraLineDiff {
+        removed_spans,
+        added_spans,
+    })
+}
+
+/// Split a line into the token stream that LCS aligns on. Identifier
+/// runs collapse to one token so renames stay atomic; every other byte
+/// (punctuation, whitespace, unicode) is its own token.
+fn tokenize_line(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let is_word = b.is_ascii_alphanumeric() || b == b'_';
+        if is_word {
+            let start = i;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if !(c.is_ascii_alphanumeric() || c == b'_') {
+                    break;
+                }
+                i += 1;
+            }
+            out.push(&line[start..i]);
+        } else {
+            // Non-ASCII bytes: emit the entire UTF-8 scalar as one
+            // token so we never split in the middle of a codepoint
+            // (which would produce a `&str` panic when indexing).
+            let ch_len = utf8_scalar_len(bytes, i);
+            out.push(&line[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    out
+}
+
+/// Number of bytes in the UTF-8 scalar starting at `bytes[i]`. For the
+/// ASCII fast path this is always 1; kept small so `tokenize_line` stays
+/// allocation-free.
+fn utf8_scalar_len(bytes: &[u8], i: usize) -> usize {
+    let b = bytes[i];
+    if b < 0x80 {
+        1
+    } else if b < 0xC0 {
+        // Continuation byte where a leader was expected — malformed
+        // input. Treat as 1 byte so we make forward progress instead
+        // of looping; the renderer will still see the bytes via the
+        // outer `&line[..]` slice.
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Classic quadratic LCS dp. Returns `(lcs_len, table)` where
+/// `table[i * (m + 1) + j]` is the LCS of `a[..i]` and `b[..j]`.
+fn lcs_table(a: &[&str], b: &[&str]) -> (usize, Vec<u16>) {
+    let n = a.len();
+    let m = b.len();
+    // u16 caps at 65k — lines in a reasonable source file stay well
+    // below that even for minified JS, so the extra compactness is
+    // free. If we ever blow the cap, saturating_add keeps us
+    // monotonic instead of wrapping.
+    let mut table = vec![0u16; (n + 1) * (m + 1)];
+    for i in 0..n {
+        for j in 0..m {
+            let idx = (i + 1) * (m + 1) + (j + 1);
+            let v = if a[i] == b[j] {
+                table[i * (m + 1) + j].saturating_add(1)
+            } else {
+                let up = table[i * (m + 1) + (j + 1)];
+                let left = table[(i + 1) * (m + 1) + j];
+                up.max(left)
+            };
+            table[idx] = v;
+        }
+    }
+    let lcs_len = table[(n + 1) * (m + 1) - 1] as usize;
+    (lcs_len, table)
+}
+
+/// Walk the LCS table from the bottom-right corner, emitting
+/// per-line span lists. `removed_spans` accumulates the old line
+/// (RemovedWord + Unchanged); `added_spans` the new line (AddedWord +
+/// Unchanged). Within each list, adjacent spans of the same kind get
+/// merged so `let x = 1;` → `let y = 1;` produces two tokens worth of
+/// highlight, not six.
+fn backtrack_spans(
+    a: &[&str],
+    b: &[&str],
+    table: &[u16],
+) -> (Vec<IntraLineSpan>, Vec<IntraLineSpan>) {
+    let n = a.len();
+    let m = b.len();
+    let stride = m + 1;
+
+    let mut removed_rev: Vec<IntraLineSpan> = Vec::new();
+    let mut added_rev: Vec<IntraLineSpan> = Vec::new();
+
+    let mut i = n;
+    let mut j = m;
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && a[i - 1] == b[j - 1] {
+            push_span(&mut removed_rev, IntraLineSpan::Unchanged(a[i - 1].into()));
+            push_span(&mut added_rev, IntraLineSpan::Unchanged(b[j - 1].into()));
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || table[i * stride + (j - 1)] >= table[(i - 1) * stride + j]) {
+            push_span(&mut added_rev, IntraLineSpan::AddedWord(b[j - 1].into()));
+            j -= 1;
+        } else {
+            push_span(
+                &mut removed_rev,
+                IntraLineSpan::RemovedWord(a[i - 1].into()),
+            );
+            i -= 1;
+        }
+    }
+
+    removed_rev.reverse();
+    added_rev.reverse();
+    (removed_rev, added_rev)
+}
+
+/// Append `span` onto `out`, merging with the previous element when
+/// both carry the same variant. Keeps spans coarse for the painter so
+/// runs of emphasized punctuation don't split into one rectangle per
+/// character.
+fn push_span(out: &mut Vec<IntraLineSpan>, span: IntraLineSpan) {
+    if let Some(last) = out.last_mut() {
+        match (last, &span) {
+            (IntraLineSpan::Unchanged(a), IntraLineSpan::Unchanged(b)) => {
+                // We're walking the table in reverse, so the new text
+                // precedes the existing accumulated text. Merge by
+                // prepending — kept linear because spans are short.
+                let mut merged = b.clone();
+                merged.push_str(a);
+                *a = merged;
+                return;
+            }
+            (IntraLineSpan::RemovedWord(a), IntraLineSpan::RemovedWord(b)) => {
+                let mut merged = b.clone();
+                merged.push_str(a);
+                *a = merged;
+                return;
+            }
+            (IntraLineSpan::AddedWord(a), IntraLineSpan::AddedWord(b)) => {
+                let mut merged = b.clone();
+                merged.push_str(a);
+                *a = merged;
+                return;
+            }
+            _ => {}
+        }
+    }
+    out.push(span);
+}
+
+#[cfg(test)]
+mod intra_line_tests {
+    use super::*;
+
+    /// Reassemble a span list into the original line text so the tests
+    /// can verify the partition is loss-free without caring about which
+    /// kind each token carries.
+    fn concat(spans: &[IntraLineSpan]) -> String {
+        spans
+            .iter()
+            .map(|s| match s {
+                IntraLineSpan::Unchanged(t)
+                | IntraLineSpan::RemovedWord(t)
+                | IntraLineSpan::AddedWord(t) => t.as_str(),
+            })
+            .collect()
+    }
+
+    fn removed_text(spans: &[IntraLineSpan]) -> String {
+        spans
+            .iter()
+            .filter_map(|s| match s {
+                IntraLineSpan::RemovedWord(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn added_text(spans: &[IntraLineSpan]) -> String {
+        spans
+            .iter()
+            .filter_map(|s| match s {
+                IntraLineSpan::AddedWord(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn identifier_rename_highlights_only_the_identifier() {
+        let removed = "let x = 1;";
+        let added = "let y = 1;";
+        let diff = intra_line_diff(removed, added).expect("similar enough to align");
+        assert_eq!(concat(&diff.removed_spans), removed);
+        assert_eq!(concat(&diff.added_spans), added);
+        assert_eq!(removed_text(&diff.removed_spans), "x");
+        assert_eq!(added_text(&diff.added_spans), "y");
+    }
+
+    #[test]
+    fn last_argument_change_highlights_only_that_argument() {
+        let removed = "foo(a, b, c)";
+        let added = "foo(a, b, d)";
+        let diff = intra_line_diff(removed, added).expect("similar enough to align");
+        assert_eq!(concat(&diff.removed_spans), removed);
+        assert_eq!(concat(&diff.added_spans), added);
+        assert_eq!(removed_text(&diff.removed_spans), "c");
+        assert_eq!(added_text(&diff.added_spans), "d");
+    }
+
+    #[test]
+    fn unrelated_lines_return_none() {
+        let diff = intra_line_diff("hello world", "goodbye moon");
+        assert!(
+            diff.is_none(),
+            "unrelated lines should fall back to whole-line rendering"
+        );
+    }
+
+    #[test]
+    fn empty_inputs_return_none() {
+        assert!(intra_line_diff("", "").is_none());
+    }
+
+    #[test]
+    fn identical_lines_produce_all_unchanged() {
+        let diff = intra_line_diff("same", "same").expect("identical lines align trivially");
+        assert!(diff
+            .removed_spans
+            .iter()
+            .all(|s| matches!(s, IntraLineSpan::Unchanged(_))));
+        assert!(diff
+            .added_spans
+            .iter()
+            .all(|s| matches!(s, IntraLineSpan::Unchanged(_))));
+    }
+
+    #[test]
+    fn punctuation_swap_is_localized() {
+        // Closing paren moved to a brace — everything else is shared,
+        // so only the final token should flip.
+        let removed = "call(x)";
+        let added = "call(x}";
+        let diff = intra_line_diff(removed, added).expect("similar enough to align");
+        assert_eq!(concat(&diff.removed_spans), removed);
+        assert_eq!(concat(&diff.added_spans), added);
+        assert_eq!(removed_text(&diff.removed_spans), ")");
+        assert_eq!(added_text(&diff.added_spans), "}");
+    }
+
+    #[test]
+    fn non_ascii_bytes_do_not_split_codepoints() {
+        // A Korean-rename mid-line: the diff must still reassemble the
+        // exact original strings and never slice inside a UTF-8 scalar
+        // (which would otherwise crash the `&str` indexing inside
+        // `tokenize_line`).
+        let removed = "label = \"안녕\";";
+        let added = "label = \"hello\";";
+        let diff = intra_line_diff(removed, added).expect("shared scaffolding aligns");
+        assert_eq!(concat(&diff.removed_spans), removed);
+        assert_eq!(concat(&diff.added_spans), added);
+    }
+}
