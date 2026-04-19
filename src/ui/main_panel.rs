@@ -772,6 +772,12 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
                 preflight,
             ));
         }
+        CommitAction::RewordPrompt(oid) => {
+            // Reword any-commit flow — kicks off the modal which
+            // owns the commit-tree + rebase --onto pipeline.
+            app.show_reword_modal(oid);
+            return out;
+        }
 
         // ---- background network ops ----
         CommitAction::Pull { branch } => {

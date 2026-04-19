@@ -743,13 +743,25 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
         ui.close_menu();
     }
 
-    // ---- HEAD-specific ----
+    // ---- Edit message (available for any reachable commit) ----
+    //
+    // HEAD path uses `commit --amend`; non-HEAD path uses the
+    // reword flow (backup tag → commit-tree → rebase --onto).
+    // We expose both under the same "Edit commit message" label
+    // so the menu doesn't advertise the mechanism.
+    ui.separator();
     if is_head {
-        ui.separator();
-        if ui.button("Edit commit message (amend)").clicked() {
+        if ui.button("Edit commit message…").clicked() {
             action = Some(CommitAction::AmendMessagePrompt);
             ui.close_menu();
         }
+    } else if ui.button("Edit commit message…").clicked() {
+        action = Some(CommitAction::RewordPrompt(row.oid));
+        ui.close_menu();
+    }
+
+    // ---- HEAD-specific (drop / move) ----
+    if is_head {
         if ui.button("Drop commit").clicked() {
             action = Some(CommitAction::DropCommitPrompt(row.oid));
             ui.close_menu();
