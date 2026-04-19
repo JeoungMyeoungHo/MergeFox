@@ -376,6 +376,42 @@ impl CloneSizePolicy {
     }
 }
 
+/// Default partial-clone mode the clone wizard pre-selects.
+///
+/// Most users won't change this — the default is `None` (full clone).
+/// Power users on mono-repo / game-engine / large-asset repositories can
+/// pin their preferred filter here so every new clone starts on the
+/// right footing without touching the advanced panel each time.
+///
+/// Kept narrow on purpose: `BlobLimit` picks up its threshold from
+/// `CloneDefaults::blob_limit_bytes`, and `TreeZero` still requires the
+/// user to type directory patterns at clone time (we have no way to
+/// guess what they want checked out). No sparse patterns are persisted
+/// here — the UI collects them per-clone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneFilterPolicy {
+    #[default]
+    None,
+    BlobNone,
+    /// Threshold lives on `CloneDefaults::blob_limit_bytes`.
+    BlobLimit,
+    /// Sparse directories come from the UI at clone time — this variant
+    /// just means "the radio starts pointing at tree:0".
+    TreeZero,
+}
+
+impl CloneFilterPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "Full clone",
+            Self::BlobNone => "Partial (blob:none)",
+            Self::BlobLimit => "Partial (blob:limit)",
+            Self::TreeZero => "Partial + sparse (tree:0)",
+        }
+    }
+}
+
 /// Tunable clone behaviour. Single struct so we can evolve the surface
 /// without breaking the config schema each time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +430,21 @@ pub struct CloneDefaults {
     /// shrinking Linux-kernel-scale clones 10× over full history.
     #[serde(default = "default_shallow_depth")]
     pub shallow_depth: u32,
+    /// Default selection for the partial-clone radio in the wizard. The
+    /// user can still override per-clone; this is only the starting
+    /// point.
+    #[serde(default)]
+    pub filter_policy: CloneFilterPolicy,
+    /// Threshold in bytes for `CloneFilterPolicy::BlobLimit`. Default
+    /// 1 MiB — big enough to hold most generated code / locale strings /
+    /// JSON configs (which users do want eagerly) while skipping
+    /// textures, pre-rendered videos, bundled binaries, etc.
+    ///
+    /// Storage is in bytes rather than KB/MB because `git` itself takes
+    /// a raw byte count for `--filter=blob:limit=<N>`; the UI converts
+    /// to/from human units for display.
+    #[serde(default = "default_blob_limit_bytes")]
+    pub blob_limit_bytes: u64,
 }
 
 impl Default for CloneDefaults {
@@ -402,6 +453,8 @@ impl Default for CloneDefaults {
             size_policy: CloneSizePolicy::Prompt,
             prompt_threshold_mb: default_prompt_threshold_mb(),
             shallow_depth: default_shallow_depth(),
+            filter_policy: CloneFilterPolicy::default(),
+            blob_limit_bytes: default_blob_limit_bytes(),
         }
     }
 }
@@ -412,6 +465,14 @@ fn default_prompt_threshold_mb() -> u32 {
 
 fn default_shallow_depth() -> u32 {
     100
+}
+
+fn default_blob_limit_bytes() -> u64 {
+    // 1 MiB — see the doc comment on `CloneDefaults::blob_limit_bytes`
+    // for why. Chosen in binary units because git reports and accepts
+    // powers of 1024 when humans type "1M", and decimal MB would be a
+    // small but confusing discrepancy.
+    1_048_576
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

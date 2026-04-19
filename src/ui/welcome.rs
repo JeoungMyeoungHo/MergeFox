@@ -2,9 +2,11 @@
 
 use std::path::PathBuf;
 
-use crate::app::{CloneSizePrompt, MergeFoxApp};
-use crate::clone::{self, Stage};
-use crate::config::{CloneSizePolicy, UiLanguage};
+use crate::app::{
+    BlobLimitUnit, CloneSizePrompt, LargeRepoMode, LargeRepoModeState, MergeFoxApp,
+};
+use crate::clone::{self, CloneFilter, CloneOpts, Stage};
+use crate::config::{CloneFilterPolicy, CloneSizePolicy, UiLanguage};
 use crate::git_url;
 use crate::providers::{
     self, AccountId, CreateRepositoryDraft, ProviderAccount, RemoteRepoOwner, RemoteRepoOwnerKind,
@@ -44,6 +46,11 @@ enum CloneDecision {
     Full,
     /// Spawn a shallow clone at the prompt's chosen depth.
     Shallow,
+    /// Spawn a partial clone with `--filter=blob:none` — the "one-click
+    /// recommended response" offered on the large-repo prompt. Fetches
+    /// every commit/tree object but defers blob downloads, which is the
+    /// single biggest saving for binary-heavy repos.
+    PartialBlobNone,
     /// Dismiss the prompt without cloning.
     Cancel,
 }
@@ -57,6 +64,10 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let recents = app.config.recents.clone();
     let connected_accounts = app.repo_browser_accounts();
     let labels = labels(app.config.ui_language.resolved());
+    // Snapshot the persisted clone defaults once per frame — they feed
+    // the first-time seed of `LargeRepoModeState`. Read once to avoid
+    // re-borrowing `app.config` while `state` holds a mutable borrow.
+    let clone_defaults = app.config.clone_defaults.clone();
     let mut intent = Intent::default();
 
     egui::CentralPanel::default().show(ctx, |ui| {
@@ -139,6 +150,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 intent.open_settings = true;
             }
         });
+
+        ui.add_space(8.0);
+        render_large_repo_mode_panel(ui, &mut state.large_repo_mode, &clone_defaults, &labels);
 
         ui.add_space(16.0);
 
@@ -1119,6 +1133,224 @@ fn labels(language: UiLanguage) -> Labels {
     }
 }
 
+/// Render the "Large repository mode (advanced)" collapsible beneath
+/// the unified input on the welcome page.
+///
+/// Design notes
+/// ------------
+/// * Collapsed by default. Anyone who doesn't need this feature shouldn't
+///   see it — the default full-clone path is unchanged.
+/// * The panel is purely UI state. We don't dispatch a clone from here —
+///   dispatch happens through the normal "Clone" button. This panel's
+///   job is to seed `state.large_repo_mode`, which
+///   `resolve_large_repo_opts` reads at dispatch time.
+/// * Localisation scope: deliberately English-only for this first cut.
+///   Adding this surface to every `Labels` locale would dwarf the rest
+///   of the change; the rest of the wizard already mixes English in a
+///   few locales (remote-repo creator, for instance). We can add
+///   translations in a follow-up.
+fn render_large_repo_mode_panel(
+    ui: &mut egui::Ui,
+    state: &mut LargeRepoModeState,
+    defaults: &crate::config::CloneDefaults,
+    _labels: &Labels,
+) {
+    // Seed from persisted defaults once, then leave alone. Seeding on
+    // every frame would stomp user edits; seeding only when the user
+    // first expands keeps the starting point sensible.
+    if !state.seeded {
+        state.shallow_depth = defaults.shallow_depth;
+        state.mode = match defaults.filter_policy {
+            CloneFilterPolicy::None => LargeRepoMode::Full,
+            CloneFilterPolicy::BlobNone => LargeRepoMode::PartialBlobNone,
+            CloneFilterPolicy::BlobLimit => LargeRepoMode::PartialBlobLimit,
+            CloneFilterPolicy::TreeZero => LargeRepoMode::PartialTreeZero,
+        };
+        // Default 1 MiB split as 1 MB for display.
+        let bytes = defaults.blob_limit_bytes.max(1);
+        if bytes % (1024 * 1024) == 0 {
+            state.blob_limit_unit = BlobLimitUnit::Mb;
+            state.blob_limit_value = (bytes / (1024 * 1024)).min(u32::MAX as u64) as u32;
+        } else {
+            state.blob_limit_unit = BlobLimitUnit::Kb;
+            state.blob_limit_value = (bytes / 1024).max(1).min(u32::MAX as u64) as u32;
+        }
+        if state.blob_limit_value == 0 {
+            state.blob_limit_value = 1;
+        }
+        state.seeded = true;
+    }
+
+    egui::CollapsingHeader::new("Large repository mode (advanced)")
+        .default_open(state.expanded)
+        .show(ui, |ui| {
+            state.expanded = true;
+            ui.label(
+                egui::RichText::new(
+                    "Use for monorepos, game engines, and large-binary repositories. \
+                     These options only apply to the next clone you start.",
+                )
+                .weak()
+                .size(11.0),
+            );
+            ui.add_space(4.0);
+
+            ui.radio_value(&mut state.mode, LargeRepoMode::Full, "Full clone");
+            ui.radio_value(&mut state.mode, LargeRepoMode::Shallow, "Shallow");
+            ui.radio_value(
+                &mut state.mode,
+                LargeRepoMode::PartialBlobNone,
+                "Partial (blob:none) — fetch blobs on demand",
+            );
+            ui.radio_value(
+                &mut state.mode,
+                LargeRepoMode::PartialBlobLimit,
+                "Partial (blob:limit) — skip blobs above a size threshold",
+            );
+            ui.radio_value(
+                &mut state.mode,
+                LargeRepoMode::PartialTreeZero,
+                "Partial + sparse (tree:0) — fetch only the directories you pick",
+            );
+
+            // Depth input — visible for Shallow always, and for the
+            // partial modes when the user opts in to combine the two.
+            ui.add_space(6.0);
+            match state.mode {
+                LargeRepoMode::Shallow => {
+                    ui.horizontal(|ui| {
+                        ui.label("Depth:");
+                        ui.add(egui::DragValue::new(&mut state.shallow_depth).clamp_range(1..=u32::MAX));
+                    });
+                }
+                LargeRepoMode::PartialBlobNone
+                | LargeRepoMode::PartialBlobLimit
+                | LargeRepoMode::PartialTreeZero => {
+                    ui.checkbox(
+                        &mut state.combine_shallow,
+                        "Also limit history depth (--depth=N)",
+                    );
+                    if state.combine_shallow {
+                        ui.horizontal(|ui| {
+                            ui.label("Depth:");
+                            ui.add(
+                                egui::DragValue::new(&mut state.shallow_depth)
+                                    .clamp_range(1..=u32::MAX),
+                            );
+                        });
+                    }
+                }
+                LargeRepoMode::Full => {}
+            }
+
+            if state.mode == LargeRepoMode::PartialBlobLimit {
+                ui.horizontal(|ui| {
+                    ui.label("Size threshold:");
+                    ui.add(
+                        egui::DragValue::new(&mut state.blob_limit_value)
+                            .clamp_range(1..=u32::MAX),
+                    );
+                    egui::ComboBox::from_id_source("blob-limit-unit")
+                        .selected_text(state.blob_limit_unit.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut state.blob_limit_unit,
+                                BlobLimitUnit::Kb,
+                                "KB",
+                            );
+                            ui.selectable_value(
+                                &mut state.blob_limit_unit,
+                                BlobLimitUnit::Mb,
+                                "MB",
+                            );
+                        });
+                    ui.weak("blobs smaller than this are fetched eagerly");
+                });
+            }
+
+            if state.mode == LargeRepoMode::PartialTreeZero {
+                ui.label("Sparse-checkout directories (one per line):");
+                ui.add(
+                    egui::TextEdit::multiline(&mut state.sparse_dirs_text)
+                        .desired_rows(4)
+                        .desired_width(560.0)
+                        .hint_text("src/\nREADME.md"),
+                );
+                if let Some(msg) = state.validation_error.as_ref() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, msg);
+                }
+                ui.weak(
+                    "Cone mode — list directories (not globs). \
+                     At least one entry is required for tree:0 clones.",
+                );
+            }
+        });
+}
+
+/// Parse the sparse-dirs textarea, stripping blank lines and trimming
+/// whitespace. Returns a list suitable to hand to `git sparse-checkout
+/// set` directly.
+fn parse_sparse_dirs(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Translate the UI state into `CloneOpts`. Validation lives here so
+/// both the Clone button and the large-repo prompt's "Partial" button
+/// see identical rules.
+///
+/// Returns `Err(msg)` when the user selected a combination we can't
+/// honour (currently: `TreeZero` with no sparse directories). The
+/// caller is responsible for routing that error into
+/// `state.large_repo_mode.validation_error` and aborting the clone.
+fn resolve_large_repo_opts(state: &LargeRepoModeState) -> Result<CloneOpts, String> {
+    let depth = match state.mode {
+        LargeRepoMode::Full => None,
+        LargeRepoMode::Shallow => Some(state.shallow_depth.max(1)),
+        LargeRepoMode::PartialBlobNone
+        | LargeRepoMode::PartialBlobLimit
+        | LargeRepoMode::PartialTreeZero => {
+            if state.combine_shallow {
+                Some(state.shallow_depth.max(1))
+            } else {
+                None
+            }
+        }
+    };
+
+    let filter = match state.mode {
+        LargeRepoMode::Full | LargeRepoMode::Shallow => CloneFilter::None,
+        LargeRepoMode::PartialBlobNone => CloneFilter::BlobNone,
+        LargeRepoMode::PartialBlobLimit => CloneFilter::BlobLimit {
+            bytes: state
+                .blob_limit_unit
+                .to_bytes(state.blob_limit_value.max(1)),
+        },
+        LargeRepoMode::PartialTreeZero => CloneFilter::TreeZero,
+    };
+
+    let sparse_dirs = if state.mode == LargeRepoMode::PartialTreeZero {
+        parse_sparse_dirs(&state.sparse_dirs_text)
+    } else {
+        Vec::new()
+    };
+
+    if matches!(filter, CloneFilter::TreeZero) && sparse_dirs.is_empty() {
+        return Err(
+            "Add at least one sparse-checkout directory before cloning (one per line)."
+                .to_string(),
+        );
+    }
+
+    Ok(CloneOpts {
+        depth,
+        filter,
+        sparse_dirs,
+    })
+}
+
 /// Render the "this repo is big, how do you want to clone it?" modal.
 /// Kept inline on the welcome page (no `egui::Window`) so it reads like a
 /// banner rather than a popup: the user is already staring at the clone
@@ -1141,6 +1373,20 @@ fn render_clone_size_prompt(
     ui.horizontal(|ui| {
         if ui.button(labels.clone_shallow_btn).clicked() {
             intent.clone_decision = Some(CloneDecision::Shallow);
+        }
+        // "Partial" is the recommended response for a large repo where
+        // the bulk of the bytes are blobs (assets, generated
+        // artifacts). We label it as "Partial" — the user learns the
+        // technical name via the tooltip / the post-clone banner.
+        if ui
+            .button("Partial (blob:none)")
+            .on_hover_text(
+                "Fetch commits and trees now, blobs on demand. \
+                 Usually the best trade-off for binary-heavy repos.",
+            )
+            .clicked()
+        {
+            intent.clone_decision = Some(CloneDecision::PartialBlobNone);
         }
         if ui.button(labels.clone_full_btn).clicked() {
             intent.clone_decision = Some(CloneDecision::Full);
@@ -1166,17 +1412,57 @@ fn format_size_mb(bytes: u64) -> String {
 /// `CloneSizePolicy`. The welcome flow never mutates `state.clone` or
 /// `state.clone_preflight` directly — they all pass through here and
 /// through `apply_clone_decision`.
+///
+/// Advanced-panel semantics
+/// ------------------------
+/// When the user has configured anything in the Large-repository-mode
+/// panel (non-`Full` radio selection, or sparse dirs typed in), we
+/// bypass the `CloneSizePolicy` preflight entirely — the user has
+/// already stated an intention, so we honour it without asking "do you
+/// want to go shallow?" on top of it. The preflight probe still runs
+/// when the panel is left at defaults.
 fn start_clone_with_policy(app: &mut MergeFoxApp, url: String, dest: PathBuf) {
     let policy = app.config.clone_defaults.size_policy;
     let shallow_depth = app.config.clone_defaults.shallow_depth;
     let threshold_mb = app.config.clone_defaults.prompt_threshold_mb;
     let accounts = app.config.provider_accounts.clone();
 
+    // Resolve advanced-panel options before we borrow `state` mutably
+    // so the validation error can be surfaced back on the same state.
+    let advanced_opts = app
+        .active_welcome_state()
+        .map(|s| (s.large_repo_mode.mode, resolve_large_repo_opts(&s.large_repo_mode)));
+
     let Some(state) = app.active_welcome_state_mut() else {
         return;
     };
     if state.clone.is_some() || state.clone_preflight.is_some() {
         return; // already doing something
+    }
+
+    // Clear any stale validation from a previous submit.
+    state.large_repo_mode.validation_error = None;
+
+    let advanced_in_effect = match &advanced_opts {
+        Some((mode, _)) => *mode != LargeRepoMode::Full,
+        None => false,
+    };
+
+    // Hand-configured advanced mode short-circuits the preflight — the
+    // user has already picked how they want to clone.
+    if advanced_in_effect {
+        let Some((_, resolved)) = advanced_opts else {
+            return;
+        };
+        match resolved {
+            Ok(opts) => {
+                state.clone = Some(clone::spawn_with_opts(url, dest, opts, accounts));
+            }
+            Err(msg) => {
+                state.large_repo_mode.validation_error = Some(msg);
+            }
+        }
+        return;
     }
 
     match policy {
@@ -1237,6 +1523,24 @@ fn apply_clone_decision(app: &mut MergeFoxApp, decision: CloneDecision) {
                 prompt.url,
                 prompt.dest,
                 Some(shallow_depth),
+                accounts,
+            ));
+        }
+        CloneDecision::PartialBlobNone => {
+            // Recommended one-click answer for big repos: keep the full
+            // commit/tree graph (so `git log`, `git blame`, branch
+            // navigation still work offline) but lazy-fetch blobs. This
+            // is usually 10–20× less data than a full clone on asset-
+            // heavy projects, and the user can still promote to full
+            // later with `git fetch --refetch --filter=…`.
+            let opts = CloneOpts {
+                filter: CloneFilter::BlobNone,
+                ..CloneOpts::default()
+            };
+            state.clone = Some(clone::spawn_with_opts(
+                prompt.url,
+                prompt.dest,
+                opts,
                 accounts,
             ));
         }
