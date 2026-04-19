@@ -9,6 +9,7 @@ pub mod commit_modal;
 pub mod conflicts;
 pub mod diff_view;
 pub mod file_preview;
+pub mod find_fix;
 pub mod fonts;
 pub mod forge;
 pub mod graph;

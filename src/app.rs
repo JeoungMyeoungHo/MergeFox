@@ -152,6 +152,17 @@ pub struct MergeFoxApp {
     /// is a history rewrite and queueing a second would create a
     /// race on the branch ref.
     pub reword_task: Option<RewordTask>,
+    /// "Find & replace across history" modal state (palette / top-bar
+    /// entry). Carries the current search pattern + replacement +
+    /// scan results so tab switches don't lose them.
+    pub find_fix_modal: Option<crate::ui::find_fix::FindFixModalState>,
+    /// In-flight find-and-fix read-only scan. Streams results back
+    /// into `find_fix_modal.working_tree_results` / `commit_results`
+    /// when it finishes. Non-destructive — safe to cancel by dropping.
+    pub find_fix_scan_task: Option<FindFixScanTask>,
+    /// In-flight find-and-fix apply worker. Destructive; we cap at one
+    /// at a time for the same reason as the reword task.
+    pub find_fix_apply_task: Option<FindFixApplyTask>,
 }
 
 /// Worker-thread handle for an in-flight basket revert. Opaque to the
@@ -170,6 +181,26 @@ pub struct RewordTask {
     pub repo_path: std::path::PathBuf,
     pub target_oid: gix::ObjectId,
     pub rx: std::sync::mpsc::Receiver<std::result::Result<crate::git::RewordOutcome, String>>,
+}
+
+/// Worker-thread handle for an in-flight find-and-fix scan. Read-only;
+/// on success we populate the modal's result lists from the outcome.
+pub struct FindFixScanTask {
+    pub repo_path: std::path::PathBuf,
+    pub pattern: String,
+    pub rx: std::sync::mpsc::Receiver<
+        std::result::Result<crate::git::FindFixScanResult, String>,
+    >,
+}
+
+/// Worker-thread handle for an in-flight find-and-fix apply. Ownership
+/// of the modal state stays on the main thread — the worker just sends
+/// the structured outcome back.
+pub struct FindFixApplyTask {
+    pub repo_path: std::path::PathBuf,
+    pub rx: std::sync::mpsc::Receiver<
+        std::result::Result<crate::git::FindFixApplyOutcome, String>,
+    >,
 }
 
 /// Worker-thread handle for an in-flight basket squash. Mirrors
@@ -1044,6 +1075,9 @@ impl MergeFoxApp {
             basket_squash_task: None,
             reword_modal: None,
             reword_task: None,
+            find_fix_modal: None,
+            find_fix_scan_task: None,
+            find_fix_apply_task: None,
         }
     }
 
@@ -1696,6 +1730,258 @@ impl MergeFoxApp {
                     m.busy = false;
                 }
                 self.notify_err_with_detail("Reword failed to start.", err);
+            }
+        }
+    }
+
+    /// Open the "Find & replace across history" modal. Idempotent — a
+    /// second trigger while it's already open is a no-op so a double
+    /// shortcut press doesn't clobber the user's in-progress scan.
+    pub fn show_find_fix_modal(&mut self) {
+        if !matches!(self.view, View::Workspace(_)) {
+            self.notify_info("Open a repository first.");
+            return;
+        }
+        if self.find_fix_modal.is_some() {
+            return;
+        }
+        self.find_fix_modal = Some(crate::ui::find_fix::FindFixModalState::new());
+    }
+
+    /// Kick off a read-only scan for the current modal pattern. Safe to
+    /// call repeatedly — if a scan is already in flight we refuse so
+    /// the result list doesn't flicker between two workers' outputs.
+    pub fn start_find_fix_scan(&mut self) {
+        let Some(state) = self.find_fix_modal.as_ref() else {
+            return;
+        };
+        if self.find_fix_scan_task.is_some() {
+            self.notify_info("A scan is already running — wait for it to finish.");
+            return;
+        }
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        let repo_path = tabs.current().repo.path().to_path_buf();
+        let pattern = state.pattern.clone();
+        let include_wt = state.include_working_tree;
+        let include_cm = state.include_commit_messages;
+        let limit = state.commit_history_limit;
+        if let Some(m) = self.find_fix_modal.as_mut() {
+            m.scan_busy = true;
+            m.last_scan_error = None;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.egui_ctx.clone();
+        let worker_path = repo_path.clone();
+        let worker_pattern = pattern.clone();
+        std::thread::spawn(move || {
+            let result =
+                crate::git::find_fix_scan(&worker_path, &worker_pattern, include_wt, include_cm, limit)
+                    .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.find_fix_scan_task = Some(FindFixScanTask {
+            repo_path,
+            pattern,
+            rx,
+        });
+    }
+
+    /// Drain the scan channel. Populates the modal's result lists on
+    /// success; clears `scan_busy` either way so the UI can re-enable
+    /// the Search button.
+    pub fn poll_find_fix_scan(&mut self) {
+        let Some(task) = self.find_fix_scan_task.as_ref() else {
+            return;
+        };
+        let outcome = match task.rx.try_recv() {
+            Ok(o) => o,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.find_fix_scan_task = None;
+                if let Some(m) = self.find_fix_modal.as_mut() {
+                    m.scan_busy = false;
+                    m.last_scan_error = Some("Scan worker exited without a result.".into());
+                }
+                return;
+            }
+        };
+        self.find_fix_scan_task = None;
+
+        let Some(state) = self.find_fix_modal.as_mut() else {
+            return;
+        };
+        state.scan_busy = false;
+        state.scanned_at_least_once = true;
+        match outcome {
+            Ok(result) => {
+                state.working_tree_results = result.working_tree;
+                state.commit_results = result.commit_messages;
+                // Fresh scan ⇒ prune any stale ticks from an earlier
+                // result set so the Apply count is honest.
+                let wt_paths: std::collections::BTreeSet<std::path::PathBuf> = state
+                    .working_tree_results
+                    .iter()
+                    .map(|m| m.path.clone())
+                    .collect();
+                state.selected_paths.retain(|p| wt_paths.contains(p));
+                let commit_oids: std::collections::BTreeSet<gix::ObjectId> = state
+                    .commit_results
+                    .iter()
+                    .map(|m| m.oid)
+                    .collect();
+                state.selected_commits.retain(|o| commit_oids.contains(o));
+                state.last_scan_error = None;
+            }
+            Err(err) => {
+                state.working_tree_results.clear();
+                state.commit_results.clear();
+                state.last_scan_error = Some(err);
+            }
+        }
+    }
+
+    /// Kick off the destructive apply worker. Builds an `ApplyPlan`
+    /// from the currently-ticked modal entries and routes through the
+    /// backup-tag + auto-stash envelope in `find_fix_ops::apply`.
+    pub fn start_find_fix_apply(&mut self) {
+        let Some(state) = self.find_fix_modal.as_ref() else {
+            return;
+        };
+        if self.find_fix_apply_task.is_some() {
+            self.notify_info("A find-and-fix apply is already in progress — wait for it.");
+            return;
+        }
+        if state.selected_paths.is_empty() && state.selected_commits.is_empty() {
+            self.notify_info("Tick at least one file or commit before applying.");
+            return;
+        }
+        if state.pattern.is_empty() {
+            self.notify_err("Cannot apply an empty search pattern.");
+            return;
+        }
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        let repo_path = tabs.current().repo.path().to_path_buf();
+
+        let plan = crate::git::FindFixApplyPlan {
+            pattern: state.pattern.clone(),
+            replacement: state.replacement.clone(),
+            apply_working_tree_paths: state.selected_paths.iter().cloned().collect(),
+            apply_commit_oids: state.selected_commits.iter().copied().collect(),
+        };
+
+        if let Some(m) = self.find_fix_modal.as_mut() {
+            m.apply_busy = true;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.egui_ctx.clone();
+        let worker_path = repo_path.clone();
+        std::thread::spawn(move || {
+            let result =
+                crate::git::find_fix_apply(&worker_path, plan).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.find_fix_apply_task = Some(FindFixApplyTask { repo_path, rx });
+    }
+
+    /// Drain the apply channel. On success we rebuild the graph and
+    /// clear the modal so the user sees the "succeeded" toast plus
+    /// fresh state; on abort we keep the modal open so they can inspect
+    /// the partial selection without re-entering the pattern.
+    pub fn poll_find_fix_apply(&mut self) {
+        let Some(task) = self.find_fix_apply_task.as_ref() else {
+            return;
+        };
+        let outcome = match task.rx.try_recv() {
+            Ok(o) => o,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.find_fix_apply_task = None;
+                if let Some(m) = self.find_fix_modal.as_mut() {
+                    m.apply_busy = false;
+                }
+                self.notify_err(
+                    "Find-and-fix worker died before reporting — inspect backup tags to recover.",
+                );
+                return;
+            }
+        };
+        let repo_path = task.repo_path.clone();
+        self.find_fix_apply_task = None;
+
+        match outcome {
+            Ok(crate::git::FindFixApplyOutcome::Success {
+                working_tree_files_changed,
+                commit_oid_remap,
+                backup_tag,
+                auto_stashed,
+            }) => {
+                let scope = self.active_graph_scope();
+                self.rebuild_graph(scope);
+                // Drop modal state so a fresh invocation starts clean —
+                // the result toast + activity log cover the "what
+                // landed" summary.
+                self.find_fix_modal = None;
+
+                let mut parts: Vec<String> = Vec::new();
+                if working_tree_files_changed > 0 {
+                    parts.push(format!(
+                        "{working_tree_files_changed} working-tree file{} rewritten",
+                        if working_tree_files_changed == 1 { "" } else { "s" }
+                    ));
+                }
+                if !commit_oid_remap.is_empty() {
+                    parts.push(format!(
+                        "{} commit message{} rewritten",
+                        commit_oid_remap.len(),
+                        if commit_oid_remap.len() == 1 { "" } else { "s" }
+                    ));
+                }
+                let detail_summary = if parts.is_empty() {
+                    "No files changed.".into()
+                } else {
+                    parts.join(" · ")
+                };
+                let backup_line = backup_tag
+                    .as_ref()
+                    .map(|t| format!("\nBackup tag: {t}"))
+                    .unwrap_or_default();
+                let stash_line = if auto_stashed {
+                    "\nAuto-stash restored."
+                } else {
+                    ""
+                };
+                let _ = repo_path;
+                self.notify_ok_with_detail(
+                    "Find & fix applied.",
+                    format!("{detail_summary}{backup_line}{stash_line}"),
+                );
+            }
+            Ok(crate::git::FindFixApplyOutcome::Aborted { reason, backup_tag }) => {
+                if let Some(m) = self.find_fix_modal.as_mut() {
+                    m.apply_busy = false;
+                }
+                let detail = match backup_tag {
+                    Some(tag) => format!(
+                        "Reason: {reason}\n\nRolled back to backup tag {tag}. \
+                         The tag is left in place for manual recovery."
+                    ),
+                    None => format!("Reason: {reason}"),
+                };
+                self.notify_err_with_detail("Find & fix aborted.", detail);
+            }
+            Err(err) => {
+                if let Some(m) = self.find_fix_modal.as_mut() {
+                    m.apply_busy = false;
+                }
+                self.notify_err_with_detail("Find & fix failed to start.", err);
             }
         }
     }
@@ -5604,6 +5890,8 @@ impl eframe::App for MergeFoxApp {
         self.poll_graph_tasks();
         self.poll_basket_revert();
         self.poll_reword_task();
+        self.poll_find_fix_scan();
+        self.poll_find_fix_apply();
         self.poll_basket_squash();
         self.drain_image_evictions(ctx);
         // Drain the async preview-decoder pool into its shared cache.
@@ -5652,6 +5940,7 @@ impl eframe::App for MergeFoxApp {
         ui::rebase::show(ctx, self);
         ui::conflicts::show(ctx, self);
         ui::reword::show(ctx, self);
+        ui::find_fix::show(ctx, self);
         self.handle_commit_basket_bar(ctx);
         self.poll_combined_diff();
         self.handle_basket_focus_modal(ctx);
@@ -5667,6 +5956,9 @@ impl eframe::App for MergeFoxApp {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.basket_squash_task.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        if self.find_fix_scan_task.is_some() || self.find_fix_apply_task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.provider_oauth_start_task.is_some() || self.provider_oauth_poll_task.is_some() {

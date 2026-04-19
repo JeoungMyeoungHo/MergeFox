@@ -96,6 +96,15 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let valid_paths: std::collections::BTreeSet<PathBuf> =
         entries.iter().map(|e| e.path.clone()).collect();
     commit_modal.selection.retain(|p| valid_paths.contains(p));
+
+    // Commit-message linter: load rules for the active repo and run
+    // them against the current draft every frame. `load_rules` returns
+    // an empty ruleset when the file is absent, so this costs ~0 for
+    // repos that never opt in.
+    let lint_rules = crate::git::load_message_lint_rules(ws.repo.path()).unwrap_or_default();
+    let lint_findings_snapshot: Vec<crate::git::LintFinding> =
+        crate::git::lint_message(&commit_modal.message, &lint_rules);
+    let has_lint_error = lint_findings_snapshot.iter().any(|f| f.is_error());
     if commit_modal
         .selection_anchor
         .as_ref()
@@ -161,6 +170,13 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     }
                 });
             }
+
+            // ---- Commit-message linter preflight -------------------------
+            // Findings are computed fresh each frame against the current
+            // text. Errors block the Commit buttons below; warnings just
+            // surface a banner. Auto-fix is offered when any finding
+            // carries a `replacement`.
+            render_lint_banner(ui, commit_modal, lint_findings_snapshot.as_slice());
 
             ui.add_space(6.0);
             ui.separator();
@@ -246,7 +262,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     result = CommitIntent::Cancel;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let msg_ok = !commit_modal.message.trim().is_empty();
+                    let msg_ok = !commit_modal.message.trim().is_empty() && !has_lint_error;
                     let any_staged = staged_count > 0;
                     let amend_author_ok = !commit_modal.amend_author_override
                         || (!commit_modal.amend_author_name.trim().is_empty()
@@ -344,6 +360,81 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     }
 
     poll_ai_task(app);
+}
+
+/// Render the commit-message linter banner. One row per finding +
+/// an "Apply fixes" button when any finding carries a `replacement`.
+/// Errors show in red (and the caller disables Commit); warnings show
+/// in amber and merely inform.
+fn render_lint_banner(
+    ui: &mut egui::Ui,
+    commit_modal: &mut CommitModal,
+    findings: &[crate::git::LintFinding],
+) {
+    if findings.is_empty() {
+        return;
+    }
+    let any_fixable = findings.iter().any(|f| f.replacement.is_some());
+    let has_error = findings.iter().any(|f| f.is_error());
+    let accent = if has_error {
+        Color32::from_rgb(235, 108, 108)
+    } else {
+        Color32::from_rgb(240, 180, 96)
+    };
+    ui.add_space(8.0);
+    egui::Frame::none()
+        .fill(ui.visuals().extreme_bg_color)
+        .stroke(egui::Stroke::new(1.0, accent))
+        .rounding(4.0)
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let header = if has_error {
+                    "⛔ Commit blocked by message lint"
+                } else {
+                    "⚠ Commit message lint"
+                };
+                ui.label(RichText::new(header).color(accent).strong());
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if any_fixable && ui.small_button("Apply fixes").clicked() {
+                            commit_modal.message =
+                                crate::git::lint_auto_fix(&commit_modal.message, findings);
+                        }
+                    },
+                );
+            });
+            ui.add_space(4.0);
+            for f in findings {
+                ui.horizontal_wrapped(|ui| {
+                    let tag = if f.is_error() { "error" } else { "warn" };
+                    ui.label(
+                        RichText::new(format!("[{tag}]"))
+                            .monospace()
+                            .size(11.0)
+                            .color(accent)
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(format!("'{}'", f.pattern))
+                            .monospace()
+                            .size(11.5),
+                    );
+                    if let Some(rep) = &f.replacement {
+                        ui.label(
+                            RichText::new(format!("→ '{rep}'"))
+                                .monospace()
+                                .size(11.5)
+                                .weak(),
+                        );
+                    }
+                    if let Some(reason) = &f.reason {
+                        ui.label(RichText::new(format!("— {reason}")).size(11.5));
+                    }
+                });
+            }
+        });
 }
 
 #[derive(Clone, Copy, PartialEq)]

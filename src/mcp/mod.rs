@@ -18,6 +18,7 @@
 pub mod action_preview;
 pub mod activity_log;
 pub mod forge;
+pub mod git_tools;
 pub mod server;
 pub mod types;
 

@@ -85,6 +85,11 @@ thiserror = "1"
 # Serde + persistence
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `toml` is used by the commit-message linter to read
+# `.mergefox/rules.toml`. `toml_edit` is already transitively in the
+# dep graph; adding the small `toml` facade is cheaper than inventing a
+# second config format.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # OS integration

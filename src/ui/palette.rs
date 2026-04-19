@@ -43,6 +43,7 @@ pub enum PaletteAction {
     OpenCommitModal,
     BlameCurrentFile,
     OpenBisect,
+    OpenFindFix,
     ExportJournal,
     PushTag(String),
     PushAllTags,
@@ -299,6 +300,11 @@ fn collect(app: &MergeFoxApp) -> Vec<PaletteCommand> {
             action: PaletteAction::OpenBisect,
         });
         out.push(PaletteCommand {
+            label: "Find & replace across history…".into(),
+            hint: Some("scrub a term from WT + commits".into()),
+            action: PaletteAction::OpenFindFix,
+        });
+        out.push(PaletteCommand {
             label: "Export journal to JSON…".into(),
             hint: None,
             action: PaletteAction::ExportJournal,
@@ -449,6 +455,9 @@ fn execute(app: &mut MergeFoxApp, action: PaletteAction) {
         PaletteAction::OpenBisect => {
             app.bisect_ui.open = true;
             app.bisect_ui.status = None;
+        }
+        PaletteAction::OpenFindFix => {
+            app.show_find_fix_modal();
         }
         PaletteAction::ExportJournal => {
             app.export_journal_to_file();
