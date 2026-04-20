@@ -143,6 +143,20 @@ pub struct MergeFoxApp {
     /// backup tag), so queueing a second behind the first would be
     /// user-hostile.
     pub basket_squash_task: Option<BasketSquashTask>,
+    /// In-flight LFS lock / unlock worker. At most one at a time
+    /// per app (not per tab) because a lock op mutates a remote
+    /// resource — if the user rapid-fires clicks we'd rather
+    /// coalesce than serialise racing commands against the lock
+    /// server. The task's `repo_path` is how we route the result
+    /// back to the right tab.
+    pub lfs_lock_action_task: Option<LfsLockActionTask>,
+    /// Pending "force unlock" confirmation — `Some` = modal open.
+    /// We don't funnel this through the generic `PendingPrompt`
+    /// machinery because force-unlock is a cross-cutting lock-server
+    /// action, not a destructive repo op, and widening `ConfirmKind`
+    /// for a single extra case would churn several unrelated match
+    /// arms. See `ui::sidebar::ForceUnlockConfirm`.
+    pub force_unlock_confirm: Option<crate::ui::sidebar::ForceUnlockConfirm>,
 }
 
 /// Worker-thread handle for an in-flight basket revert. Opaque to the
@@ -166,6 +180,52 @@ pub struct BasketSquashTask {
     pub repo_path: std::path::PathBuf,
     pub requested: usize,
     pub rx: std::sync::mpsc::Receiver<crate::git::SquashOutcome>,
+}
+
+/// Worker-thread handle for an in-flight `git lfs locks --json`
+/// refresh. We keep the `repo_path` on the handle alongside the
+/// receiver so the main-loop poller can match the result back to
+/// the correct tab — a late-arriving refresh from a tab the user
+/// has since closed simply gets dropped when the tab's field is
+/// cleared.
+pub struct LfsLocksRefreshTask {
+    pub repo_path: std::path::PathBuf,
+    pub rx: std::sync::mpsc::Receiver<crate::git::LfsListResult>,
+}
+
+/// Outcome of a one-shot lock / unlock / force-unlock worker. We
+/// push toasts based on which variant lands, and always trigger a
+/// lock-list refresh afterwards so the sidebar catches up even if
+/// the op failed (the server might now report a different state
+/// than we assumed).
+pub enum LfsLockActionOutcome {
+    /// `git lfs lock <path>` succeeded.
+    Locked(crate::git::LfsLock),
+    /// `git lfs unlock <path>` succeeded. `forced` records whether
+    /// `--force` was passed, so the toast wording can distinguish
+    /// "Unlocked" from "Force unlocked".
+    Unlocked { path: std::path::PathBuf, forced: bool },
+    /// `git lfs unlock` refused because the caller isn't the owner.
+    /// UI offers a confirm prompt → retry with `force = true`.
+    NotOwner { path: std::path::PathBuf },
+    /// LFS isn't available for this repo (server doesn't speak
+    /// locks, not configured, etc.). UI shows the inline reason
+    /// instead of an error toast.
+    Unavailable(String),
+    /// Everything else — raw stderr for the user to inspect.
+    Failed { summary: String, detail: String },
+}
+
+/// Worker-thread handle for a one-shot lock / unlock op. Mirrors
+/// the shape of the other per-tab task structs. `path` is carried
+/// for toast text and so a second click on the same file while the
+/// first worker is in flight can be coalesced at the UI layer if
+/// we want (currently we just ignore such clicks — spawning a
+/// second worker would race on the same lock row).
+pub struct LfsLockActionTask {
+    pub repo_path: std::path::PathBuf,
+    pub path: std::path::PathBuf,
+    pub rx: std::sync::mpsc::Receiver<LfsLockActionOutcome>,
 }
 
 #[derive(Default)]
@@ -612,6 +672,34 @@ pub struct WorkspaceState {
     /// Whether the Working Tree virtual node is selected (like a commit selection).
     /// When true, the diff panel shows working tree changes instead of a commit.
     pub selected_working_tree: bool,
+    /// High-level profile this workspace was opened under. Drives
+    /// `profile_rules` gates that turn specialised UI surfaces on or
+    /// off — today that's the Git LFS lock panel + file-tree lock
+    /// glyphs, but the same rule set is where future profile-gated
+    /// surfaces will plug in.
+    pub workspace_profile: crate::ui::profile_rules::WorkspaceProfile,
+    /// Cached LFS lock list for this repo's working tree. Refreshed on
+    /// demand (panel open / after lock/unlock) rather than per-frame
+    /// because each refresh shells out to `git lfs locks`.
+    pub lfs_locks: Option<Vec<crate::git::LfsLock>>,
+    /// Reason string when LFS isn't available for this repo. `Some`
+    /// means we've tried and it failed (server doesn't speak locks,
+    /// no `.lfsconfig`, etc.); `None` paired with `lfs_locks: Some`
+    /// means we have current data; `None` paired with `lfs_locks:
+    /// None` means we haven't tried yet.
+    pub lfs_locks_unavailable_reason: Option<String>,
+    /// In-flight `git lfs locks --json` refresh task. Mirrors other
+    /// per-tab worker structs — polled once per frame from the main
+    /// `update` loop, result installed into `lfs_locks` /
+    /// `lfs_locks_unavailable_reason`.
+    pub lfs_locks_refresh_task: Option<LfsLocksRefreshTask>,
+    /// Current-user name as reported by `git config user.name`,
+    /// cached at repo open so the "do I own this lock?" check in the
+    /// sidebar doesn't shell out on every frame. Empty string when
+    /// git config has no user.name configured — which just means
+    /// every lock will render as owned by someone else, the safe
+    /// failure mode.
+    pub git_user_name: String,
 }
 
 #[derive(Default)]
@@ -1024,6 +1112,8 @@ impl MergeFoxApp {
             basket_revert_task: None,
             basket_squash_confirm: None,
             basket_squash_task: None,
+            lfs_lock_action_task: None,
+            force_unlock_confirm: None,
         }
     }
 
@@ -1998,6 +2088,34 @@ impl MergeFoxApp {
             .map(str::to_owned)
             .unwrap_or_else(|| repo_path.display().to_string());
         let lfs_scan = spawn_lfs_scan(&repo_path);
+        // Read `user.name` once at repo open — the LFS lock panel
+        // compares this string against each lock's owner to decide
+        // which rows get a native "Unlock" button vs. a
+        // force-unlock affordance. Reading it per frame would shell
+        // out to git on every paint; reading it once here is enough
+        // because `.git/config` changes are rare at runtime and the
+        // cost of being slightly stale is cosmetic (the lock still
+        // works either way).
+        let git_user_name =
+            crate::git::cli::run_line(&repo_path, ["config", "user.name"]).unwrap_or_default();
+        // Detect the workspace profile for lock-related surfaces.
+        // For now this is a simple heuristic: if the repo has any
+        // LFS-tracked patterns in `.gitattributes`, assume the user
+        // wants the GameDev surfaces on. Users who want to override
+        // this get a settings toggle in a follow-up — the important
+        // thing today is that non-LFS repos stay on the General
+        // profile and see zero change.
+        let workspace_profile = detect_workspace_profile(&repo_path);
+        // Queue one refresh of the lock list on repo open when the
+        // profile opts in. General-profile repos never trigger this
+        // shell-out so we don't pay the `git lfs locks` cost on
+        // text-only projects.
+        let rules = crate::ui::profile_rules::rules_for(workspace_profile);
+        let lfs_locks_refresh_task = if rules.show_lfs_lock_controls {
+            Some(spawn_lfs_locks_refresh(&repo_path))
+        } else {
+            None
+        };
 
         let new_ws = WorkspaceState {
             repo,
@@ -2041,6 +2159,11 @@ impl MergeFoxApp {
             selected_working_file: None,
             working_file_diff: None,
             selected_working_tree: false,
+            workspace_profile,
+            lfs_locks: None,
+            lfs_locks_unavailable_reason: None,
+            lfs_locks_refresh_task,
+            git_user_name,
         };
 
         // If we came from an existing workspace, append the new tab
@@ -5041,6 +5164,140 @@ impl MergeFoxApp {
             }
         }
     }
+
+    /// Drain any LFS lock-list refresh results that have arrived
+    /// since last frame. Kept in the same shape as `poll_lfs_scan`
+    /// so a refresh that finishes on a background tab still installs
+    /// its result (and isn't silently dropped when the user switches
+    /// back to it later).
+    pub(crate) fn poll_lfs_locks_refresh(&mut self) {
+        let View::Workspace(tabs) = &mut self.view else {
+            return;
+        };
+        for tab in &mut tabs.tabs {
+            let Some(task) = tab.lfs_locks_refresh_task.as_ref() else {
+                continue;
+            };
+            let Ok(result) = task.rx.try_recv() else {
+                continue;
+            };
+            tab.lfs_locks_refresh_task = None;
+            match result {
+                crate::git::LfsListResult::Ok { locks } => {
+                    tab.lfs_locks = Some(locks);
+                    tab.lfs_locks_unavailable_reason = None;
+                }
+                crate::git::LfsListResult::Unavailable { reason } => {
+                    tab.lfs_locks = Some(Vec::new());
+                    tab.lfs_locks_unavailable_reason = Some(reason);
+                }
+            }
+        }
+    }
+
+    /// Kick off a fresh `git lfs locks --json` refresh for the
+    /// active tab. Idempotent — if one is already in flight we
+    /// return without starting a second (the first result will
+    /// land and refresh the UI on its own).
+    pub fn refresh_active_lfs_locks(&mut self) {
+        let View::Workspace(tabs) = &mut self.view else {
+            return;
+        };
+        let ws = tabs.current_mut();
+        let rules = crate::ui::profile_rules::rules_for(ws.workspace_profile);
+        if !rules.show_lfs_lock_controls {
+            return;
+        }
+        if ws.lfs_locks_refresh_task.is_some() {
+            return;
+        }
+        let repo_path = ws.repo.path().to_path_buf();
+        ws.lfs_locks_refresh_task = Some(spawn_lfs_locks_refresh(&repo_path));
+    }
+
+    /// Spawn a lock worker — `git lfs lock <path>`. Refuses to
+    /// stack a second worker if one is already in flight; we
+    /// prefer the user to wait 200ms for the first to complete
+    /// rather than race two commands against the lock server.
+    pub fn start_lfs_lock(&mut self, rel_path: std::path::PathBuf) {
+        if self.lfs_lock_action_task.is_some() {
+            self.notify_info("LFS lock already in flight — wait for it to finish.");
+            return;
+        }
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        let repo_path = tabs.current().repo.path().to_path_buf();
+        self.lfs_lock_action_task = Some(spawn_lfs_lock(repo_path, rel_path));
+    }
+
+    /// Spawn an unlock worker. `force = true` passes `--force`
+    /// (for admin override of another user's lock). Same
+    /// single-in-flight rule as `start_lfs_lock`.
+    pub fn start_lfs_unlock(&mut self, rel_path: std::path::PathBuf, force: bool) {
+        if self.lfs_lock_action_task.is_some() {
+            self.notify_info("LFS unlock already in flight — wait for it to finish.");
+            return;
+        }
+        let View::Workspace(tabs) = &self.view else {
+            return;
+        };
+        let repo_path = tabs.current().repo.path().to_path_buf();
+        self.lfs_lock_action_task = Some(spawn_lfs_unlock(repo_path, rel_path, force));
+    }
+
+    /// Drain the lock-action worker and surface a toast. Always
+    /// queues a list refresh afterwards — the server may have
+    /// changed state even on failure (another user took the lock
+    /// while we were deliberating) and the UI shouldn't lie.
+    pub(crate) fn poll_lfs_lock_action(&mut self) {
+        let Some(task) = self.lfs_lock_action_task.as_ref() else {
+            return;
+        };
+        let Ok(outcome) = task.rx.try_recv() else {
+            return;
+        };
+        let task_repo_path = task.repo_path.clone();
+        self.lfs_lock_action_task = None;
+
+        match outcome {
+            LfsLockActionOutcome::Locked(lock) => {
+                self.notify_ok(format!("Locked {}", lock.path.display()));
+            }
+            LfsLockActionOutcome::Unlocked { path, forced } => {
+                if forced {
+                    self.notify_ok(format!("Force unlocked {}", path.display()));
+                } else {
+                    self.notify_ok(format!("Unlocked {}", path.display()));
+                }
+            }
+            LfsLockActionOutcome::NotOwner { path } => {
+                self.notify_warn(format!(
+                    "Can't unlock {}: owned by another user. Use 'Force unlock' to override.",
+                    path.display()
+                ));
+            }
+            LfsLockActionOutcome::Unavailable(reason) => {
+                self.notify_info(format!("LFS locks unavailable: {reason}"));
+            }
+            LfsLockActionOutcome::Failed { summary, detail } => {
+                self.notify_err_with_detail(summary, detail);
+            }
+        }
+        // Always refresh the active tab's lock list — the op's
+        // result may have mutated server-side state we haven't
+        // captured yet. Scope to the tab the worker was running
+        // for so a tab switch mid-flight doesn't refresh a tab
+        // the user no longer cares about.
+        let View::Workspace(tabs) = &mut self.view else {
+            return;
+        };
+        for tab in &mut tabs.tabs {
+            if tab.repo.path() == task_repo_path && tab.lfs_locks_refresh_task.is_none() {
+                tab.lfs_locks_refresh_task = Some(spawn_lfs_locks_refresh(&task_repo_path));
+            }
+        }
+    }
 }
 
 /// Spawn a background thread that walks HEAD's tree looking for tracked
@@ -5079,6 +5336,138 @@ fn spawn_lfs_scan(repo_path: &Path) -> LfsScanState {
         running: Some(rx),
         result: None,
         dismissed: false,
+    }
+}
+
+/// Spawn a worker that runs `git lfs locks --json` and sends the
+/// classified result back. The worker catches the "LFS not
+/// configured" case and converts it into a benign `Unavailable`
+/// variant so the UI can render it inline rather than as an error.
+/// A genuine error in [`crate::git::lfs_locks::list_locks`] is
+/// surfaced as an `Unavailable { reason: <debug> }` so the lock
+/// panel still gets *some* result — otherwise the user would see
+/// the spinner hang indefinitely with no explanation.
+fn spawn_lfs_locks_refresh(repo_path: &Path) -> LfsLocksRefreshTask {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = repo_path.to_path_buf();
+    std::thread::spawn(move || {
+        let result = match crate::git::lfs_locks::list_locks(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "lfs locks list failed");
+                crate::git::LfsListResult::Unavailable {
+                    reason: format!("lock list failed: {e:#}"),
+                }
+            }
+        };
+        let _ = tx.send(result);
+    });
+    LfsLocksRefreshTask {
+        repo_path: repo_path.to_path_buf(),
+        rx,
+    }
+}
+
+/// Spawn a worker that runs `git lfs lock <path>`. Converts the
+/// `Result<LfsLock>` from the backend into the richer
+/// [`LfsLockActionOutcome`] so the main poller can render a single
+/// toast per outcome without re-parsing errors.
+fn spawn_lfs_lock(repo_path: PathBuf, rel_path: PathBuf) -> LfsLockActionTask {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let repo_path_for_task = repo_path.clone();
+    let rel_path_for_task = rel_path.clone();
+    std::thread::spawn(move || {
+        let outcome = match crate::git::lfs_locks::lock(&repo_path, &rel_path) {
+            Ok(lock) => LfsLockActionOutcome::Locked(lock),
+            Err(e) => {
+                let raw = format!("{e:#}");
+                let lower = raw.to_ascii_lowercase();
+                // The backend `lock` bails out via anyhow rather than a
+                // structured enum, so we repeat the "not installed /
+                // unavailable" sniffing here to offer the same inline
+                // experience as the list path. Everything else lands
+                // in `Failed`.
+                if lower.contains("'lfs' is not a git command")
+                    || lower.contains("git-lfs not installed")
+                    || lower.contains("missing protocol")
+                    || lower.contains("lfs.url")
+                {
+                    LfsLockActionOutcome::Unavailable(raw)
+                } else {
+                    LfsLockActionOutcome::Failed {
+                        summary: "Lock failed".to_string(),
+                        detail: raw,
+                    }
+                }
+            }
+        };
+        let _ = tx.send(outcome);
+    });
+    LfsLockActionTask {
+        repo_path: repo_path_for_task,
+        path: rel_path_for_task,
+        rx,
+    }
+}
+
+/// Spawn a worker that runs `git lfs unlock [--force] <path>`.
+fn spawn_lfs_unlock(repo_path: PathBuf, rel_path: PathBuf, force: bool) -> LfsLockActionTask {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let repo_path_for_task = repo_path.clone();
+    let rel_path_for_task = rel_path.clone();
+    std::thread::spawn(move || {
+        let outcome = match crate::git::lfs_locks::unlock(&repo_path, &rel_path, force) {
+            Ok(()) => LfsLockActionOutcome::Unlocked {
+                path: rel_path.clone(),
+                forced: force,
+            },
+            Err(crate::git::LfsUnlockError::NotOwner) => {
+                LfsLockActionOutcome::NotOwner { path: rel_path.clone() }
+            }
+            Err(crate::git::LfsUnlockError::Unavailable(reason)) => {
+                LfsLockActionOutcome::Unavailable(reason)
+            }
+            Err(crate::git::LfsUnlockError::Other(detail)) => LfsLockActionOutcome::Failed {
+                summary: "Unlock failed".to_string(),
+                detail,
+            },
+        };
+        let _ = tx.send(outcome);
+    });
+    LfsLockActionTask {
+        repo_path: repo_path_for_task,
+        path: rel_path_for_task,
+        rx,
+    }
+}
+
+/// Pick the workspace profile for a freshly-opened repo. Today this
+/// is a coarse `.gitattributes`-based heuristic: if the repo declares
+/// any `filter=lfs` pattern, we assume the team is doing LFS-heavy
+/// (often asset-heavy) work and opt them into the `GameDev` surfaces.
+/// Non-LFS repos stay on `General` so nothing about their UI changes.
+///
+/// The detection is deliberately conservative — we only look at the
+/// top-level `.gitattributes`, not nested ones, because nested LFS
+/// rules are rare enough that missing them is acceptable in exchange
+/// for a fast, side-effect-free probe at repo open. Users who want
+/// to override the detection will get a settings toggle in a
+/// follow-up.
+fn detect_workspace_profile(repo_path: &Path) -> crate::ui::profile_rules::WorkspaceProfile {
+    let attrs = repo_path.join(".gitattributes");
+    let bytes = match std::fs::read(&attrs) {
+        Ok(b) => b,
+        Err(_) => return crate::ui::profile_rules::WorkspaceProfile::General,
+    };
+    // Cheap byte scan — we don't need to parse the attribute
+    // grammar, just detect the presence of the `filter=lfs` marker.
+    if bytes
+        .windows(b"filter=lfs".len())
+        .any(|w| w == b"filter=lfs")
+    {
+        crate::ui::profile_rules::WorkspaceProfile::GameDev
+    } else {
+        crate::ui::profile_rules::WorkspaceProfile::General
     }
 }
 
@@ -5388,6 +5777,8 @@ impl eframe::App for MergeFoxApp {
         self.poll_active_job();
         self.poll_forge_tasks();
         self.poll_lfs_scan();
+        self.poll_lfs_locks_refresh();
+        self.poll_lfs_lock_action();
         self.poll_nav_tasks();
         self.poll_diff_tasks();
         self.poll_graph_tasks();
@@ -5427,6 +5818,7 @@ impl eframe::App for MergeFoxApp {
         ui::panic_recovery::show(ctx, self);
         ui::commit_modal::show(ctx, self);
         ui::prompt::show(ctx, self);
+        ui::sidebar::show_force_unlock_confirm(ctx, self);
         ui::columns::show(ctx, self);
         ui::activity_log::show(ctx, self);
         ui::reflog::show(ctx, self);
