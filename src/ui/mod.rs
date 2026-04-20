@@ -23,6 +23,7 @@ pub mod notifications;
 pub mod palette;
 pub mod panic_recovery;
 pub mod profile_rules;
+pub mod project_tree;
 pub mod prompt;
 pub mod publish_remote;
 pub mod rebase;
