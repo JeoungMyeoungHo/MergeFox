@@ -656,6 +656,19 @@ pub struct RemoteRepoBrowserState {
     pub create_repo: CreateRemoteRepoState,
 }
 
+/// Which tab is showing in the center panel. Session-local for v1 —
+/// we deliberately do NOT persist it to `RepoSettings` because the
+/// profile-driven default (see `ProfileRules::default_center_view`) is
+/// already a good per-repo initial pick, and users who want a different
+/// tab have to click it exactly once per session. Adding a persisted
+/// override is cheap to do later if real users ask; starting with it
+/// would have been a schema-migration commitment we aren't sure we want.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CenterViewTab {
+    Graph,
+    ProjectTree,
+}
+
 pub struct WorkspaceState {
     pub repo: Repo,
     pub selected_branch: Option<String>,
@@ -847,17 +860,19 @@ pub struct WorkspaceState {
     pub workspace_profile: crate::config::WorkspaceProfile,
     /// Cached project-kind detection run once when the repo opened.
     pub detected_project_kind: Option<crate::workspace_profile::DetectedProjectKind>,
-    /// Cached LFS lock list for this repo's working tree. Refreshed on
-    /// demand (panel open / after lock/unlock) rather than per-frame.
+    /// Cached LFS lock list for this repo's working tree.
     pub lfs_locks: Option<Vec<crate::git::LfsLock>>,
     /// Reason string when LFS isn't available for this repo.
     pub lfs_locks_unavailable_reason: Option<String>,
     /// In-flight `git lfs locks --json` refresh task.
     pub lfs_locks_refresh_task: Option<LfsLocksRefreshTask>,
-    /// Current-user name as reported by `git config user.name`, cached
-    /// at repo open so the "do I own this lock?" check in the sidebar
-    /// doesn't shell out on every frame.
+    /// Current-user name as reported by `git config user.name`.
     pub git_user_name: String,
+    /// Which tab the center panel is rendering right now. Initialised
+    /// from the workspace profile's `default_center_view`.
+    pub center_view_tab: CenterViewTab,
+    /// Lazily-walked file-system tree for the Project tab.
+    pub project_tree: crate::ui::project_tree::ProjectTreeState,
 }
 
 #[derive(Default)]
@@ -3061,6 +3076,14 @@ impl MergeFoxApp {
             None
         };
 
+        // Pick the initial center tab from the already-resolved
+        // `workspace_profile` (user override > team file > General,
+        // computed further up this function).
+        let center_view_tab = match rules.default_center_view {
+            crate::ui::profile_rules::DefaultCenterView::Graph => CenterViewTab::Graph,
+            crate::ui::profile_rules::DefaultCenterView::ProjectTree => CenterViewTab::ProjectTree,
+        };
+        let project_tree = crate::ui::project_tree::ProjectTreeState::build(repo.path());
         let new_ws = WorkspaceState {
             repo,
             selected_branch: None,
@@ -3114,6 +3137,8 @@ impl MergeFoxApp {
             lfs_locks_unavailable_reason: None,
             lfs_locks_refresh_task,
             git_user_name,
+            center_view_tab,
+            project_tree,
         };
 
         // If we came from an existing workspace, append the new tab
