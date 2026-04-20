@@ -1,10 +1,13 @@
 use crate::actions::{CommitAction, ResetMode};
 use crate::app::{
-    default_remote_name, tracked_upstream_for_branch, MergeFoxApp, SelectedFileView, View,
+    default_remote_name, tracked_upstream_for_branch, CenterViewTab, MergeFoxApp, SelectedFileView,
+    View,
 };
 use crate::config::Config;
 use crate::git::GraphScope;
 use crate::journal::{self, Operation};
+use crate::ui::profile_rules;
+use crate::ui::project_tree::{self, ProjectTreeIntent};
 use crate::ui::prompt::{self, PendingPrompt};
 
 /// Buttons / hotkeys at the top of the main panel can request the app
@@ -21,6 +24,15 @@ struct PanelIntent {
     open_rebase: bool,
     open_columns: bool,
     open_activity_log: bool,
+    /// When the user switches tabs inside the center panel, we record
+    /// the target tab here. Applied after the UI closure releases its
+    /// borrow so the next frame opens with the correct content.
+    switch_tab: Option<CenterViewTab>,
+    /// Intent returned by the project-tree rendering. Applied by
+    /// `apply_project_tree_intent` below once the borrow is released.
+    project_tree_intent: Option<ProjectTreeIntent>,
+    /// Set when the "Refresh tree" toolbar button is pressed.
+    refresh_project_tree: bool,
 }
 
 pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
@@ -37,6 +49,101 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
         if crate::ui::diff_view::has_selected_file(ws) {
             crate::ui::diff_view::show_selected_file_center(ui, ws);
+            return;
+        }
+
+        // ---------- center-view tab switcher ----------
+        //
+        // Two tabs: the original commit-graph view and the new
+        // file-system project tree. We keep the switcher deliberately
+        // minimal (two selectable labels) so it adds one row of vertical
+        // space and no new mental model — the user reads it as "two
+        // related views of the same repo" rather than as a separate
+        // pane / dock / window. The initial tab is picked per profile
+        // at repo-open time and then free to toggle.
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(ws.center_view_tab == CenterViewTab::Graph, "Graph")
+                .on_hover_text("Commit graph — default view")
+                .clicked()
+                && ws.center_view_tab != CenterViewTab::Graph
+            {
+                intent.switch_tab = Some(CenterViewTab::Graph);
+            }
+            if ui
+                .selectable_label(
+                    ws.center_view_tab == CenterViewTab::ProjectTree,
+                    "Project",
+                )
+                .on_hover_text("Browse the repository working tree")
+                .clicked()
+                && ws.center_view_tab != CenterViewTab::ProjectTree
+            {
+                intent.switch_tab = Some(CenterViewTab::ProjectTree);
+            }
+        });
+        ui.separator();
+
+        if matches!(ws.center_view_tab, CenterViewTab::ProjectTree) {
+            // Project tab has its own compact toolbar (the Scope /
+            // Rebase / Columns buttons don't mean anything here) and
+            // then the tree itself in the remaining space.
+            let rules = profile_rules::rules_for(ws.workspace_profile);
+            ui.horizontal(|ui| {
+                ui.label("Project");
+                ui.separator();
+                if ui
+                    .button("Refresh tree")
+                    .on_hover_text(
+                        ws.project_tree
+                            .last_refreshed
+                            .map(|t| {
+                                let dt = t.elapsed().as_secs();
+                                format!("Reloads the working-tree listing (last: {dt}s ago)")
+                            })
+                            .unwrap_or_else(|| "Reloads the working-tree listing".to_string()),
+                    )
+                    .clicked()
+                {
+                    intent.refresh_project_tree = true;
+                }
+                // Show-hidden toggle — we mutate the state directly
+                // because flipping the checkbox should only be visible
+                // after the next refresh (dotfiles need a re-read to
+                // actually appear / disappear from `node.children`).
+                // This matches what the tooltip promises.
+                let mut show_hidden = ws.project_tree.show_hidden;
+                if ui
+                    .checkbox(&mut show_hidden, "Show hidden")
+                    .on_hover_text("Reveal dotfiles on the next refresh (.git and .mergefox stay hidden)")
+                    .changed()
+                {
+                    ws.project_tree.show_hidden = show_hidden;
+                    intent.refresh_project_tree = true;
+                }
+                ui.separator();
+                ui.label("Filter:");
+                // Single-line filter. Case-insensitive substring match
+                // against the node name — the render pass auto-expands
+                // ancestors so matches deep in the tree become visible.
+                ui.add(
+                    egui::TextEdit::singleline(&mut ws.project_tree.filter)
+                        .hint_text("filename substring…")
+                        .desired_width(200.0),
+                );
+            });
+            ui.separator();
+
+            let available_width = ui.available_width();
+            let selected_file = ws.selected_working_file.clone();
+            let opts = project_tree::ShowOptions {
+                rules: &rules,
+                selected_file: selected_file.as_deref(),
+                available_width,
+            };
+            if let Some(pressed) = project_tree::show(ui, &mut ws.project_tree, opts) {
+                intent.project_tree_intent = Some(pressed);
+            }
             return;
         }
 
@@ -349,6 +456,292 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     }
     if let Some(scope) = intent.new_scope {
         app.rebuild_graph(scope);
+    }
+    if let Some(tab) = intent.switch_tab {
+        if let View::Workspace(tabs) = &mut app.view {
+            tabs.current_mut().center_view_tab = tab;
+        }
+    }
+    if intent.refresh_project_tree {
+        if let View::Workspace(tabs) = &mut app.view {
+            let ws = tabs.current_mut();
+            let repo_path = ws.repo.path().to_path_buf();
+            ws.project_tree.refresh_from_disk(&repo_path);
+            // Re-apply the freshest status snapshot we already have on
+            // hand so the new tree starts out with correct glyphs
+            // instead of one frame of "everything looks clean".
+            apply_current_status_overlay(ws);
+        }
+    }
+    if let Some(tree_intent) = intent.project_tree_intent {
+        apply_project_tree_intent(app, tree_intent);
+    }
+}
+
+/// Re-overlay the cached `git status` entries onto the project tree.
+/// Called after a refresh (so the rebuilt tree inherits current status)
+/// and after ops that mutate the working tree. Locks / ignored lists
+/// aren't wired yet — the backend doesn't yet surface LFS locks or a
+/// cached ignored set on `WorkspaceState`, and we want the UI to
+/// degrade gracefully in their absence rather than guard every
+/// invocation behind a feature flag.
+fn apply_current_status_overlay(ws: &mut crate::app::WorkspaceState) {
+    let entries = ws
+        .repo_ui_cache
+        .as_ref()
+        .and_then(|c| c.working.as_deref())
+        .unwrap_or(&[]);
+    ws.project_tree.reapply_status(entries, &[], &[]);
+}
+
+/// Turn an intent emitted by the project-tree view into app-level
+/// state changes. Centralising the match here keeps `project_tree.rs`
+/// free of `MergeFoxApp` knowledge — the tree module only needs to
+/// know about `PathBuf`, which is trivial to unit-test.
+fn apply_project_tree_intent(app: &mut MergeFoxApp, intent: ProjectTreeIntent) {
+    match intent {
+        ProjectTreeIntent::ToggleExpand(path) => {
+            if let View::Workspace(tabs) = &mut app.view {
+                let ws = tabs.current_mut();
+                if ws.project_tree.expanded.contains(&path) {
+                    ws.project_tree.expanded.remove(&path);
+                } else {
+                    // First expansion of a directory triggers a
+                    // one-level `read_dir` — cheap even on 10k-child
+                    // folders because we never recurse.
+                    ws.project_tree.expanded.insert(path.clone());
+                    let repo_path = ws.repo.path().to_path_buf();
+                    if let Some(target) = find_node_mut(&mut ws.project_tree.root, &path) {
+                        if target.children.is_none() {
+                            let show_hidden = ws.project_tree.show_hidden;
+                            load_directory_for_expand(target, &repo_path, show_hidden);
+                        }
+                    }
+                    apply_current_status_overlay(ws);
+                }
+            }
+        }
+        ProjectTreeIntent::SelectFile(path) => {
+            // Route through the existing working-tree selection path —
+            // the right panel / diff view already knows how to render
+            // `selected_working_file`, so we just populate it.
+            if let View::Workspace(tabs) = &mut app.view {
+                let ws = tabs.current_mut();
+                ws.selected_working_tree = true;
+                ws.selected_working_file = Some(path.clone());
+                ws.selected_file_view = SelectedFileView::Diff;
+                ws.set_image_cache(None);
+                // Look up the matching status entry so the diff text is
+                // populated immediately — mirrors what
+                // `diff_view::render_sidebar_working_list` does on click.
+                let entry = ws
+                    .repo_ui_cache
+                    .as_ref()
+                    .and_then(|c| c.working.as_deref())
+                    .and_then(|entries| entries.iter().find(|e| e.path == path).cloned());
+                ws.working_file_diff = entry.as_ref().and_then(|e| {
+                    crate::git::diff_text_for_working_entry(ws.repo.path(), e).ok()
+                });
+            }
+        }
+        ProjectTreeIntent::OpenInFileManager(path) => {
+            if let View::Workspace(tabs) = &app.view {
+                let ws = tabs.current();
+                let abs = ws.repo.path().join(&path);
+                if let Err(e) = open_in_file_manager(&abs) {
+                    app.last_error = Some(format!("open in file manager: {e:#}"));
+                }
+            }
+        }
+        ProjectTreeIntent::StageFile(path) => {
+            if let View::Workspace(tabs) = &app.view {
+                let ws = tabs.current();
+                if let Err(e) =
+                    crate::git::ops::stage_paths(ws.repo.path(), &[path.as_path()])
+                {
+                    app.last_error = Some(format!("stage {}: {e:#}", path.display()));
+                }
+            }
+            app.refresh_repo_ui_cache();
+            if let View::Workspace(tabs) = &mut app.view {
+                apply_current_status_overlay(tabs.current_mut());
+            }
+        }
+        ProjectTreeIntent::UnstageFile(path) => {
+            if let View::Workspace(tabs) = &app.view {
+                let ws = tabs.current();
+                if let Err(e) =
+                    crate::git::ops::unstage_paths(ws.repo.path(), &[path.as_path()])
+                {
+                    app.last_error = Some(format!("unstage {}: {e:#}", path.display()));
+                }
+            }
+            app.refresh_repo_ui_cache();
+            if let View::Workspace(tabs) = &mut app.view {
+                apply_current_status_overlay(tabs.current_mut());
+            }
+        }
+        ProjectTreeIntent::DiscardFile(path) => {
+            // No dedicated confirmation prompt exists yet for file
+            // discards from the project tree — rather than invent a
+            // new modal here, we run the same `git restore` /
+            // `git clean` path the commit modal uses and surface any
+            // error via `last_error`. Destructive, but consistent with
+            // how the per-file discard button behaves elsewhere; a
+            // richer confirm can slot in later.
+            let outcome = if let View::Workspace(tabs) = &app.view {
+                let ws = tabs.current();
+                // Partition by tracked-vs-untracked so we can pass the
+                // right buckets to `discard_paths`. If we don't know
+                // (no status cache hit) assume tracked — `git restore`
+                // will simply no-op on a path git doesn't know about.
+                let untracked = ws
+                    .repo_ui_cache
+                    .as_ref()
+                    .and_then(|c| c.working.as_deref())
+                    .map(|entries| {
+                        entries.iter().any(|e| {
+                            e.path == path
+                                && matches!(e.kind, crate::git::ops::EntryKind::Untracked)
+                        })
+                    })
+                    .unwrap_or(false);
+                if untracked {
+                    crate::git::ops::discard_paths(ws.repo.path(), &[], &[path.as_path()])
+                } else {
+                    crate::git::ops::discard_paths(ws.repo.path(), &[path.as_path()], &[])
+                }
+            } else {
+                Ok(())
+            };
+            if let Err(e) = outcome {
+                app.last_error = Some(format!("discard {}: {e:#}", path.display()));
+            }
+            app.refresh_repo_ui_cache();
+            if let View::Workspace(tabs) = &mut app.view {
+                apply_current_status_overlay(tabs.current_mut());
+            }
+        }
+        ProjectTreeIntent::RequestLock(_)
+        | ProjectTreeIntent::RequestUnlock(_)
+        | ProjectTreeIntent::RequestForceUnlock(_) => {
+            // LFS lock controls are surfaced in the context menu for
+            // profiles that enable them, but the app-level helpers
+            // (`start_lfs_lock` / `start_lfs_unlock`) aren't wired yet.
+            // For now we surface a hint so the user knows the click
+            // registered and why nothing changed.
+            app.last_error =
+                Some("LFS lock controls are not yet wired on this build".to_string());
+        }
+    }
+}
+
+/// Walk to a specific node by relative path. Used by the expand intent
+/// so we can lazily populate a directory's children without duplicating
+/// the path-walk logic from `project_tree.rs` there.
+fn find_node_mut<'a>(
+    node: &'a mut crate::ui::project_tree::ProjectTreeNode,
+    rel_path: &std::path::Path,
+) -> Option<&'a mut crate::ui::project_tree::ProjectTreeNode> {
+    if rel_path.as_os_str().is_empty() {
+        return Some(node);
+    }
+    let components: Vec<_> = rel_path.components().collect();
+    let mut cur = node;
+    for comp in components {
+        let name = comp.as_os_str().to_string_lossy().into_owned();
+        let children = cur.children.as_mut()?;
+        let idx = children.iter().position(|c| c.name == name)?;
+        cur = &mut children[idx];
+    }
+    Some(cur)
+}
+
+/// Shim over the `read_dir` call used by `ProjectTreeState::build`.
+/// Kept in `main_panel` (not `project_tree`) so the tree module stays
+/// pure-data: the caller passes the repo root from the live repo state
+/// here rather than the tree tracking it forever.
+fn load_directory_for_expand(
+    node: &mut crate::ui::project_tree::ProjectTreeNode,
+    repo_root: &std::path::Path,
+    show_hidden: bool,
+) {
+    // We rebuild the state view by calling refresh_from_disk-like logic
+    // scoped to a single node. Rather than expose another public
+    // function, we approximate by re-walking that directory inline.
+    let abs = repo_root.join(&node.rel_path);
+    let Ok(rd) = std::fs::read_dir(&abs) else {
+        node.children = Some(Vec::new());
+        return;
+    };
+    use crate::ui::project_tree::{ProjectNodeKind, ProjectTreeNode};
+    let mut entries: Vec<ProjectTreeNode> = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".git" || name == ".mergefox" {
+            continue;
+        }
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        let kind = if ft.is_dir() {
+            ProjectNodeKind::Directory
+        } else {
+            ProjectNodeKind::File
+        };
+        let rel_path = node.rel_path.join(&name);
+        entries.push(ProjectTreeNode {
+            name,
+            rel_path,
+            kind,
+            children: None,
+            status: None,
+            subtree_dirty: false,
+            lock_owner: None,
+            ignored: false,
+        });
+    }
+    entries.sort_by(|a, b| match (a.kind, b.kind) {
+        (ProjectNodeKind::Directory, ProjectNodeKind::File) => std::cmp::Ordering::Less,
+        (ProjectNodeKind::File, ProjectNodeKind::Directory) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+    node.children = Some(entries);
+}
+
+/// Cross-platform "reveal this path in the native file manager".
+/// Mirrors the helper in `ui/settings/about.rs` — duplicated here on
+/// purpose because hoisting it to a shared util would require touching
+/// the settings module's error type, and the implementations are 3
+/// lines of platform-gated `Command::new` anyway.
+fn open_in_file_manager(path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    #[cfg(target_os = "macos")]
+    let status = std::process::Command::new("open")
+        .arg(path)
+        .status()
+        .context("launch `open`")?;
+
+    #[cfg(target_os = "windows")]
+    let status = std::process::Command::new("explorer")
+        .arg(path)
+        .status()
+        .context("launch `explorer`")?;
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = std::process::Command::new("xdg-open")
+        .arg(path)
+        .status()
+        .context("launch `xdg-open`")?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("file manager exited with status {status}");
     }
 }
 

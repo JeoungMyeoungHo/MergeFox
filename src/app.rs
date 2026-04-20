@@ -453,8 +453,25 @@ pub struct RemoteRepoBrowserState {
     pub create_repo: CreateRemoteRepoState,
 }
 
+/// Which tab is showing in the center panel. Session-local for v1 —
+/// we deliberately do NOT persist it to `RepoSettings` because the
+/// profile-driven default (see `ProfileRules::default_center_view`) is
+/// already a good per-repo initial pick, and users who want a different
+/// tab have to click it exactly once per session. Adding a persisted
+/// override is cheap to do later if real users ask; starting with it
+/// would have been a schema-migration commitment we aren't sure we want.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CenterViewTab {
+    Graph,
+    ProjectTree,
+}
+
 pub struct WorkspaceState {
     pub repo: Repo,
+    /// Coarse profile (general / game-dev / minimal) cached at repo
+    /// open. Used via `ui::profile_rules::rules_for` to make UI
+    /// decisions without scattering `match` arms across files.
+    pub workspace_profile: crate::config::WorkspaceProfile,
     pub selected_branch: Option<String>,
     pub graph_scope: GraphScope,
     pub graph_view: Option<GraphView>,
@@ -612,6 +629,15 @@ pub struct WorkspaceState {
     /// Whether the Working Tree virtual node is selected (like a commit selection).
     /// When true, the diff panel shows working tree changes instead of a commit.
     pub selected_working_tree: bool,
+    /// Which tab the center panel is rendering right now. Initialised
+    /// from the workspace profile's `default_center_view` on open; the
+    /// user can toggle freely within a session.
+    pub center_view_tab: CenterViewTab,
+    /// Lazily-walked file-system tree for the Project tab. Built once
+    /// when the repo opens; refreshed on demand from the toolbar button
+    /// and whenever the working-tree cache updates (so status glyphs
+    /// stay honest).
+    pub project_tree: crate::ui::project_tree::ProjectTreeState,
 }
 
 #[derive(Default)]
@@ -1999,8 +2025,20 @@ impl MergeFoxApp {
             .unwrap_or_else(|| repo_path.display().to_string());
         let lfs_scan = spawn_lfs_scan(&repo_path);
 
+        // Profile defaults to `General` until a detector lands. The
+        // project-tree tab still benefits from this wiring: power users
+        // can flip the profile explicitly from Settings → Repo (future
+        // work) and the UI will react immediately.
+        let workspace_profile = crate::config::WorkspaceProfile::default();
+        let profile_rules = crate::ui::profile_rules::rules_for(workspace_profile);
+        let center_view_tab = match profile_rules.default_center_view {
+            crate::ui::profile_rules::DefaultCenterView::Graph => CenterViewTab::Graph,
+            crate::ui::profile_rules::DefaultCenterView::ProjectTree => CenterViewTab::ProjectTree,
+        };
+        let project_tree = crate::ui::project_tree::ProjectTreeState::build(repo.path());
         let new_ws = WorkspaceState {
             repo,
+            workspace_profile,
             selected_branch: None,
             graph_scope: scope,
             graph_view,
@@ -2041,6 +2079,8 @@ impl MergeFoxApp {
             selected_working_file: None,
             working_file_diff: None,
             selected_working_tree: false,
+            center_view_tab,
+            project_tree,
         };
 
         // If we came from an existing workspace, append the new tab

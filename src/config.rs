@@ -406,6 +406,32 @@ impl PullStrategyPref {
     }
 }
 
+/// Coarse-grained preset for how a repository is typically used. Drives
+/// UI defaults (which center-panel tab opens first, whether LFS lock
+/// controls are visible, etc.) — the actual behaviour lives in
+/// `crate::ui::profile_rules`. This enum only captures the user's intent
+/// so we can route to the right rule set.
+///
+/// The variants deliberately stay coarse — "GameDev" means "asset-heavy
+/// repo where the file tree is the primary navigation" rather than a
+/// specific engine or pipeline. We widen over time as real usage shows
+/// up, instead of starting with a dozen speculative buckets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceProfile {
+    /// Default — no strong opinion. Commit graph is the entry point.
+    #[default]
+    General,
+    /// Asset-heavy checkout (textures, audio, large binary files) where
+    /// users navigate by "find the file I'm editing" more often than
+    /// they read the commit graph. Project-tree tab opens by default.
+    GameDev,
+    /// Deliberately pared-back UI for users who only need the essentials.
+    /// Reserved for future use — for the profile rules we currently treat
+    /// it the same as `General`.
+    Minimal,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoSettings {
     #[serde(default)]
