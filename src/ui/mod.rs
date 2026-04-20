@@ -20,6 +20,7 @@ pub mod hud;
 pub mod icon;
 pub mod main_panel;
 pub mod notifications;
+pub mod open_with;
 pub mod palette;
 pub mod panic_recovery;
 pub mod profile_rules;

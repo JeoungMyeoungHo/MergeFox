@@ -479,6 +479,10 @@ pub enum ProjectTreeIntent {
     SelectFile(PathBuf),
     ToggleExpand(PathBuf),
     OpenInFileManager(PathBuf),
+    /// Launch the file in the user's configured DCC app for this
+    /// extension, falling back to the OS default handler. See
+    /// `ui::open_with::open_file`.
+    OpenWith(PathBuf),
     StageFile(PathBuf),
     UnstageFile(PathBuf),
     RequestLock(PathBuf),
@@ -727,6 +731,19 @@ fn render_row(
                 label.context_menu(|ui| {
                     if ui.button("Open").clicked() {
                         intent = Some(ProjectTreeIntent::SelectFile(row.node.rel_path.clone()));
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Open with…")
+                        .on_hover_text(
+                            "Launch the configured DCC app for this extension, \
+                             or the system default if none is set",
+                        )
+                        .clicked()
+                    {
+                        intent = Some(ProjectTreeIntent::OpenWith(
+                            row.node.rel_path.clone(),
+                        ));
                         ui.close_menu();
                     }
                     if ui.button("Show in file manager").clicked() {

@@ -68,6 +68,12 @@ pub struct Config {
     /// the same repo twice across restarts.
     #[serde(default)]
     pub profile_suggestion_dismissed_for: Vec<PathBuf>,
+    /// User-editable "open with" mappings by file extension. Drives the
+    /// context-menu "Open" / "Open with <app>" action in the project
+    /// tree + commit modal. Empty command string = fall through to the
+    /// OS default viewer.
+    #[serde(default)]
+    pub dcc_apps: DccAppMappings,
     // NOTE: the `secrets_backend` field was removed along with the OS
     // keychain dependency. Old config files that still have it will be
     // silently ignored by serde. Going forward the secret store is
@@ -88,6 +94,7 @@ impl Default for Config {
             clone_defaults: CloneDefaults::default(),
             diff_prefs: DiffPrefs::default(),
             profile_suggestion_dismissed_for: Vec::new(),
+            dcc_apps: DccAppMappings::default(),
         }
     }
 }
@@ -115,6 +122,20 @@ impl Default for DiffPrefs {
             show_minimap: default_show_minimap(),
         }
     }
+}
+
+/// User-editable launch commands keyed by file extension (lowercase, no
+/// leading dot). Empty command string = fall through to the OS default
+/// viewer. The command template is a single line split on whitespace
+/// into argv; any token equal to `{file}` is substituted with the
+/// absolute file path, otherwise the path is appended as the final arg.
+///
+/// Not namespaced by profile: opening a `.psd` in a user's configured
+/// image editor is useful regardless of workspace style.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DccAppMappings {
+    #[serde(default)]
+    pub mappings: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -599,6 +620,7 @@ impl Config {
             clone_defaults: &self.clone_defaults,
             diff_prefs: &self.diff_prefs,
             profile_suggestion_dismissed_for: &self.profile_suggestion_dismissed_for,
+            dcc_apps: &self.dcc_apps,
         };
         write_config(&path, &to_write)
     }
@@ -682,6 +704,7 @@ struct SerConfig<'a> {
     clone_defaults: &'a CloneDefaults,
     diff_prefs: &'a DiffPrefs,
     profile_suggestion_dismissed_for: &'a [PathBuf],
+    dcc_apps: &'a DccAppMappings,
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -798,6 +821,7 @@ fn save_config_to_path(path: &Path, cfg: &Config) -> Result<()> {
         clone_defaults: &cfg.clone_defaults,
         diff_prefs: &cfg.diff_prefs,
         profile_suggestion_dismissed_for: &cfg.profile_suggestion_dismissed_for,
+        dcc_apps: &cfg.dcc_apps,
     };
     write_config(path, &to_write)
 }

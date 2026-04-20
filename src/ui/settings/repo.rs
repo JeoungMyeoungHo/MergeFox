@@ -549,6 +549,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
     // Rendered after the modal's mut-borrow block closes so the
     // section can freely mutate `app.config` + live workspace state.
     render_workspace_profile_section(ui, app);
+    render_dcc_apps_section(ui, app);
 }
 
 enum Intent {
@@ -1637,3 +1638,123 @@ fn set_profile_override(
     }
     app.notify_ok("Workspace profile updated.");
 }
+
+/// Render the "Open-with DCC applications" editor — per-extension
+/// command templates with `{file}` substitution. Values are written
+/// through directly to `app.config.dcc_apps.mappings`; `Config::save`
+/// is called once per change rather than batched because the delta
+/// is tiny and the file-system write is cheap.
+fn render_dcc_apps_section(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
+    use crate::app::View;
+    ui.add_space(12.0);
+    ui.label(RichText::new("Open-with DCC applications").strong());
+    ui.weak(
+        "Configure per-extension launch commands. Leave blank to fall back to the system \
+         default. Use `{file}` in the template to control argument placement.",
+    );
+
+    // Collect the current mappings and render them as editable rows.
+    // We clone the keys into a Vec so we can mutate the map while
+    // iterating — BTreeMap doesn't allow that otherwise.
+    let keys: Vec<String> = app.config.dcc_apps.mappings.keys().cloned().collect();
+    let mut dirty = false;
+    let mut to_delete: Option<String> = None;
+
+    egui::Grid::new("dcc_apps_grid")
+        .num_columns(3)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Extension").weak());
+            ui.label(RichText::new("Command template").weak());
+            ui.label("");
+            ui.end_row();
+
+            for ext in &keys {
+                ui.label(format!(".{ext}"));
+                let current = app
+                    .config
+                    .dcc_apps
+                    .mappings
+                    .get(ext)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut edited = current.clone();
+                let resp = ui.add(
+                    TextEdit::singleline(&mut edited)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("/path/to/app {file}"),
+                );
+                if resp.lost_focus() && edited != current {
+                    app.config
+                        .dcc_apps
+                        .mappings
+                        .insert(ext.clone(), edited);
+                    dirty = true;
+                }
+                if ui.small_button("×").on_hover_text("Remove mapping").clicked() {
+                    to_delete = Some(ext.clone());
+                }
+                ui.end_row();
+            }
+        });
+
+    if let Some(ext) = to_delete {
+        app.config.dcc_apps.mappings.remove(&ext);
+        dirty = true;
+    }
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.button("Add mapping").clicked() {
+            // Seed a blank "" key so the user can type the extension
+            // in the row. We insert "" because BTreeMap needs a unique
+            // key; the editor row treats empty extension as
+            // placeholder. To keep this simple, just auto-append a
+            // numeric placeholder if "" already exists.
+            let mut key = String::new();
+            if app.config.dcc_apps.mappings.contains_key(&key) {
+                let mut n = 1;
+                loop {
+                    key = format!("new{n}");
+                    if !app.config.dcc_apps.mappings.contains_key(&key) {
+                        break;
+                    }
+                    n += 1;
+                }
+            }
+            app.config.dcc_apps.mappings.insert(key, String::new());
+            dirty = true;
+        }
+
+        // "Suggest defaults" button — populates blank entries for the
+        // current project kind. Idempotent: never overwrites an
+        // existing value.
+        let detected = match &app.view {
+            View::Workspace(tabs) if !tabs.launcher_active => tabs.current().detected_project_kind,
+            _ => None,
+        };
+        ui.add_enabled_ui(detected.is_some(), |ui| {
+            let label = match detected {
+                Some(kind) => format!("Suggest defaults for {}", kind.label()),
+                None => "Suggest defaults".to_string(),
+            };
+            if ui.button(label).clicked() {
+                if let Some(kind) = detected {
+                    for ext in crate::ui::open_with::suggested_mappings_for_kind(kind) {
+                        app.config
+                            .dcc_apps
+                            .mappings
+                            .entry(ext.to_string())
+                            .or_insert_with(String::new);
+                    }
+                    dirty = true;
+                }
+            }
+        });
+    });
+
+    if dirty {
+        let _ = app.config.save();
+    }
+}
+

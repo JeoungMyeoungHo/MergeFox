@@ -586,6 +586,29 @@ fn apply_project_tree_intent(app: &mut MergeFoxApp, intent: ProjectTreeIntent) {
                 }
             }
         }
+        ProjectTreeIntent::OpenWith(path) => {
+            let (repo_path, mappings) = match &app.view {
+                View::Workspace(tabs) if !tabs.launcher_active => (
+                    tabs.current().repo.path().to_path_buf(),
+                    app.config.dcc_apps.clone(),
+                ),
+                _ => return,
+            };
+            match crate::ui::open_with::open_file(&repo_path, &path, &mappings) {
+                Ok(crate::ui::open_with::OpenOutcome::ConfiguredApp { command_label }) => {
+                    app.notify_info(format!("Opened in {command_label}"));
+                }
+                Ok(crate::ui::open_with::OpenOutcome::OsDefault) => {
+                    app.notify_info("Opened with system default");
+                }
+                Err(detail) => {
+                    app.notify_err_with_detail(
+                        format!("Couldn't open {}", path.display()),
+                        detail,
+                    );
+                }
+            }
+        }
         ProjectTreeIntent::StageFile(path) => {
             if let View::Workspace(tabs) = &app.view {
                 let ws = tabs.current();

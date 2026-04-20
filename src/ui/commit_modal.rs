@@ -499,6 +499,10 @@ enum MoveIntent {
     /// Discard the given unstaged paths. Tracked files restore from index;
     /// untracked files are removed from disk.
     Discard(Vec<DiscardPath>),
+    /// Open a file through `ui::open_with` (configured DCC app, else
+    /// OS default). Routed via MoveIntent so the dispatch happens after
+    /// the modal closure releases its borrow on `app`.
+    OpenWith(PathBuf),
 }
 
 #[derive(Clone)]
@@ -757,6 +761,18 @@ fn render_row(
         label_resp.context_menu(|ui| {
             let has_unstaged = entry.unstaged || matches!(entry.kind, EntryKind::Untracked);
             let has_staged = entry.staged;
+            if ui
+                .button("Open with…")
+                .on_hover_text(
+                    "Launch the configured DCC app for this extension, or the system \
+                     default if none is set",
+                )
+                .clicked()
+            {
+                *move_intent = Some(MoveIntent::OpenWith(entry.path.clone()));
+                ui.close_menu();
+            }
+            ui.separator();
             if has_unstaged
                 && ui
                     .button("Stage all hunks of this file")
@@ -882,6 +898,35 @@ fn apply_range_selection(
 /// Execute a stage/unstage intent against the working copy. Errors surface
 /// on the commit modal so the user can retry.
 fn apply_move_intent(app: &mut MergeFoxApp, intent: MoveIntent) {
+    // OpenWith handled separately — it routes through the open-with
+    // helper (which doesn't mutate git state) and posts toasts rather
+    // than setting `commit_modal.last_error`.
+    if let MoveIntent::OpenWith(rel_path) = &intent {
+        let (repo_path, mappings) = match &app.view {
+            View::Workspace(tabs) if !tabs.launcher_active => (
+                tabs.current().repo.path().to_path_buf(),
+                app.config.dcc_apps.clone(),
+            ),
+            _ => return,
+        };
+        let rel = rel_path.clone();
+        match crate::ui::open_with::open_file(&repo_path, &rel, &mappings) {
+            Ok(crate::ui::open_with::OpenOutcome::ConfiguredApp { command_label }) => {
+                app.notify_info(format!("Opened in {command_label}"));
+            }
+            Ok(crate::ui::open_with::OpenOutcome::OsDefault) => {
+                app.notify_info("Opened with system default");
+            }
+            Err(detail) => {
+                app.notify_err_with_detail(
+                    format!("Couldn't open {}", rel.display()),
+                    detail,
+                );
+            }
+        }
+        return;
+    }
+
     let View::Workspace(tabs) = &mut app.view else {
         return;
     };
@@ -920,6 +965,7 @@ fn apply_move_intent(app: &mut MergeFoxApp, intent: MoveIntent) {
                 .collect();
             crate::git::ops::discard_paths(&path, &tracked, &untracked)
         }
+        MoveIntent::OpenWith(_) => unreachable!("handled above"),
     };
     if let Err(e) = result {
         if let Some(m) = app.commit_modal.as_mut() {
