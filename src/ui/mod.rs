@@ -1,6 +1,7 @@
 pub mod activity_log;
 pub mod basket_focus;
 pub mod basket_squash;
+pub mod binary_conflict_view;
 pub mod bisect;
 pub mod blame;
 pub mod columns;

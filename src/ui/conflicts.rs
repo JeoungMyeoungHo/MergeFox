@@ -92,15 +92,48 @@ enum ConflictIntent {
     /// conflict even after a slow state change.
     HunkAction(PathBuf, HunkIntent),
     /// Save the per-hunk-composed result. Fired only when every hunk in
-    /// the selected file has a non-Pending resolution — the UI button
-    /// itself is disabled otherwise, but we double-check in the applier
-    /// so a keyboard shortcut can't bypass the guard.
+    /// the selected file has a non-Pending resolution.
     SaveHunks(PathBuf),
     /// Reset every hunk's resolution to `Pending` for the selected file.
-    /// Used as a "start over" escape hatch.
     ResetHunks(PathBuf),
+    /// Binary keep-both: resolve by taking `main` as canonical and
+    /// writing the other side to a sibling path.
+    KeepBoth {
+        path: PathBuf,
+        main: ConflictChoice,
+    },
+    /// Binary "open externally": export one stage's bytes to a temp
+    /// file with the original extension and hand it to the platform's
+    /// default viewer (`open` / `xdg-open` / `explorer`).
+    OpenExternalSide {
+        path: PathBuf,
+        side: ConflictChoice,
+    },
     Continue,
     Abort,
+}
+
+impl ConflictIntent {
+    /// Translate a [`binary_conflict_view::BinaryConflictIntent`] emitted by
+    /// the binary card into the matching [`ConflictIntent`] variant the
+    /// outer match handles. Kept as a dedicated mapper so the two enums
+    /// can evolve independently (the binary-card enum is a stable
+    /// public surface; `ConflictIntent` is an internal pipeline).
+    fn from_binary_intent(
+        path: PathBuf,
+        intent: crate::ui::binary_conflict_view::BinaryConflictIntent,
+    ) -> Self {
+        use crate::ui::binary_conflict_view::BinaryConflictIntent as B;
+        match intent {
+            B::UseOurs => ConflictIntent::UseFile(path, ConflictChoice::Ours),
+            B::UseTheirs => ConflictIntent::UseFile(path, ConflictChoice::Theirs),
+            B::KeepBoth { keep_as_main } => ConflictIntent::KeepBoth {
+                path,
+                main: keep_as_main,
+            },
+            B::OpenExternal { side } => ConflictIntent::OpenExternalSide { path, side },
+        }
+    }
 }
 
 /// Built-in editor-side resolution choice for a single conflict region.
@@ -352,6 +385,36 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     });
 
                     ui.add_space(10.0);
+
+                    // ---------- Binary-conflict card (early return) ---------
+                    //
+                    // Binary files (images, PSDs, FBX meshes, compiled
+                    // artifacts, …) can't be hand-merged with the text-hunk
+                    // editor, so they get a dedicated card instead: twin
+                    // previews of ours / theirs plus the "Keep both" action
+                    // for users who want to diff externally and merge later.
+                    // We return early from the detail-pane closure so none of
+                    // the text-based controls below render for binary files.
+                    if entry.is_binary {
+                        let bin_labels =
+                            crate::ui::binary_conflict_view::SideLabels {
+                                ours_short: labels.ours_short.clone(),
+                                theirs_short: labels.theirs_short.clone(),
+                            };
+                        if let Some(bin_intent) =
+                            crate::ui::binary_conflict_view::render(
+                                ui,
+                                entry,
+                                &bin_labels,
+                            )
+                        {
+                            intent = Some(ConflictIntent::from_binary_intent(
+                                entry.path.clone(),
+                                bin_intent,
+                            ));
+                        }
+                        return;
+                    }
 
                     // ---------- Local / Remote cards ------------------------
                     //
@@ -941,6 +1004,12 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         Some(ConflictIntent::ResetHunks(path)) => {
             reset_hunks(app, &path);
         }
+        Some(ConflictIntent::KeepBoth { path, main }) => {
+            resolve_conflict_keep_both(app, &path, main);
+        }
+        Some(ConflictIntent::OpenExternalSide { path, side }) => {
+            open_conflict_side_externally(app, &path, side);
+        }
         Some(ConflictIntent::Continue) => app.continue_conflict_operation(),
         Some(ConflictIntent::Abort) => app.abort_conflict_operation(),
         None => {}
@@ -1519,6 +1588,198 @@ fn launch_mergetool(app: &mut MergeFoxApp, path: &Path) {
             app.last_error = Some(format!(
                 "launch mergetool: {err}\n\
                  Is `git` on PATH and `merge.tool` configured?"
+            ));
+        }
+    }
+}
+
+/// Wire the binary-card `KeepBoth` intent into the backend. The disk
+/// write here can be non-trivial for big assets (a 40 MB PSD is not
+/// unusual) so we dispatch through `Repo::resolve_conflict_keep_both`
+/// directly on the UI thread for a first pass — it's blocking but
+/// matches what the neighbouring `resolve_conflict_choice` /
+/// `resolve_conflict_manual` paths already do. Offloading to a worker
+/// would also mean invalidating the conflict list asynchronously,
+/// which is a larger refactor and out of scope for this change.
+fn resolve_conflict_keep_both(
+    app: &mut MergeFoxApp,
+    path: &Path,
+    main: ConflictChoice,
+) {
+    let result = {
+        let View::Workspace(tabs) = &mut app.view else {
+            return;
+        };
+        let ws = tabs.current_mut();
+        let result = ws.repo.resolve_conflict_keep_both(path, main);
+        ws.conflict_editor_path = None;
+        result
+    };
+
+    match result {
+        Ok(outcome) => {
+            app.hud = Some(crate::app::Hud::new(
+                format!(
+                    "Kept both: {} + {}",
+                    format_path(&outcome.main_path),
+                    format_path(&outcome.side_path),
+                ),
+                2400,
+            ));
+        }
+        Err(err) => {
+            app.notify_err_with_detail(
+                format!("Keep both failed for {}.", format_path(path)),
+                format!("{err:#}"),
+            );
+        }
+    }
+}
+
+/// Export the chosen side's bytes to a temp file and hand it to the
+/// platform's default viewer.
+///
+/// Implementation notes
+/// --------------------
+///   * **Temp-file naming** — `mergefox-conflict-<short-oid>.<ext>` so
+///     successive previews for different blobs don't collide and the
+///     extension is preserved (Preview / Finder / Photoshop dispatch
+///     on extension, not content sniffing). Missing oid falls back to
+///     a randomly-suffixed name — this only happens when
+///     `ls-files --stage` didn't turn up an oid, which is rare.
+///   * **Cleanup** — we deliberately leave the temp file in place.
+///     The user may still be viewing it when MergeFox quits, and the
+///     OS tempdir gets reaped by the platform cleaner. Eagerly
+///     deleting would break the "open in Photoshop for 10 minutes"
+///     workflow.
+///   * **Platform dispatch** — mirrors the `open_in_file_manager`
+///     helper in `settings/about.rs` (macOS `open`, Windows
+///     `explorer`, Linux `xdg-open`). We don't take a new crate
+///     dependency just for this.
+fn open_conflict_side_externally(
+    app: &mut MergeFoxApp,
+    path: &Path,
+    side: ConflictChoice,
+) {
+    let (repo_path, side_bytes, oid_hint) = {
+        let View::Workspace(tabs) = &app.view else {
+            return;
+        };
+        let ws = tabs.current();
+        let repo_path = ws.repo.path().to_path_buf();
+        // Read raw bytes for the requested stage via `git show`.
+        let stage = match side {
+            ConflictChoice::Ours => 2,
+            ConflictChoice::Theirs => 3,
+        };
+        let spec = format!(":{stage}:{}", path.display());
+        let bytes_result = crate::git::cli::run(&repo_path, ["show", &spec]);
+        let bytes = match bytes_result {
+            Ok(out) => out.stdout,
+            Err(err) => {
+                app.last_error = Some(format!(
+                    "read {} side for {}: {err:#}",
+                    match side {
+                        ConflictChoice::Ours => "ours",
+                        ConflictChoice::Theirs => "theirs",
+                    },
+                    format_path(path)
+                ));
+                return;
+            }
+        };
+        // Pull an OID hint for the temp filename (purely cosmetic /
+        // uniqueness — the bytes are what matters).
+        let oid_line = crate::git::cli::run_line(
+            &repo_path,
+            ["ls-files", "--stage", "--", &path.display().to_string()],
+        )
+        .ok();
+        let oid_hint = oid_line
+            .and_then(|out| {
+                out.lines().find_map(|line| {
+                    let mut parts = line.split_whitespace();
+                    let _mode = parts.next()?;
+                    let sha = parts.next()?;
+                    let st = parts.next()?;
+                    if st == stage.to_string().as_str() {
+                        Some(sha.to_string())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or_else(|| format!("{}", std::process::id()));
+        (repo_path, bytes, oid_hint)
+    };
+    let _ = repo_path; // not needed past this point; reserved for future use.
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let short_oid: String = oid_hint.chars().take(10).collect();
+    let file_name = if ext.is_empty() {
+        format!("mergefox-conflict-{short_oid}")
+    } else {
+        format!("mergefox-conflict-{short_oid}.{ext}")
+    };
+    let temp_path = std::env::temp_dir().join(file_name);
+    if let Err(err) = std::fs::write(&temp_path, &side_bytes) {
+        app.last_error = Some(format!(
+            "write temp preview {}: {err}",
+            temp_path.display()
+        ));
+        return;
+    }
+
+    let spawn_result = {
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("open")
+                .arg(&temp_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("explorer")
+                .arg(&temp_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            std::process::Command::new("xdg-open")
+                .arg(&temp_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        }
+    };
+
+    match spawn_result {
+        Ok(_) => {
+            app.hud = Some(crate::app::Hud::new(
+                format!(
+                    "Opened {} side of {} externally",
+                    match side {
+                        ConflictChoice::Ours => "ours",
+                        ConflictChoice::Theirs => "theirs",
+                    },
+                    format_path(path)
+                ),
+                2000,
+            ));
+        }
+        Err(err) => {
+            app.last_error = Some(format!(
+                "open external viewer: {err}\n\
+                 Temp file written at {}",
+                temp_path.display()
             ));
         }
     }
