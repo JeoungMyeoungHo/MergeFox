@@ -330,38 +330,81 @@ fn render_sidebar(ui: &mut egui::Ui, app: &mut MergeFoxApp, language: UiLanguage
 
     // Each tab gets a uniform full-sidebar-width row so short labels
     // ("AI") don't render as a tiny 30 px button next to longer ones
-    // ("Integrations" / "저장소"). Matches System Settings / VS Code
-    // navigation lists — clickable target is always a predictable strip.
+    // ("Integrations" / "저장소"). Clickable target is always a
+    // predictable strip.
+    //
+    // We paint the selected highlight ourselves (instead of relying on
+    // `SelectableLabel`) because egui's default selectable fills the
+    // row flush to its allocated rect, which makes the selected row
+    // and an adjacent hovered row appear visually merged — no gap
+    // between two coloured blocks. With a small inset + rounded
+    // corners the rows read as distinct pills.
     let row_width = ui.available_width();
     let row_height = 30.0;
-    let row_size = egui::vec2(row_width, row_height);
+    // Vertical breathing room between rows so consecutive fills never
+    // touch. Without this the rounded corners hide but adjacent rows
+    // still share a pixel edge.
+    let row_gap = 3.0;
     let mut clicked_section: Option<SettingsSection> = None;
     for &section in &visible_sections {
         let selected = current_section == section;
         let changed = section_is_changed(app, section);
         let label = section.label(language);
-        let text = if selected || changed {
-            RichText::new(label).strong()
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(row_width, row_height),
+            egui::Sense::click(),
+        );
+        // Inset the painted pill a touch so the focus ring / hover
+        // fill stays inside the logical row rect.
+        let pill = rect.shrink2(egui::vec2(2.0, 1.0));
+        let visuals = ui.style().visuals.clone();
+        let (fill, stroke) = if selected {
+            (
+                visuals.selection.bg_fill,
+                egui::Stroke::new(1.0, visuals.selection.stroke.color),
+            )
+        } else if resp.hovered() {
+            (
+                visuals.widgets.hovered.weak_bg_fill,
+                egui::Stroke::NONE,
+            )
         } else {
-            RichText::new(label)
+            (egui::Color32::TRANSPARENT, egui::Stroke::NONE)
         };
-        let resp = ui.add_sized(row_size, egui::SelectableLabel::new(selected, text));
-        let mut badge_rect = resp.rect;
-        badge_rect.set_left(resp.rect.right() - 70.0);
-        ui.scope_builder(egui::UiBuilder::new().max_rect(badge_rect), |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if changed {
-                    ui.label(
-                        RichText::new(chrome_labels(language).changed_badge)
-                            .small()
-                            .color(Color32::from_rgb(255, 171, 92)),
-                    );
-                }
-            });
-        });
+        if fill != egui::Color32::TRANSPARENT || stroke != egui::Stroke::NONE {
+            ui.painter().rect(pill, 5.0, fill, stroke);
+        }
+        let text_color = if selected {
+            visuals.selection.stroke.color
+        } else {
+            visuals.text_color()
+        };
+        let text = if selected || changed {
+            RichText::new(label).color(text_color).strong()
+        } else {
+            RichText::new(label).color(text_color)
+        };
+        // Text anchored at the pill's left-center with a little left padding.
+        ui.painter().text(
+            pill.left_center() + egui::vec2(10.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            text.text(),
+            egui::FontId::proportional(14.0),
+            text_color,
+        );
+        if changed {
+            ui.painter().text(
+                pill.right_center() - egui::vec2(10.0, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                chrome_labels(language).changed_badge,
+                egui::FontId::proportional(11.0),
+                Color32::from_rgb(255, 171, 92),
+            );
+        }
         if resp.clicked() {
             clicked_section = Some(section);
         }
+        ui.add_space(row_gap);
     }
 
     if visible_sections.is_empty() {
