@@ -670,18 +670,59 @@ pub enum FormatKind {
 impl FormatKind {
     pub fn from_ext(ext: &str) -> Self {
         match ext {
+            // --- Raster images (native decoders) ---
             "png" | "jpg" | "jpeg" | "gif" | "bmp" | "tga" | "tif" | "tiff" | "webp" | "ico"
             | "exr" | "hdr" | "qoi" => FormatKind::Image,
-            "psd" => FormatKind::Psd,
+            "psd" | "psb" => FormatKind::Psd,
+
+            // --- 3D / scene formats ---
             "fbx" => FormatKind::OpaqueAsset("FBX model"),
             "blend" => FormatKind::OpaqueAsset("Blender scene"),
-            "spine" => FormatKind::OpaqueAsset("Spine skeleton"),
             "obj" => FormatKind::OpaqueAsset("OBJ model"),
             "gltf" | "glb" => FormatKind::OpaqueAsset("glTF model"),
+            "usd" | "usda" | "usdc" | "usdz" => FormatKind::OpaqueAsset("USD scene"),
+            "abc" => FormatKind::OpaqueAsset("Alembic cache"),
+            "ma" | "mb" => FormatKind::OpaqueAsset("Maya scene"),
+            "max" => FormatKind::OpaqueAsset("3ds Max scene"),
+            "c4d" => FormatKind::OpaqueAsset("Cinema 4D scene"),
+            "spp" => FormatKind::OpaqueAsset("Substance Painter"),
+            "sbsar" | "sbs" => FormatKind::OpaqueAsset("Substance material"),
+            "vox" => FormatKind::OpaqueAsset("MagicaVoxel"),
+
+            // --- 2D / animation ---
+            "ase" | "aseprite" => FormatKind::OpaqueAsset("Aseprite"),
+            "spine" => FormatKind::OpaqueAsset("Spine skeleton"),
+            "kra" => FormatKind::OpaqueAsset("Krita"),
+            "xcf" => FormatKind::OpaqueAsset("GIMP document"),
+            "ai" => FormatKind::OpaqueAsset("Illustrator document"),
+
+            // --- GPU textures ---
+            "dds" => FormatKind::OpaqueAsset("DirectDraw surface"),
+            "ktx" | "ktx2" => FormatKind::OpaqueAsset("KTX texture"),
+            "astc" => FormatKind::OpaqueAsset("ASTC texture"),
+            "pvr" => FormatKind::OpaqueAsset("PVR texture"),
+            "basis" | "basisu" => FormatKind::OpaqueAsset("Basis Universal"),
+
+            // --- Engine-specific ---
             "uasset" => FormatKind::OpaqueAsset("Unreal asset"),
+            "umap" => FormatKind::OpaqueAsset("Unreal map"),
             "unity" | "prefab" => FormatKind::OpaqueAsset("Unity asset"),
-            "mp4" | "mov" | "webm" => FormatKind::OpaqueAsset("Video"),
-            "wav" | "mp3" | "ogg" | "flac" => FormatKind::OpaqueAsset("Audio"),
+            "unitypackage" => FormatKind::OpaqueAsset("Unity package"),
+            "asset" => FormatKind::OpaqueAsset("Engine asset"),
+            "anim" | "controller" | "mat" => FormatKind::OpaqueAsset("Unity asset"),
+            "scn" | "tscn" | "tres" | "res" => FormatKind::OpaqueAsset("Godot resource"),
+
+            // --- Media ---
+            "mp4" | "mov" | "webm" | "mkv" | "avi" => FormatKind::OpaqueAsset("Video"),
+            "wav" | "mp3" | "ogg" | "flac" | "m4a" | "aiff" | "aif" | "opus" => {
+                FormatKind::OpaqueAsset("Audio")
+            }
+
+            // --- Archives (often shipped with LFS) ---
+            "zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz" => {
+                FormatKind::OpaqueAsset("Archive")
+            }
+
             _ => FormatKind::Unknown,
         }
     }
@@ -708,6 +749,85 @@ impl FormatKind {
 /// can't actually decode synchronously in the worker pool.
 pub fn is_previewable_ext(ext: &str) -> bool {
     FormatKind::from_ext(&ext.to_ascii_lowercase()).has_inprocess_decoder()
+}
+
+/// Quick-look metadata card for a path. Used by the file-preview pane
+/// to render a richer placeholder for formats we can't decode in-process
+/// (`.fbx`, `.blend`, engine assets). The card surfaces the format
+/// label, byte size, and modification time so users can still skim
+/// "what is this, when did it change, is it big" without opening the
+/// file externally.
+#[derive(Debug, Clone)]
+pub struct PlaceholderMetadata {
+    pub label: &'static str,
+    pub size_bytes: Option<u64>,
+    pub modified_relative: Option<String>,
+}
+
+impl PlaceholderMetadata {
+    pub fn for_path(path: &Path) -> Self {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let kind = FormatKind::from_ext(&ext);
+        let label = match kind {
+            FormatKind::OpaqueAsset(l) => l,
+            FormatKind::Psd => "Photoshop document",
+            FormatKind::Image => "Image",
+            FormatKind::Unknown => "File",
+        };
+        let meta = std::fs::metadata(path).ok();
+        let size_bytes = meta.as_ref().map(|m| m.len());
+        let modified_relative = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(relative_time_since);
+        Self {
+            label,
+            size_bytes,
+            modified_relative,
+        }
+    }
+
+    /// One-line summary for the placeholder card.
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = vec![self.label.to_string()];
+        if let Some(bytes) = self.size_bytes {
+            parts.push(format_bytes(bytes));
+        }
+        if let Some(rel) = self.modified_relative.as_ref() {
+            parts.push(format!("modified {rel}"));
+        }
+        parts.join(" · ")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn relative_time_since(when: std::time::SystemTime) -> Option<String> {
+    let diff = std::time::SystemTime::now().duration_since(when).ok()?;
+    let secs = diff.as_secs();
+    Some(match secs {
+        0..=59 => "moments ago".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    })
 }
 
 fn decode(kind: FormatKind, bytes: &[u8], mode: PreviewMode) -> Result<Option<DecodedImage>> {
@@ -968,5 +1088,41 @@ mod tests {
                 eprintln!("qlmanage produced no output, treating as skip");
             }
         }
+    }
+
+    #[test]
+    fn format_bytes_rolls_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(2048), "2 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn format_kind_from_ext_covers_new_game_formats() {
+        assert!(matches!(FormatKind::from_ext("umap"), FormatKind::OpaqueAsset(_)));
+        assert!(matches!(FormatKind::from_ext("ase"), FormatKind::OpaqueAsset(_)));
+        assert!(matches!(FormatKind::from_ext("dds"), FormatKind::OpaqueAsset(_)));
+        assert!(matches!(FormatKind::from_ext("usdc"), FormatKind::OpaqueAsset(_)));
+        assert!(matches!(FormatKind::from_ext("vox"), FormatKind::OpaqueAsset(_)));
+        assert!(matches!(FormatKind::from_ext("psb"), FormatKind::Psd));
+        assert!(matches!(FormatKind::from_ext("nope"), FormatKind::Unknown));
+    }
+
+    #[test]
+    fn placeholder_metadata_summary_combines_parts() {
+        // Synthesize a PlaceholderMetadata without touching disk so the
+        // test is hermetic. `for_path` is covered implicitly by the
+        // production render path; here we just check summary format.
+        let meta = PlaceholderMetadata {
+            label: "FBX model",
+            size_bytes: Some(1024 * 1024 * 12),
+            modified_relative: Some("3h ago".into()),
+        };
+        let s = meta.summary();
+        assert!(s.contains("FBX model"));
+        assert!(s.contains("12.0 MB"));
+        assert!(s.contains("3h ago"));
     }
 }
