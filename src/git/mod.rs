@@ -9,6 +9,7 @@ pub mod graph;
 pub mod hunk_staging;
 pub mod jobs;
 pub mod lfs;
+pub mod lfs_locks;
 pub mod message_lint;
 pub mod ops;
 pub mod reflog_rewind;
@@ -56,6 +57,7 @@ pub use hunk_staging::{
 pub use graph::{CommitGraph, GraphRow, GraphScope, RefKind, RefLabel};
 pub use jobs::{GitJob, GitJobKind, JobProgress, PullStrategy};
 pub use lfs::{LfsCandidate, LfsScanResult};
+pub use lfs_locks::{LfsListResult, LfsLock, LfsUnlockError};
 pub use ops::{EntryKind, StashEntry, StatusEntry};
 pub use repo::{
     BisectStatus, BranchInfo, ConflictBlob, ConflictChoice, ConflictEntry, CountObjectsSummary,

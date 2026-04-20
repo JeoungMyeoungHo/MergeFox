@@ -61,6 +61,29 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         .filter(|e| e.unstaged || matches!(e.kind, EntryKind::Untracked))
         .count();
 
+    // Snapshot the lock context so the render closure can reference
+    // it without re-borrowing `ws`. When the profile hides lock
+    // controls we leave `lock_ctx` = None so the banner, glyphs, and
+    // context-menu items are all skipped in one branch.
+    let lock_ctx = {
+        let rules = crate::ui::profile_rules::rules_for(ws.workspace_profile);
+        if rules.show_lfs_lock_controls {
+            ws.lfs_locks.as_ref().map(|locks| LockContext {
+                locks: locks.clone(),
+                current_user: ws.git_user_name.clone(),
+            })
+        } else {
+            None
+        }
+    };
+    // Compute the "you are editing someone else's locked file"
+    // banner content once, outside the closure, so the window
+    // doesn't re-walk the entries on every repaint.
+    let foreign_lock_banner = lock_ctx
+        .as_ref()
+        .map(|ctx| build_foreign_lock_banner(&entries, ctx))
+        .filter(|s| !s.is_empty());
+
     let recent_messages = ws
         .repo
         .linear_head_commits(12)
@@ -87,6 +110,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let mut result: CommitIntent = CommitIntent::None;
     let mut move_intent: Option<MoveIntent> = None;
     let mut open_ai_settings = false;
+    let mut lock_intent: Option<CommitModalLockIntent> = None;
 
     // Prune stale selections (files that disappeared from the status list,
     // e.g. just got committed in another pane) so the selection counter
@@ -120,6 +144,16 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         .default_width(720.0)
         .min_width(560.0)
         .show(ctx, |ui| {
+            // Non-blocking warning when the user is about to commit
+            // changes to files someone else has locked. We don't
+            // refuse the commit — the lock server might have gone
+            // stale and we'd rather let the user commit and find
+            // out at push time than wedge them entirely.
+            if let Some(banner) = &foreign_lock_banner {
+                ui.colored_label(Color32::from_rgb(220, 170, 60), banner);
+                ui.add_space(4.0);
+            }
+
             // ---- Unstaged panel -----------------------------------------
             render_panel(
                 ui,
@@ -128,6 +162,8 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 commit_modal,
                 &mut move_intent,
                 unstaged_count,
+                lock_ctx.as_ref(),
+                &mut lock_intent,
             );
 
             ui.add_space(6.0);
@@ -142,6 +178,8 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 commit_modal,
                 &mut move_intent,
                 staged_count,
+                lock_ctx.as_ref(),
+                &mut lock_intent,
             );
 
             ui.add_space(8.0);
@@ -349,6 +387,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     if let Some(intent) = move_intent {
         apply_move_intent(app, intent);
     }
+    if let Some(intent) = lock_intent {
+        apply_lock_intent(app, intent);
+    }
     if open_ai_settings {
         app.open_settings_section(crate::ui::settings::SettingsSection::Ai);
     }
@@ -475,6 +516,8 @@ fn render_panel(
     modal: &mut CommitModal,
     move_intent: &mut Option<MoveIntent>,
     count_for_header: usize,
+    lock_ctx: Option<&LockContext>,
+    lock_intent: &mut Option<CommitModalLockIntent>,
 ) {
     // Filter entries belonging to this panel.
     //
@@ -640,7 +683,16 @@ fn render_panel(
                 return;
             }
             for entry in &belongs {
-                render_row(ui, kind, &belongs, entry, modal, move_intent);
+                render_row(
+                    ui,
+                    kind,
+                    &belongs,
+                    entry,
+                    modal,
+                    move_intent,
+                    lock_ctx,
+                    lock_intent,
+                );
             }
         });
 }
@@ -653,7 +705,16 @@ fn render_row(
     entry: &StatusEntry,
     modal: &mut CommitModal,
     move_intent: &mut Option<MoveIntent>,
+    lock_ctx: Option<&LockContext>,
+    lock_intent: &mut Option<CommitModalLockIntent>,
 ) {
+    // Resolve lock state for this row (if the profile enables it).
+    // `Owned` → render padlock + "Unlock" context item. `Foreign`
+    // → render padlock + hover owner name + "Force unlock (admin)".
+    // `None` → no lock decorations at all.
+    let row_lock = lock_ctx
+        .and_then(|ctx| ctx.state_for(&entry.path));
+
     ui.horizontal(|ui| {
         let mut checked = modal.selection.contains(&entry.path);
         if ui.checkbox(&mut checked, "").changed() {
@@ -662,6 +723,25 @@ fn render_row(
 
         let (color, glyph) = style_for(&entry.kind, entry.staged, entry.unstaged);
         ui.label(RichText::new(glyph).color(color).monospace().strong());
+
+        // Lock glyph sits immediately before the path so the
+        // "someone owns this file" signal is impossible to miss.
+        // Colored per-ownership so self-owned vs. foreign locks
+        // read at a glance.
+        if let Some(state) = &row_lock {
+            let (color, hover) = match state {
+                RowLockState::Owned => (
+                    Color32::from_rgb(120, 200, 140),
+                    "Locked by you".to_string(),
+                ),
+                RowLockState::Foreign { owner } => (
+                    Color32::from_rgb(220, 170, 60),
+                    format!("Locked by {owner}"),
+                ),
+            };
+            ui.label(RichText::new("🔒").color(color).small())
+                .on_hover_text(hover);
+        }
 
         // Clickable path label — clicking toggles the checkbox so users
         // don't have to aim at the tiny checkbox. Right-click opens a
@@ -694,6 +774,12 @@ fn render_row(
             {
                 *move_intent = Some(MoveIntent::UnstageOne(entry.path.clone()));
                 ui.close_menu();
+            }
+            // LFS lock / unlock affordances — only in profiles where
+            // `show_lfs_lock_controls` is on (gated by `lock_ctx`).
+            if lock_ctx.is_some() {
+                ui.separator();
+                render_row_lock_menu(ui, &entry.path, row_lock.as_ref(), lock_intent);
             }
             ui.separator();
             ui.weak("For per-hunk staging, open the diff view for this file.");
@@ -1218,4 +1304,132 @@ fn style_for(kind: &EntryKind, staged: bool, _unstaged: bool) -> (Color32, Strin
 fn short(oid: &gix::ObjectId) -> String {
     let s = oid.to_string();
     s[..7.min(s.len())].to_string()
+}
+
+// ------------------------------ LFS locks -----------------------------------
+
+/// Snapshot of the lock state the commit modal needs to render its
+/// lock decorations. Cloned from [`crate::app::WorkspaceState`] once
+/// per `show()` call so the render closure can touch it without a
+/// live borrow of `ws`.
+pub(crate) struct LockContext {
+    pub(crate) locks: Vec<crate::git::LfsLock>,
+    pub(crate) current_user: String,
+}
+
+/// Per-row lock state. `Owned` → self; `Foreign` → someone else.
+/// Absence (`None`) means no lock on this path at all.
+#[derive(Clone)]
+enum RowLockState {
+    Owned,
+    Foreign { owner: String },
+}
+
+impl LockContext {
+    fn state_for(&self, path: &std::path::Path) -> Option<RowLockState> {
+        let lock = self.locks.iter().find(|l| l.path.as_path() == path)?;
+        if !self.current_user.is_empty() && lock.owner == self.current_user {
+            Some(RowLockState::Owned)
+        } else {
+            let owner = if lock.owner.is_empty() {
+                "another user".to_string()
+            } else {
+                lock.owner.clone()
+            };
+            Some(RowLockState::Foreign { owner })
+        }
+    }
+}
+
+/// Build the "you are editing someone else's locked file" banner
+/// text, or an empty string when every locked file in the status
+/// list is self-owned (or unlocked). Walks the entry list and the
+/// lock list once, so the cost is O(entries * locks) on a short
+/// list — fine for the typical working-tree size.
+fn build_foreign_lock_banner(entries: &[StatusEntry], ctx: &LockContext) -> String {
+    let mut bits: Vec<String> = Vec::new();
+    for entry in entries {
+        if let Some(RowLockState::Foreign { owner }) = ctx.state_for(&entry.path) {
+            bits.push(format!("{} (by {owner})", entry.path.display()));
+        }
+    }
+    if bits.is_empty() {
+        String::new()
+    } else {
+        format!("Editing files locked by others: {}", bits.join(", "))
+    }
+}
+
+/// What the lock context menu wants to trigger. Mirrors the sidebar's
+/// [`crate::ui::sidebar::LockIntent`] but kept separate because this
+/// one has an extra "ForceUnlockPrompt" shape — the sidebar one also
+/// has one, but the modal dispatcher routes through the same
+/// `MergeFoxApp` entry points so we don't cross-import.
+pub(crate) enum CommitModalLockIntent {
+    Lock { path: PathBuf },
+    Unlock { path: PathBuf },
+    ForceUnlockPrompt { path: PathBuf, owner: String },
+}
+
+fn render_row_lock_menu(
+    ui: &mut egui::Ui,
+    path: &std::path::Path,
+    row_lock: Option<&RowLockState>,
+    intent: &mut Option<CommitModalLockIntent>,
+) {
+    match row_lock {
+        None => {
+            if ui
+                .button("Lock file")
+                .on_hover_text("Acquire an LFS lock on this file")
+                .clicked()
+            {
+                *intent = Some(CommitModalLockIntent::Lock {
+                    path: path.to_path_buf(),
+                });
+                ui.close_menu();
+            }
+        }
+        Some(RowLockState::Owned) => {
+            if ui
+                .button("Unlock file")
+                .on_hover_text("Release your lock on this file")
+                .clicked()
+            {
+                *intent = Some(CommitModalLockIntent::Unlock {
+                    path: path.to_path_buf(),
+                });
+                ui.close_menu();
+            }
+        }
+        Some(RowLockState::Foreign { owner }) => {
+            if ui
+                .button(
+                    egui::RichText::new("Force unlock (admin)")
+                        .color(Color32::LIGHT_RED),
+                )
+                .on_hover_text(
+                    "Override another user's lock — requires server admin permission",
+                )
+                .clicked()
+            {
+                *intent = Some(CommitModalLockIntent::ForceUnlockPrompt {
+                    path: path.to_path_buf(),
+                    owner: owner.clone(),
+                });
+                ui.close_menu();
+            }
+        }
+    }
+}
+
+fn apply_lock_intent(app: &mut crate::app::MergeFoxApp, intent: CommitModalLockIntent) {
+    match intent {
+        CommitModalLockIntent::Lock { path } => app.start_lfs_lock(path),
+        CommitModalLockIntent::Unlock { path } => app.start_lfs_unlock(path, false),
+        CommitModalLockIntent::ForceUnlockPrompt { path, owner } => {
+            app.force_unlock_confirm =
+                Some(crate::ui::sidebar::ForceUnlockConfirm { path, owner });
+        }
+    }
 }
