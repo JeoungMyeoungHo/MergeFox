@@ -253,6 +253,17 @@ pub struct SettingsModal {
     /// `Some(list)` (empty when the repo has no submodules). Reset
     /// after update / sync to force a re-read.
     pub submodules: Option<Vec<crate::git::SubmoduleEntry>>,
+    /// Per-template "apply this one" checkboxes. Populated on-demand
+    /// when the user expands the "Project templates" panel, keyed by
+    /// the `TemplateKind` discriminant. Empty = use defaults (all
+    /// selected) on first expand.
+    pub project_template_selection:
+        std::collections::HashMap<crate::git::project_templates::TemplateKind, bool>,
+    /// Whether the "Project templates" applier panel is expanded in the
+    /// Repository settings section. Collapsed by default so the
+    /// existing chrome is not visually disrupted for users who don't
+    /// need templating.
+    pub project_templates_expanded: bool,
     /// Most recent on-screen size of the settings window. Saved back to
     /// config when the modal closes so the next open restores it.
     pub window_size: Option<crate::config::SettingsWindowState>,
@@ -3170,6 +3181,8 @@ impl MergeFoxApp {
             sparse_checkout: None,
             sparse_patterns_draft: String::new(),
             submodules: None,
+            project_template_selection: std::collections::HashMap::new(),
+            project_templates_expanded: false,
             window_size: Some(self.config.settings_window.clone()),
             reset_scope: None,
         });

@@ -6,6 +6,7 @@ pub mod graph;
 pub mod jobs;
 pub mod lfs;
 pub mod ops;
+pub mod project_templates;
 pub mod repo;
 
 pub use basket_ops::{

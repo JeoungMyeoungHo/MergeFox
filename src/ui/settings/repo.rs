@@ -9,6 +9,14 @@
 //!   saving on every keystroke would spam gix with malformed URLs
 //!   during typing.
 //! * Add / Delete write immediately.
+//!
+//! The "Project templates" panel near the top of this section is a
+//! per-repo helper that drops curated `.gitattributes` / `.gitignore`
+//! files for detected game-engine projects (Unreal / Unity / Godot).
+//! It uses `crate::git::project_templates` and never runs `git add` —
+//! the user reviews the resulting working-tree diff before committing.
+
+use std::path::Path;
 
 use anyhow::bail;
 use egui::{Color32, ComboBox, RichText, TextEdit};
@@ -16,6 +24,9 @@ use egui::{Color32, ComboBox, RichText, TextEdit};
 use super::{finish_repo_update, persist_config, with_settings_repo, Feedback};
 use crate::app::MergeFoxApp;
 use crate::config::{PullStrategyPref, RepoSettings, UiLanguage};
+use crate::git::project_templates::{
+    apply_template, templates_for, ApplyOutcome, DetectedProjectKind, TemplateKind,
+};
 
 pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
     let language = current_language(app);
@@ -143,6 +154,35 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
             }
         });
         ui.weak(labels.provider_account_hint);
+
+        // --- project templates ----------------------------------------
+        //
+        // Detected game-engine projects get a curated `.gitattributes`
+        // / `.gitignore` pair in one click. The detection runs here
+        // (rather than in a shared cache) because the section is
+        // rendered at most a few times per second and the probe is a
+        // handful of `Path::exists` calls — cheaper than invalidating
+        // a workspace-level cache when the repo's files change.
+        //
+        // Rendering reads/writes modal state through plain fields so we
+        // don't need a second `settings_modal.as_mut()` borrow from
+        // inside the already-active one.
+        let detected = detect_project_kind(&repo_path);
+        if let Some(kind) = detected {
+            let (next_expanded, next_selection, fire_intent) = render_project_templates(
+                ui,
+                &repo_path,
+                kind,
+                modal.project_templates_expanded,
+                modal.project_template_selection.clone(),
+                &labels,
+            );
+            modal.project_templates_expanded = next_expanded;
+            modal.project_template_selection = next_selection;
+            if let Some(tmpl_intent) = fire_intent {
+                intent = Some(tmpl_intent);
+            }
+        }
 
         ui.add_space(12.0);
         ui.heading(labels.remote_urls);
@@ -549,6 +589,14 @@ enum Intent {
     SyncSubmodule {
         path: Option<String>,
     },
+    /// Apply the user's currently-checked subset of `templates_for(kind)`
+    /// to the repo at `repo_path`. Dispatched from the "Project
+    /// templates" sub-section.
+    ApplyProjectTemplates {
+        repo_path: std::path::PathBuf,
+        kind: DetectedProjectKind,
+        selected: Vec<TemplateKind>,
+    },
 }
 
 fn handle_intent(app: &mut MergeFoxApp, intent: Intent, labels: &Labels) {
@@ -580,6 +628,11 @@ fn handle_intent(app: &mut MergeFoxApp, intent: Intent, labels: &Labels) {
         Intent::RefreshSubmodules => refresh_submodules(app),
         Intent::UpdateSubmodule { path } => update_submodule(app, path, labels),
         Intent::SyncSubmodule { path } => sync_submodule(app, path, labels),
+        Intent::ApplyProjectTemplates {
+            repo_path,
+            kind,
+            selected,
+        } => apply_project_templates(app, &repo_path, kind, &selected, labels),
     }
 }
 
@@ -891,6 +944,248 @@ fn cleaned(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Heuristic probe: does this repo look like an Unreal / Unity / Godot
+/// project? We check the repo root for a handful of well-known marker
+/// files/directories and stop at the first match. `None` means no
+/// engine was detected; in that case the UI hides the template panel.
+///
+/// The markers are intentionally conservative — we'd rather fail to
+/// detect a genuine game project than mislabel a generic Rust repo as
+/// "Unreal" and offer to drop 40 ignore patterns on it. The UI also
+/// surfaces the detected engine to the user before any template runs,
+/// so a mis-detection can't cause damage without a confirmation click.
+fn detect_project_kind(repo_path: &Path) -> Option<DetectedProjectKind> {
+    // Godot first — its `project.godot` marker is the most specific of
+    // the three (one file, a fixed name). Unity's `ProjectSettings/`
+    // and Unreal's `.uproject` come next; neither directory name is
+    // guaranteed to be unique in the wild so we also require a sibling
+    // that Unity / Unreal typically generate.
+    if repo_path.join("project.godot").is_file() {
+        return Some(DetectedProjectKind::Godot);
+    }
+    if has_uproject(repo_path) {
+        return Some(DetectedProjectKind::Unreal);
+    }
+    if repo_path.join("ProjectSettings").is_dir() && repo_path.join("Assets").is_dir() {
+        return Some(DetectedProjectKind::Unity);
+    }
+    None
+}
+
+/// Unreal doesn't have a fixed `.uproject` filename — it takes the
+/// project's name — so we scan the repo root for any `*.uproject`.
+/// Root-only is fine because Unreal refuses to open a project whose
+/// `.uproject` file lives in a subdirectory without a manual move.
+fn has_uproject(repo_path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(repo_path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".uproject") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Render the "Project templates" block. Returns the updated
+/// (expanded, selection, optional-apply-intent) so the caller can
+/// write them back to the modal without a nested `as_mut` borrow.
+///
+/// The function is pure w.r.t. application state — it reads the
+/// current panel pose through arguments, composes egui widgets, and
+/// surfaces the user's decisions as return values. All persistence
+/// happens at the call site.
+fn render_project_templates(
+    ui: &mut egui::Ui,
+    repo_path: &Path,
+    kind: DetectedProjectKind,
+    mut expanded: bool,
+    selection_in: std::collections::HashMap<TemplateKind, bool>,
+    labels: &Labels,
+) -> (
+    bool,
+    std::collections::HashMap<TemplateKind, bool>,
+    Option<Intent>,
+) {
+    let templates = templates_for(kind);
+
+    ui.add_space(16.0);
+    ui.heading(labels.project_templates);
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(labels.project_templates_detected);
+        ui.label(
+            RichText::new(project_kind_label(kind))
+                .strong()
+                .color(Color32::from_rgb(140, 200, 155)),
+        );
+    });
+    ui.weak(labels.project_templates_blurb);
+
+    // Seed the checkbox map on first expand so every template starts
+    // ticked — the most common flow is "apply everything we suggest".
+    let mut selection = if selection_in.is_empty() {
+        let mut map = std::collections::HashMap::new();
+        for tmpl in templates {
+            map.insert(tmpl.kind, true);
+        }
+        map
+    } else {
+        selection_in
+    };
+
+    let header = if expanded {
+        labels.project_templates_collapse
+    } else {
+        labels.project_templates_review
+    };
+    if ui.button(header).clicked() {
+        expanded = !expanded;
+    }
+
+    let mut fire_intent: Option<Intent> = None;
+    if expanded {
+        ui.add_space(4.0);
+        for tmpl in templates {
+            let entry = selection.entry(tmpl.kind).or_insert(true);
+            ui.horizontal(|ui| {
+                ui.checkbox(entry, "");
+                ui.label(RichText::new(tmpl.filename).monospace().strong());
+                ui.weak(format!("— {}", tmpl.summary));
+            });
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let any_selected = selection.values().any(|v| *v);
+            if ui
+                .add_enabled(any_selected, egui::Button::new(labels.project_templates_apply))
+                .on_hover_text(labels.project_templates_apply_hint)
+                .clicked()
+            {
+                let chosen: Vec<TemplateKind> = templates
+                    .iter()
+                    .filter(|t| selection.get(&t.kind).copied().unwrap_or(true))
+                    .map(|t| t.kind)
+                    .collect();
+                fire_intent = Some(Intent::ApplyProjectTemplates {
+                    repo_path: repo_path.to_path_buf(),
+                    kind,
+                    selected: chosen,
+                });
+            }
+            if ui.button(labels.project_templates_cancel).clicked() {
+                expanded = false;
+            }
+        });
+    }
+
+    (expanded, selection, fire_intent)
+}
+
+
+fn project_kind_label(kind: DetectedProjectKind) -> &'static str {
+    match kind {
+        DetectedProjectKind::Unreal => "Unreal",
+        DetectedProjectKind::Unity => "Unity",
+        DetectedProjectKind::Godot => "Godot",
+    }
+}
+
+/// Apply the user-chosen subset and surface a single summary toast.
+///
+/// We compose *one* notification (not one per template) because the
+/// common case is "created 2 files" and a flurry of toasts for a
+/// 2-item operation feels noisy. Per-path details go into the
+/// notification's expandable detail body.
+fn apply_project_templates(
+    app: &mut MergeFoxApp,
+    repo_path: &Path,
+    kind: DetectedProjectKind,
+    selected: &[TemplateKind],
+    labels: &Labels,
+) {
+    let templates = templates_for(kind);
+    let mut created = 0usize;
+    let mut merged_with_additions = 0usize;
+    let mut merged_no_op = 0usize;
+    let mut skipped: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
+    let mut detail_lines: Vec<String> = Vec::new();
+
+    for tmpl in templates {
+        if !selected.contains(&tmpl.kind) {
+            continue;
+        }
+        match apply_template(repo_path, tmpl) {
+            Ok(ApplyOutcome::Created { path }) => {
+                created += 1;
+                detail_lines.push(format!("created {}", path.display()));
+            }
+            Ok(ApplyOutcome::Merged { path, added_lines }) => {
+                if added_lines == 0 {
+                    merged_no_op += 1;
+                    detail_lines.push(format!(
+                        "{} — already up to date",
+                        path.display()
+                    ));
+                } else {
+                    merged_with_additions += 1;
+                    detail_lines.push(format!(
+                        "merged {} new line{} into {}",
+                        added_lines,
+                        if added_lines == 1 { "" } else { "s" },
+                        path.display()
+                    ));
+                }
+            }
+            Ok(ApplyOutcome::SkippedExisting { path, reason }) => {
+                detail_lines.push(format!("skipped {} — {reason}", path.display()));
+                skipped.push((path, reason));
+            }
+            Err(err) => {
+                let name = tmpl.filename.to_string();
+                let msg = format!("{err:#}");
+                detail_lines.push(format!("{name} failed: {msg}"));
+                errors.push((name, msg));
+            }
+        }
+    }
+
+    let summary = format!(
+        "{}: {} created, {} merged, {} skipped",
+        labels.project_templates_toast_prefix,
+        created,
+        merged_with_additions + merged_no_op,
+        skipped.len() + errors.len()
+    );
+
+    let mut detail = detail_lines.join("\n");
+    if !skipped.is_empty() || !errors.is_empty() {
+        detail.push_str("\n\n");
+        detail.push_str(labels.project_templates_toast_review_hint);
+    } else {
+        detail.push_str("\n\n");
+        detail.push_str(labels.project_templates_toast_review_commit);
+    }
+
+    // Error severity for "nothing succeeded and at least one thing
+    // failed"; otherwise a plain success toast. Mixed outcomes still
+    // count as success because the failures are surfaced in the detail.
+    let severity = if created + merged_with_additions + merged_no_op == 0
+        && (!skipped.is_empty() || !errors.is_empty())
+    {
+        crate::ui::notifications::NotifSeverity::Warning
+    } else {
+        crate::ui::notifications::NotifSeverity::Success
+    };
+    app.notifications
+        .push_with_detail(severity, summary.clone(), Some(detail));
+    app.hud = Some(crate::app::Hud::new(summary, 1800));
+}
+
 fn current_language(app: &MergeFoxApp) -> UiLanguage {
     app.settings_modal
         .as_ref()
@@ -984,6 +1279,17 @@ struct Labels {
     submodule_synced: &'static str,
     submodule_synced_all: &'static str,
     submodule_sync_failed: &'static str,
+    project_templates: &'static str,
+    project_templates_detected: &'static str,
+    project_templates_blurb: &'static str,
+    project_templates_review: &'static str,
+    project_templates_collapse: &'static str,
+    project_templates_apply: &'static str,
+    project_templates_apply_hint: &'static str,
+    project_templates_cancel: &'static str,
+    project_templates_toast_prefix: &'static str,
+    project_templates_toast_review_commit: &'static str,
+    project_templates_toast_review_hint: &'static str,
 }
 
 fn labels(lang: UiLanguage) -> Labels {
@@ -1076,6 +1382,17 @@ fn labels(lang: UiLanguage) -> Labels {
             submodule_synced: "서브모듈 URL 동기화 완료",
             submodule_synced_all: "모든 서브모듈 URL을 동기화했습니다",
             submodule_sync_failed: "서브모듈 URL 동기화 실패",
+            project_templates: "프로젝트 템플릿",
+            project_templates_detected: "감지된 엔진:",
+            project_templates_blurb: "이 저장소에 맞는 .gitattributes / .gitignore 기본값을 적용합니다. 커밋은 직접 확인한 뒤 진행하세요.",
+            project_templates_review: "템플릿 검토 및 적용",
+            project_templates_collapse: "접기",
+            project_templates_apply: "선택한 템플릿 적용",
+            project_templates_apply_hint: "체크된 파일만 작성/병합합니다. git add는 실행하지 않습니다.",
+            project_templates_cancel: "취소",
+            project_templates_toast_prefix: "프로젝트 템플릿",
+            project_templates_toast_review_commit: "변경 사항을 워킹 트리에서 검토한 뒤 천천히 커밋하세요.",
+            project_templates_toast_review_hint: "건너뛴 파일이 있습니다 — 아래 경로를 수동으로 확인하세요.",
         },
         _ => Labels {
             heading: "Repository Settings",
@@ -1165,6 +1482,17 @@ fn labels(lang: UiLanguage) -> Labels {
             submodule_synced: "Submodule URL synced",
             submodule_synced_all: "Synced every submodule URL",
             submodule_sync_failed: "Submodule URL sync failed",
+            project_templates: "Project templates",
+            project_templates_detected: "Detected engine:",
+            project_templates_blurb: "Drop in a curated .gitattributes / .gitignore tuned for this engine. Review the working-tree diff before committing.",
+            project_templates_review: "Review & apply templates",
+            project_templates_collapse: "Collapse",
+            project_templates_apply: "Apply selected",
+            project_templates_apply_hint: "Writes or merges the checked files. Never runs git add.",
+            project_templates_cancel: "Cancel",
+            project_templates_toast_prefix: "Project templates",
+            project_templates_toast_review_commit: "Review and commit the changes at your own pace.",
+            project_templates_toast_review_hint: "Some files were skipped — open the paths above to merge them manually.",
         },
     }
 }
