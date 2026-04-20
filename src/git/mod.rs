@@ -12,6 +12,7 @@ pub mod lfs;
 pub mod lfs_locks;
 pub mod message_lint;
 pub mod ops;
+pub mod project_templates;
 pub mod reflog_rewind;
 pub mod repo;
 pub mod split_ops;
