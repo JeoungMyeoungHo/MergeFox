@@ -59,6 +59,6 @@ pub use lfs::{LfsCandidate, LfsScanResult};
 pub use ops::{EntryKind, StashEntry, StatusEntry};
 pub use repo::{
     BisectStatus, BranchInfo, ConflictBlob, ConflictChoice, ConflictEntry, CountObjectsSummary,
-    LinearCommit, ReflogEntrySummary, RemoteInfo, Repo, RepoState, SparseCheckoutStatus,
-    SubmoduleEntry, SubmoduleState, WorktreeInfo,
+    KeepBothOutcome, LinearCommit, ReflogEntrySummary, RemoteInfo, Repo, RepoState,
+    SparseCheckoutStatus, SubmoduleEntry, SubmoduleState, WorktreeInfo,
 };
