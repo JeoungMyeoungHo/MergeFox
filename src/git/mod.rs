@@ -5,6 +5,7 @@ pub mod diff;
 pub mod graph;
 pub mod jobs;
 pub mod lfs;
+pub mod lfs_locks;
 pub mod ops;
 pub mod repo;
 
@@ -23,6 +24,7 @@ pub use diff::{
 pub use graph::{CommitGraph, GraphRow, GraphScope, RefKind, RefLabel};
 pub use jobs::{GitJob, GitJobKind, JobProgress, PullStrategy};
 pub use lfs::{LfsCandidate, LfsScanResult};
+pub use lfs_locks::{LfsListResult, LfsLock, LfsUnlockError};
 pub use ops::{EntryKind, StashEntry, StatusEntry};
 pub use repo::{
     BisectStatus, BranchInfo, ConflictBlob, ConflictChoice, ConflictEntry, CountObjectsSummary,

@@ -1,6 +1,9 @@
+use std::path::PathBuf;
+
 use crate::actions::CommitAction;
 use crate::app::{MergeFoxApp, View};
-use crate::git::{BranchInfo, LfsCandidate, LfsScanResult, StashEntry};
+use crate::git::{BranchInfo, LfsCandidate, LfsLock, LfsScanResult, StashEntry};
+use crate::ui::profile_rules;
 
 pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let sidebar_fill = crate::ui::theme::sidebar_fill(&app.config.theme);
@@ -17,6 +20,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         head_branch,
         forge,
         lfs,
+        locks,
     ) = {
         let View::Workspace(tabs) = &mut app.view else {
             return;
@@ -59,6 +63,23 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             result: ws.lfs_scan.result.clone(),
         };
 
+        // Per-profile snapshot for the "File locks" panel. We only
+        // populate this when the profile opts in, so General-profile
+        // repos skip the clone entirely.
+        let locks = {
+            let rules = profile_rules::rules_for(ws.workspace_profile);
+            if rules.show_lfs_lock_controls {
+                Some(LfsLocksViewState {
+                    locks: ws.lfs_locks.clone(),
+                    unavailable_reason: ws.lfs_locks_unavailable_reason.clone(),
+                    refreshing: ws.lfs_locks_refresh_task.is_some(),
+                    current_user: ws.git_user_name.clone(),
+                })
+            } else {
+                None
+            }
+        };
+
         (
             branch_error,
             stash_error,
@@ -70,6 +91,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             head_branch,
             ws.forge.clone(),
             lfs,
+            locks,
         )
     };
 
@@ -79,6 +101,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let mut stash_action: Option<CommitAction> = None;
     let mut branch_action: Option<CommitAction> = None;
     let mut open_publish_remote: Option<String> = None;
+    let mut lock_intent: Option<LockIntent> = None;
 
     egui::SidePanel::left("branches")
         .resizable(true)
@@ -189,6 +212,10 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
                 render_lfs_section(ui, &lfs, &mut dismiss_lfs);
 
+                if let Some(locks) = locks.as_ref() {
+                    render_lfs_locks_section(ui, locks, &mut lock_intent);
+                }
+
                 crate::ui::forge::show_sidebar(ui, language, &forge, &mut forge_action);
             });
         });
@@ -227,6 +254,50 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             }
         }
     }
+
+    if let Some(intent) = lock_intent {
+        dispatch_lock_intent(app, intent);
+    }
+}
+
+/// What the "File locks" panel wants the outer handler to do.
+/// Deliberately kept outside the render closure so the renderer can
+/// stay pure (no `&mut MergeFoxApp`) — we collect an intent and
+/// dispatch after the borrow ends, same pattern the rest of this
+/// file uses for branch / stash actions.
+pub(crate) enum LockIntent {
+    Refresh,
+    Unlock { path: PathBuf },
+    ForceUnlockPrompt { path: PathBuf, owner: String },
+}
+
+fn dispatch_lock_intent(app: &mut MergeFoxApp, intent: LockIntent) {
+    match intent {
+        LockIntent::Refresh => app.refresh_active_lfs_locks(),
+        LockIntent::Unlock { path } => app.start_lfs_unlock(path, false),
+        LockIntent::ForceUnlockPrompt { path, owner } => {
+            // Surface a confirm toast through the notification
+            // center. We don't reuse the `PendingPrompt::Confirm`
+            // machinery here because its `ConfirmKind` is already a
+            // fairly long enum of destructive branch/stash actions —
+            // dragging a cross-cutting "force unlock" variant into
+            // it would widen several match arms in `prompt.rs`
+            // needlessly. Instead we render our own tiny confirm
+            // window right here in the sidebar via
+            // `render_force_unlock_confirm` the next frame.
+            app.force_unlock_confirm = Some(ForceUnlockConfirm { path, owner });
+        }
+    }
+}
+
+/// Confirm state for a pending "force unlock" click. Lives on
+/// [`MergeFoxApp`] via [`MergeFoxApp::force_unlock_confirm`] so the
+/// tiny modal survives frame-to-frame rerenders without going
+/// through the full `PendingPrompt` machinery — force unlock isn't
+/// destructive at the repo level, only on the lock server.
+pub struct ForceUnlockConfirm {
+    pub path: PathBuf,
+    pub owner: String,
 }
 
 /// Hover text for the ahead/behind pill. Combined into one string so
@@ -558,5 +629,236 @@ fn shorten(s: &str, max_chars: usize) -> String {
         let mut out: String = s.chars().take(max_chars).collect();
         out.push('…');
         out
+    }
+}
+
+/// Truncate a path string from the left (head) rather than the tail
+/// (end), so long paths still show their filename — `…game/art/hero.psd`
+/// is more useful than `game/art/long/ni…` in a narrow sidebar.
+fn shorten_path_left(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_owned();
+    }
+    // Keep the last `max_chars - 1` chars, prefix with an ellipsis
+    // so the filename end is always visible.
+    let skip = count - (max_chars.saturating_sub(1));
+    let mut out = String::from("…");
+    out.extend(s.chars().skip(skip));
+    out
+}
+
+/// Snapshot of the "File locks" panel state the outer `show` loop
+/// hands to [`render_lfs_locks_section`]. Cloned each frame so the
+/// renderer doesn't borrow `WorkspaceState` across its body (the
+/// rest of the sidebar needs that borrow dropped before we dispatch
+/// intents).
+struct LfsLocksViewState {
+    /// `None` = we haven't tried a refresh yet; `Some(Vec::new())`
+    /// = we tried and got no locks (possibly `Unavailable`).
+    locks: Option<Vec<LfsLock>>,
+    unavailable_reason: Option<String>,
+    refreshing: bool,
+    /// Cached `git config user.name` — compared case-sensitively
+    /// against `LfsLock::owner` to decide whether to show a native
+    /// "Unlock" button or a "Force unlock" affordance.
+    current_user: String,
+}
+
+fn render_lfs_locks_section(
+    ui: &mut egui::Ui,
+    state: &LfsLocksViewState,
+    intent: &mut Option<LockIntent>,
+) {
+    let lock_count = state.locks.as_ref().map(|v| v.len()).unwrap_or(0);
+    let header = if lock_count == 0 {
+        "File locks".to_string()
+    } else {
+        format!("File locks ({lock_count})")
+    };
+
+    egui::CollapsingHeader::new(header)
+        .default_open(false)
+        .show(ui, |ui| {
+            // Refresh row at the top — spinner + button, same
+            // pattern as the forge panel. The spinner makes it
+            // obvious the refresh is actually in flight rather
+            // than the button just being unresponsive.
+            ui.horizontal(|ui| {
+                let refresh_button = ui
+                    .small_button("⟳ Refresh")
+                    .on_hover_text("Re-fetch the list from the LFS lock server");
+                if refresh_button.clicked() {
+                    *intent = Some(LockIntent::Refresh);
+                }
+                if state.refreshing {
+                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.weak(egui::RichText::new("refreshing…").small());
+                }
+            });
+            ui.add_space(2.0);
+
+            // Unavailable state: render inline, not a toast —
+            // the user's repo may legitimately not participate in
+            // LFS locks and we don't want to nag.
+            if let Some(reason) = state.unavailable_reason.as_deref() {
+                ui.weak(
+                    egui::RichText::new(format!("LFS locks unavailable: {reason}"))
+                        .small(),
+                );
+                return;
+            }
+
+            let locks = match state.locks.as_ref() {
+                Some(l) => l,
+                None => {
+                    ui.weak(
+                        egui::RichText::new("Loading lock list…")
+                            .small(),
+                    );
+                    return;
+                }
+            };
+            if locks.is_empty() {
+                ui.weak(egui::RichText::new("No files locked.").small());
+                return;
+            }
+
+            // The current-user comparison is empty-safe: an empty
+            // cached name matches nobody, which means every row
+            // renders as "owned by someone else". That's the
+            // desired failure mode — worst case, the user gets
+            // force-unlock prompts instead of plain unlocks; they
+            // can still act, nothing is silently blocked.
+            let me = state.current_user.as_str();
+            for lock in locks {
+                lock_row(ui, lock, me, intent);
+            }
+        });
+    ui.add_space(4.0);
+}
+
+fn lock_row(
+    ui: &mut egui::Ui,
+    lock: &LfsLock,
+    current_user: &str,
+    intent: &mut Option<LockIntent>,
+) {
+    ui.horizontal(|ui| {
+        // Lock glyph keeps the row scannable — rows are sorted by
+        // the server but the eye still needs a fixed anchor.
+        ui.label(egui::RichText::new("🔒").small());
+        // Owner first because "who has this?" is usually the
+        // scanner's first question on a shared team.
+        let owner = if lock.owner.is_empty() {
+            "(unknown)".to_string()
+        } else {
+            lock.owner.clone()
+        };
+        ui.label(
+            egui::RichText::new(&owner)
+                .small()
+                .strong(),
+        );
+        ui.weak(egui::RichText::new("·").small());
+        // Path truncated from the left so the filename end stays
+        // visible in a narrow sidebar.
+        let path_str = lock.path.display().to_string();
+        let display = shorten_path_left(&path_str, 34);
+        let path_label = ui
+            .label(egui::RichText::new(&display).monospace().small())
+            .on_hover_text(hover_for_lock(lock));
+
+        // Unlock / Force unlock affordance on the right.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let is_mine = !current_user.is_empty() && lock.owner == current_user;
+            if is_mine {
+                if ui
+                    .small_button("Unlock")
+                    .on_hover_text("Release this lock on the server")
+                    .clicked()
+                {
+                    *intent = Some(LockIntent::Unlock {
+                        path: lock.path.clone(),
+                    });
+                }
+            } else {
+                // Force-unlock affordance appears when we row-hover.
+                // We key it to hover on the path label so the button
+                // doesn't compete with the path for tap area.
+                if path_label.hovered() || ui.ui_contains_pointer() {
+                    if ui
+                        .small_button("Force unlock")
+                        .on_hover_text(
+                            "Admin-only: override another user's lock (requires server permission)",
+                        )
+                        .clicked()
+                    {
+                        *intent = Some(LockIntent::ForceUnlockPrompt {
+                            path: lock.path.clone(),
+                            owner: owner.clone(),
+                        });
+                    }
+                }
+            }
+        });
+    });
+}
+
+fn hover_for_lock(lock: &LfsLock) -> String {
+    let mut out = format!("Locked by {}", lock.owner);
+    if let Some(ts) = lock.locked_at.as_deref() {
+        out.push_str(&format!("\nat {ts}"));
+    }
+    if !lock.id.is_empty() {
+        out.push_str(&format!("\nlock id: {}", lock.id));
+    }
+    out.push_str(&format!("\n{}", lock.path.display()));
+    out
+}
+
+/// Render the force-unlock confirmation window. Called from the
+/// main update loop alongside the other modal renderers so users
+/// don't miss the affordance on a background tab.
+pub fn show_force_unlock_confirm(ctx: &egui::Context, app: &mut MergeFoxApp) {
+    let Some(confirm) = app.force_unlock_confirm.as_ref() else {
+        return;
+    };
+    let path = confirm.path.clone();
+    let owner = confirm.owner.clone();
+    let mut close = false;
+    let mut submitted = false;
+    egui::Window::new("Force unlock?")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(360.0)
+        .show(ctx, |ui| {
+            ui.label(format!(
+                "This overrides another user's lock. Continue?\n\nPath: {}\nOwner: {}",
+                path.display(),
+                owner
+            ));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+                if ui
+                    .button(
+                        egui::RichText::new("Force unlock")
+                            .color(egui::Color32::LIGHT_RED),
+                    )
+                    .clicked()
+                {
+                    submitted = true;
+                }
+            });
+        });
+    if close {
+        app.force_unlock_confirm = None;
+    } else if submitted {
+        app.force_unlock_confirm = None;
+        app.start_lfs_unlock(path, true);
     }
 }
