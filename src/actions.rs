@@ -22,6 +22,7 @@ pub enum CommitAction {
     // --- read-only utility ---
     CopySha(Oid),
     CopyShortSha(Oid),
+    CopyRemoteCommitLink(Oid),
 
     // --- navigation / safe writes ---
     Checkout(Oid),
@@ -58,6 +59,9 @@ pub enum CommitAction {
     DropCommitPrompt(Oid),
     MoveCommitUp(Oid),
     MoveCommitDown(Oid),
+    RecomposeCommitWithAi(Oid),
+    RecomposeChildrenWithAi(Oid),
+    InteractiveRebaseChildren(Oid),
 
     // --- split commit ---
     /// Open the split-commit wizard against the given commit. The
@@ -96,6 +100,8 @@ pub enum CommitAction {
 
     // --- creation from commit ---
     CreateWorktreePrompt(Oid),
+    CreatePatchFromCommit(Oid),
+    ShareCommitAsCloudPatch(Oid),
 
     // --- stash ---
     /// Prompt for a stash message and create a new stash including
@@ -122,6 +128,7 @@ impl CommitAction {
         match self {
             Self::CopySha(o) => format!("copy SHA {o}"),
             Self::CopyShortSha(o) => format!("copy short SHA {}", short(o)),
+            Self::CopyRemoteCommitLink(o) => format!("copy remote link for {}", short(o)),
             Self::Checkout(o) => format!("checkout {}", short(o)),
             Self::CheckoutBranch(b) => format!("checkout branch {b}"),
             Self::CreateBranchPrompt(o) => format!("create branch at {}", short(o)),
@@ -156,6 +163,13 @@ impl CommitAction {
             Self::DropCommitPrompt(o) => format!("drop commit {}", short(o)),
             Self::MoveCommitUp(o) => format!("move {} up", short(o)),
             Self::MoveCommitDown(o) => format!("move {} down", short(o)),
+            Self::RecomposeCommitWithAi(o) => format!("recompose {} with AI", short(o)),
+            Self::RecomposeChildrenWithAi(o) => {
+                format!("recompose descendants of {} with AI", short(o))
+            }
+            Self::InteractiveRebaseChildren(o) => {
+                format!("interactive rebase descendants of {}", short(o))
+            }
             Self::SplitCommit(o) => format!("split commit {}", short(o)),
             Self::Pull { branch } => format!("pull {branch}"),
             Self::Push { branch, force } => {
@@ -172,6 +186,8 @@ impl CommitAction {
                 )
             }
             Self::CreateWorktreePrompt(o) => format!("create worktree from {}", short(o)),
+            Self::CreatePatchFromCommit(o) => format!("create patch from {}", short(o)),
+            Self::ShareCommitAsCloudPatch(o) => format!("share {} as cloud patch", short(o)),
             Self::StashPushPrompt => "create stash".to_string(),
             Self::StashPop { index } => format!("pop stash@{{{index}}}"),
             Self::StashApply { index } => format!("apply stash@{{{index}}}"),

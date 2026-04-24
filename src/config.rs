@@ -205,7 +205,11 @@ pub enum ThemePreset {
     #[default]
     MergeFox,
     Light,
+    /// Legacy config value kept so older `dark` settings load cleanly.
+    /// The settings UI no longer exposes this as a separate preset because
+    /// MergeFox is the app's dark theme.
     Dark,
+    Colorblind,
     Custom,
 }
 
@@ -288,21 +292,21 @@ impl ThemePalette {
 
     pub fn light() -> Self {
         Self {
-            accent: ThemeColor::rgb(51, 156, 255),
-            background: ThemeColor::rgb(250, 248, 244),
-            foreground: ThemeColor::rgb(24, 26, 31),
+            accent: ThemeColor::rgb(43, 120, 168),
+            background: ThemeColor::rgb(246, 245, 242),
+            foreground: ThemeColor::rgb(28, 31, 36),
             translucent_panels: false,
-            contrast: 38,
+            contrast: 46,
         }
     }
 
-    pub fn dark() -> Self {
+    pub fn colorblind() -> Self {
         Self {
-            accent: ThemeColor::rgb(103, 132, 255),
-            background: ThemeColor::rgb(24, 24, 24),
-            foreground: ThemeColor::rgb(255, 255, 255),
-            translucent_panels: true,
-            contrast: 60,
+            accent: ThemeColor::rgb(86, 180, 233),
+            background: ThemeColor::rgb(10, 12, 16),
+            foreground: ThemeColor::rgb(248, 248, 242),
+            translucent_panels: false,
+            contrast: 88,
         }
     }
 
@@ -333,7 +337,8 @@ impl ThemeSettings {
         match self.preset {
             ThemePreset::MergeFox => ThemePalette::mergefox(),
             ThemePreset::Light => ThemePalette::light(),
-            ThemePreset::Dark => ThemePalette::dark(),
+            ThemePreset::Dark => ThemePalette::mergefox(),
+            ThemePreset::Colorblind => ThemePalette::colorblind(),
             ThemePreset::Custom => self.custom_palette.clone(),
         }
     }
@@ -342,7 +347,8 @@ impl ThemeSettings {
         self.custom_palette = match preset {
             ThemePreset::MergeFox => ThemePalette::mergefox(),
             ThemePreset::Light => ThemePalette::light(),
-            ThemePreset::Dark => ThemePalette::dark(),
+            ThemePreset::Dark => ThemePalette::mergefox(),
+            ThemePreset::Colorblind => ThemePalette::colorblind(),
             ThemePreset::Custom => self.custom_palette.clone(),
         };
         self.preset = ThemePreset::Custom;

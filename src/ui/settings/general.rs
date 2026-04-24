@@ -58,7 +58,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
             for preset in [
                 ThemePreset::MergeFox,
                 ThemePreset::Light,
-                ThemePreset::Dark,
+                ThemePreset::Colorblind,
                 ThemePreset::Custom,
             ] {
                 theme_card(ui, preset, &mut modal.theme, &labels);
@@ -139,7 +139,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut MergeFoxApp) {
 
                 ui.horizontal_wrapped(|ui| {
                     ui.weak(labels.custom_bases);
-                    for base in [ThemePreset::MergeFox, ThemePreset::Light, ThemePreset::Dark] {
+                    for base in [
+                        ThemePreset::MergeFox,
+                        ThemePreset::Light,
+                        ThemePreset::Colorblind,
+                    ] {
                         if ui.button(preset_label(base, &labels)).clicked() {
                             modal.theme.set_custom_from(base);
                         }
@@ -546,7 +550,8 @@ fn preset_palette(preset: ThemePreset) -> ThemePalette {
     match preset {
         ThemePreset::MergeFox => ThemePalette::mergefox(),
         ThemePreset::Light => ThemePalette::light(),
-        ThemePreset::Dark => ThemePalette::dark(),
+        ThemePreset::Dark => ThemePalette::mergefox(),
+        ThemePreset::Colorblind => ThemePalette::colorblind(),
         ThemePreset::Custom => ThemePalette::default(),
     }
 }
@@ -555,7 +560,8 @@ fn preset_label(preset: ThemePreset, labels: &Labels) -> &'static str {
     match preset {
         ThemePreset::MergeFox => labels.mergefox_theme,
         ThemePreset::Light => labels.light_theme,
-        ThemePreset::Dark => labels.dark_theme,
+        ThemePreset::Dark => labels.mergefox_theme,
+        ThemePreset::Colorblind => labels.colorblind_theme,
         ThemePreset::Custom => labels.custom_theme,
     }
 }
@@ -564,7 +570,8 @@ fn preset_description(preset: ThemePreset, labels: &Labels) -> &'static str {
     match preset {
         ThemePreset::MergeFox => labels.mergefox_desc,
         ThemePreset::Light => labels.light_desc,
-        ThemePreset::Dark => labels.dark_desc,
+        ThemePreset::Dark => labels.mergefox_desc,
+        ThemePreset::Colorblind => labels.colorblind_desc,
         ThemePreset::Custom => labels.custom_desc,
     }
 }
@@ -586,11 +593,11 @@ struct Labels {
     theme_saved: &'static str,
     mergefox_theme: &'static str,
     light_theme: &'static str,
-    dark_theme: &'static str,
+    colorblind_theme: &'static str,
     custom_theme: &'static str,
     mergefox_desc: &'static str,
     light_desc: &'static str,
-    dark_desc: &'static str,
+    colorblind_desc: &'static str,
     custom_desc: &'static str,
     palette_heading: &'static str,
     palette_readonly_hint: &'static str,
@@ -643,11 +650,11 @@ fn labels(lang: UiLanguage) -> Labels {
             theme_saved: "테마를 저장했습니다",
             mergefox_theme: "MergeFox",
             light_theme: "라이트",
-            dark_theme: "다크",
+            colorblind_theme: "색각 보조",
             custom_theme: "커스텀",
             mergefox_desc: "브랜드 기본 테마",
             light_desc: "밝고 차분한 작업용 테마",
-            dark_desc: "대비가 높은 고정 다크 테마",
+            colorblind_desc: "색 의존도를 낮추고 명암 대비를 크게 둔 접근성 테마",
             custom_desc: "팔레트를 직접 조정하는 테마",
             palette_heading: "팔레트",
             palette_readonly_hint: "기본 테마 팔레트 미리보기입니다. 편집하려면 커스텀 테마로 복제하세요.",
@@ -700,11 +707,11 @@ fn labels(lang: UiLanguage) -> Labels {
             theme_saved: "Saved theme",
             mergefox_theme: "MergeFox",
             light_theme: "Light",
-            dark_theme: "Dark",
+            colorblind_theme: "Colorblind",
             custom_theme: "Custom",
             mergefox_desc: "Brand-default palette",
             light_desc: "Quiet light workspace palette",
-            dark_desc: "High-contrast fixed dark palette",
+            colorblind_desc: "High-luminance contrast palette with non-color cues",
             custom_desc: "Editable palette with your own colors",
             palette_heading: "Palette",
             palette_readonly_hint:

@@ -44,6 +44,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     // Track whether the diff-prefs toggle changed so we can persist
     // the config once the UI closure releases its borrow on `app`.
     let prev_diff_prefs = app.config.diff_prefs.clone();
+    let theme_snapshot = app.config.theme.clone();
     {
         // Split the borrow explicitly: the UI closure takes `&mut app.view`
         // exclusively while we still need read access to `ci_status_cache`
@@ -64,7 +65,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         > = ci_status_cache;
         let diff_prefs = &mut config.diff_prefs;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(crate::ui::chrome::center_frame(&theme_snapshot))
+            .show(ctx, |ui| {
         let View::Workspace(tabs) = view else {
             return;
         };
@@ -85,6 +88,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         // pane / dock / window. The initial tab is picked per profile
         // at repo-open time and then free to toggle.
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
             if ui
                 .selectable_label(ws.center_view_tab == CenterViewTab::Graph, "Graph")
                 .on_hover_text("Commit graph — default view")
@@ -105,7 +109,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 intent.switch_tab = Some(CenterViewTab::ProjectTree);
             }
         });
+        ui.add_space(2.0);
         ui.separator();
+        ui.add_space(2.0);
 
         if matches!(ws.center_view_tab, CenterViewTab::ProjectTree) {
             // Project tab has its own compact toolbar (the Scope /
@@ -113,10 +119,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             // then the tree itself in the remaining space.
             let rules = profile_rules::rules_for(ws.workspace_profile);
             ui.horizontal(|ui| {
-                ui.label("Project");
-                ui.separator();
+                crate::ui::chrome::section_title(ui, "Project");
                 if ui
-                    .button("Refresh tree")
+                    .button("Refresh")
                     .on_hover_text(
                         ws.project_tree
                             .last_refreshed
@@ -145,7 +150,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     intent.refresh_project_tree = true;
                 }
                 ui.separator();
-                ui.label("Filter:");
+                ui.label(egui::RichText::new("Filter").small().strong());
                 // Single-line filter. Case-insensitive substring match
                 // against the node name — the render pass auto-expands
                 // ancestors so matches deep in the tree become visible.
@@ -155,7 +160,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         .desired_width(200.0),
                 );
             });
+            ui.add_space(2.0);
             ui.separator();
+            ui.add_space(2.0);
 
             let available_width = ui.available_width();
             let selected_file = ws.selected_working_file.clone();
@@ -172,7 +179,8 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
 
         // ---------- toolbar ----------
         ui.horizontal(|ui| {
-            ui.label("Scope:");
+            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.label(egui::RichText::new("Scope").small().strong());
             for opt in [
                 GraphScope::CurrentBranch,
                 GraphScope::AllLocal,
@@ -347,6 +355,10 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 &mut ws.working_tree_expanded,
                 &ws.commit_basket,
                 ci_status_cache,
+                matches!(
+                    theme_snapshot.preset,
+                    crate::config::ThemePreset::Colorblind
+                ),
             );
             if let Some(action) = result.action {
                 intent.action = Some(action);
@@ -922,6 +934,18 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
             out.copy_text = Some(short.clone());
             out.hud = Some(format!("Copied: {short}"));
         }
+        CommitAction::CopyRemoteCommitLink(oid) => match remote_commit_link(ws, &app.config, oid) {
+            Some(link) => {
+                out.copy_text = Some(link.clone());
+                out.hud = Some(format!("Copied remote commit link: {}", short_sha(&oid)));
+            }
+            None => {
+                out.error = Some(
+                    "Couldn't derive a browser URL for this commit. Check the repository remote URL."
+                        .to_string(),
+                );
+            }
+        },
 
         // ---- navigation ----
         CommitAction::Checkout(oid) => {
@@ -1268,9 +1292,14 @@ fn run_action(app: &mut MergeFoxApp, action: CommitAction) -> DispatchOutcome {
         CommitAction::DropCommitPrompt(oid)
         | CommitAction::MoveCommitUp(oid)
         | CommitAction::MoveCommitDown(oid)
-        | CommitAction::CreateWorktreePrompt(oid) => {
+        | CommitAction::CreateWorktreePrompt(oid)
+        | CommitAction::RecomposeCommitWithAi(oid)
+        | CommitAction::RecomposeChildrenWithAi(oid)
+        | CommitAction::InteractiveRebaseChildren(oid)
+        | CommitAction::CreatePatchFromCommit(oid)
+        | CommitAction::ShareCommitAsCloudPatch(oid) => {
             out.error = Some(format!(
-                "'{}' isn't wired up yet — tracked for the rebase / worktree milestone.",
+                "'{}' isn't wired up yet — menu item is staged for the rebase / patch workflow milestone.",
                 describe_pending(&oid)
             ));
         }
@@ -1696,6 +1725,29 @@ fn run_prompt(app: &mut MergeFoxApp, prompt: PendingPrompt) -> DispatchOutcome {
 
 fn default_remote(ws: &crate::app::WorkspaceState, config: &Config) -> String {
     default_remote_name(ws, config)
+}
+
+fn remote_commit_link(
+    ws: &crate::app::WorkspaceState,
+    config: &Config,
+    oid: gix::ObjectId,
+) -> Option<String> {
+    let preferred = config.repo_settings_for(ws.repo.path()).default_remote;
+    let remotes = ws.repo.list_remotes().ok()?;
+    let remote = remotes
+        .iter()
+        .find(|remote| Some(remote.name.as_str()) == preferred.as_deref())
+        .or_else(|| remotes.iter().find(|remote| remote.name == "origin"))
+        .or_else(|| remotes.first())?;
+    let url = remote
+        .push_url
+        .as_ref()
+        .or(remote.fetch_url.as_ref())?;
+    let parsed = crate::git_url::parse(url)?;
+    Some(format!(
+        "https://{}/{}/{}/commit/{}",
+        parsed.host, parsed.owner, parsed.repo, oid
+    ))
 }
 
 fn short_sha(oid: &gix::ObjectId) -> String {

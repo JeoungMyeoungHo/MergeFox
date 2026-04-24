@@ -24,9 +24,12 @@ pub fn apply(ctx: &Context, settings: &ThemeSettings) {
     // Detect this by comparing egui's live `dark_mode` flag against
     // what our palette dictates. If they disagree, something outside
     // our control flipped the visuals and we need to re-stamp ours.
-    let expected_dark = settings.active_palette().is_dark();
-    let current_dark = ctx.style().visuals.dark_mode;
-    let visuals_drifted = current_dark != expected_dark;
+    let palette = settings.active_palette();
+    let expected_dark = palette.is_dark();
+    let expected_text = palette.foreground.to_color32();
+    let visuals = &ctx.style().visuals;
+    let visuals_drifted =
+        visuals.dark_mode != expected_dark || visuals.override_text_color != Some(expected_text);
 
     if hash_unchanged && !visuals_drifted {
         return;
@@ -65,8 +68,22 @@ fn apply_impl(ctx: &Context, settings: &ThemeSettings) {
     let faint_surface = surface(panel_surface, foreground, contrast, dark, 0.03, 0.08);
     let extreme_surface = surface(panel_surface, foreground, contrast, dark, 0.11, 0.20);
     let stroke_color = mix(panel_surface, foreground, if dark { 0.26 } else { 0.18 });
-    let hovered_fill = mix(panel_surface, accent, if dark { 0.18 } else { 0.10 });
-    let active_fill = mix(accent, background, if dark { 0.18 } else { 0.12 });
+    let hovered_fill = mix(panel_surface, accent, if dark { 0.18 } else { 0.07 });
+    let active_fill = if dark {
+        mix(accent, background, 0.18)
+    } else {
+        mix(panel_surface, accent, 0.18)
+    };
+    let selection_fill = if dark {
+        accent
+    } else {
+        mix(background, accent, 0.24)
+    };
+    let selection_text = if dark {
+        readable_text(selection_fill)
+    } else {
+        foreground
+    };
     let panel_fill = if palette.translucent_panels {
         alpha(background, if dark { 232 } else { 242 })
     } else {
@@ -84,6 +101,10 @@ fn apply_impl(ctx: &Context, settings: &ThemeSettings) {
     visuals.window_fill = panel_surface;
     visuals.panel_fill = panel_fill;
     visuals.window_stroke = Stroke::new(1.0, stroke_color);
+    visuals.text_cursor.stroke = Stroke::new(1.5, foreground);
+    visuals.clip_rect_margin = 3.0;
+    visuals.indent_has_left_vline = true;
+    visuals.striped = true;
     // Tightened corner radii for a less "app-store macaron" look.
     // Earlier 8–10 px felt floaty against tight info-dense screens
     // (graph, diff). 3–5 px keeps edges visibly rounded but reads as
@@ -91,8 +112,8 @@ fn apply_impl(ctx: &Context, settings: &ThemeSettings) {
     visuals.window_rounding = Rounding::same(5.0);
     visuals.menu_rounding = Rounding::same(4.0);
 
-    visuals.selection.bg_fill = accent;
-    visuals.selection.stroke = Stroke::new(1.0, readable_text(accent));
+    visuals.selection.bg_fill = selection_fill;
+    visuals.selection.stroke = Stroke::new(1.0, selection_text);
 
     let widget_rounding = Rounding::same(3.0);
 
@@ -110,14 +131,17 @@ fn apply_impl(ctx: &Context, settings: &ThemeSettings) {
 
     visuals.widgets.hovered.bg_fill = hovered_fill;
     visuals.widgets.hovered.weak_bg_fill = hovered_fill;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, mix(stroke_color, accent, 0.38));
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.2, readable_text(hovered_fill));
+    visuals.widgets.hovered.bg_stroke =
+        Stroke::new(1.0, mix(stroke_color, accent, if dark { 0.38 } else { 0.28 }));
+    visuals.widgets.hovered.fg_stroke =
+        Stroke::new(1.2, if dark { readable_text(hovered_fill) } else { foreground });
     visuals.widgets.hovered.rounding = widget_rounding;
 
     visuals.widgets.active.bg_fill = active_fill;
     visuals.widgets.active.weak_bg_fill = active_fill;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.2, readable_text(active_fill));
+    visuals.widgets.active.fg_stroke =
+        Stroke::new(1.2, if dark { readable_text(active_fill) } else { foreground });
     visuals.widgets.active.rounding = widget_rounding;
 
     visuals.widgets.open = visuals.widgets.active;
@@ -144,6 +168,94 @@ pub fn sidebar_fill(settings: &ThemeSettings) -> Color32 {
         alpha(background, if palette.is_dark() { 220 } else { 238 })
     } else {
         background
+    }
+}
+
+pub fn top_bar_fill(settings: &ThemeSettings) -> Color32 {
+    let palette = settings.active_palette();
+    let base = tab_bar_fill(settings);
+    let foreground = palette.foreground.to_color32();
+    mix(base, foreground, if palette.is_dark() { 0.045 } else { 0.035 })
+}
+
+pub fn toolbar_control_fill(settings: &ThemeSettings) -> Color32 {
+    let palette = settings.active_palette();
+    let base = top_bar_fill(settings);
+    let foreground = palette.foreground.to_color32();
+    mix(base, foreground, if palette.is_dark() { 0.055 } else { 0.045 })
+}
+
+pub fn toolbar_control_hover_fill(settings: &ThemeSettings) -> Color32 {
+    let base = toolbar_control_fill(settings);
+    let accent = settings.active_palette().accent.to_color32();
+    mix(base, accent, 0.13)
+}
+
+pub fn toolbar_control_active_fill(settings: &ThemeSettings) -> Color32 {
+    let base = toolbar_control_fill(settings);
+    let accent = settings.active_palette().accent.to_color32();
+    mix(base, accent, 0.20)
+}
+
+pub fn tab_bar_fill(settings: &ThemeSettings) -> Color32 {
+    let palette = settings.active_palette();
+    let background = palette.background.to_color32();
+    if palette.is_dark() {
+        mix(background, Color32::BLACK, 0.16)
+    } else {
+        mix(background, Color32::WHITE, 0.18)
+    }
+}
+
+pub fn active_tab_fill(settings: &ThemeSettings) -> Color32 {
+    let palette = settings.active_palette();
+    let background = palette.background.to_color32();
+    let foreground = palette.foreground.to_color32();
+    let contrast = palette.contrast as f32 / 100.0;
+    surface(background, foreground, contrast, palette.is_dark(), 0.06, 0.13)
+}
+
+pub fn inactive_tab_fill(settings: &ThemeSettings) -> Color32 {
+    let palette = settings.active_palette();
+    let background = tab_bar_fill(settings);
+    let foreground = palette.foreground.to_color32();
+    mix(background, foreground, if palette.is_dark() { 0.05 } else { 0.03 })
+}
+
+pub fn workspace_fill(settings: &ThemeSettings) -> Color32 {
+    let palette = settings.active_palette();
+    let background = palette.background.to_color32();
+    if palette.is_dark() {
+        mix(background, Color32::BLACK, 0.10)
+    } else {
+        mix(background, Color32::WHITE, 0.32)
+    }
+}
+
+pub fn subtle_stroke(settings: &ThemeSettings) -> Stroke {
+    let palette = settings.active_palette();
+    let background = palette.background.to_color32();
+    let foreground = palette.foreground.to_color32();
+    Stroke::new(
+        1.0,
+        mix(
+            background,
+            foreground,
+            if palette.is_dark() { 0.20 } else { 0.14 },
+        ),
+    )
+}
+
+pub fn accent(settings: &ThemeSettings) -> Color32 {
+    settings.active_palette().accent.to_color32()
+}
+
+pub fn muted_text(base: Option<Color32>) -> Color32 {
+    let color = base.unwrap_or(Color32::GRAY);
+    if ThemeColor::from_color32(color).luminance() > 0.45 {
+        color.gamma_multiply(0.68)
+    } else {
+        mix(color, Color32::WHITE, 0.28)
     }
 }
 
@@ -179,7 +291,7 @@ fn alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
-fn readable_text(color: Color32) -> Color32 {
+pub fn readable_text(color: Color32) -> Color32 {
     let luminance = ThemeColor::from_color32(color).luminance();
     if luminance > 0.45 {
         Color32::from_rgb(20, 20, 24)

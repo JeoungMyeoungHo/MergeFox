@@ -80,40 +80,35 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         .and_then(|head_name| tracked_upstream_for_branch(ws, head_name));
     let has_upstream = head_upstream.is_some();
 
-    egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+    egui::TopBottomPanel::top("top_bar")
+        .frame(crate::ui::chrome::toolbar_frame(&app.config.theme))
+        .show(ctx, |ui| {
+        crate::ui::chrome::apply_toolbar_visuals(ui, &app.config.theme);
         ui.horizontal(|ui| {
-            if ui.button("← Home").clicked() {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            if crate::ui::chrome::toolbar_button(ui, "← Home").clicked() {
                 go_home = true;
             }
-            ui.separator();
-            ui.label(format!("📁 {path}"));
+            crate::ui::chrome::muted_pill(ui, format!("📁 {path}"));
 
             // ---- HEAD branch + tracking status ----
             if let Some(head_name) = &head {
-                ui.separator();
-                ui.label(egui::RichText::new(format!("🜲 {head_name}")).strong());
+                crate::ui::chrome::pill(
+                    ui,
+                    format!("🜲 {head_name}"),
+                    crate::ui::theme::accent(&app.config.theme),
+                );
                 // Upstream tracking indicator
                 if let Some((_branch, upstream_ref)) = &upstream_info {
-                    ui.weak(format!("→ {upstream_ref}"));
-                    // Ahead / behind badges
-                    if ahead > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("↑{ahead}"))
-                                .color(egui::Color32::from_rgb(100, 200, 130))
-                                .strong()
-                                .small(),
-                        )
-                        .on_hover_text(format!(
-                            "{ahead} commit{} ahead of {upstream_ref} — push to publish",
-                            if ahead == 1 { "" } else { "s" }
-                        ));
-                    }
+                    crate::ui::chrome::muted_pill(ui, format!("→ {upstream_ref}"));
+                    // Behind stays as a passive branch-state badge. Ahead is
+                    // folded into the Push button below so the next action is
+                    // visually tied to the unpushed commit count.
                     if behind > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("↓{behind}"))
-                                .color(egui::Color32::from_rgb(220, 160, 80))
-                                .strong()
-                                .small(),
+                        crate::ui::chrome::pill(
+                            ui,
+                            format!("↓{behind}"),
+                            egui::Color32::from_rgb(220, 160, 80),
                         )
                         .on_hover_text(format!(
                             "{behind} commit{} behind {upstream_ref} — pull to integrate",
@@ -121,25 +116,25 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                         ));
                     }
                     if ahead == 0 && behind == 0 {
-                        ui.weak(
-                            egui::RichText::new("✓")
-                                .color(egui::Color32::from_rgb(120, 190, 130))
-                                .small(),
+                        crate::ui::chrome::pill(
+                            ui,
+                            "✓ synced",
+                            egui::Color32::from_rgb(120, 190, 130),
                         )
                         .on_hover_text("Up to date with remote");
                     }
                 } else if !cached_remotes.is_empty() {
-                    ui.weak(
-                        egui::RichText::new("(no upstream)")
-                            .color(egui::Color32::from_rgb(200, 150, 80))
-                            .small(),
+                    crate::ui::chrome::pill(
+                        ui,
+                        "no upstream",
+                        egui::Color32::from_rgb(200, 150, 80),
                     );
                 }
             }
 
             // ---- Fetch / Push / Pull buttons with dropdown options ----
             ui.separator();
-            let git_btn_size = egui::vec2(64.0, 22.0);
+            let git_btn_size = egui::vec2(68.0, 24.0);
             ui.add_enabled_ui(!has_active_job && git_available, |ui| {
                 // ── Fetch ──
                 ui.horizontal(|ui| {
@@ -224,9 +219,31 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                 // ── Push ──
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
+                    let push_label = if ahead > 0 {
+                        format!("↑{ahead} {}", labels.push)
+                    } else {
+                        format!("↑ {}", labels.push)
+                    };
+                    let push_btn_width = if ahead > 0 {
+                        78.0 + (ahead.to_string().len() as f32 * 7.0)
+                    } else {
+                        git_btn_size.x
+                    };
+                    let push_hint = if ahead > 0 {
+                        format!(
+                            "{}\n\n{ahead} unpushed commit{} on this branch.",
+                            labels.push_hint,
+                            if ahead == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        labels.push_hint.to_string()
+                    };
                     if ui
-                        .add_sized(git_btn_size, egui::Button::new(format!("↑ {}", labels.push)))
-                        .on_hover_text(labels.push_hint)
+                        .add_sized(
+                            egui::vec2(push_btn_width, git_btn_size.y),
+                            egui::Button::new(push_label),
+                        )
+                        .on_hover_text(push_hint)
                         .clicked()
                     {
                         if let Some(h) = head.as_ref() {

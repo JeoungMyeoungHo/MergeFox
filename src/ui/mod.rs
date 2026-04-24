@@ -4,6 +4,7 @@ pub mod basket_squash;
 pub mod binary_conflict_view;
 pub mod bisect;
 pub mod blame;
+pub mod chrome;
 pub mod columns;
 pub mod commit_basket;
 pub mod commit_modal;

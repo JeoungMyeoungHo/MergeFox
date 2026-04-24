@@ -108,7 +108,13 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         .default_width(260.0)
         .frame(egui::Frame::side_top_panel(ctx.style().as_ref()).fill(sidebar_fill))
         .show(ctx, |ui| {
-            ui.heading("Branches");
+            crate::ui::chrome::section_title(ui, "Repository");
+            ui.horizontal(|ui| {
+                ui.heading("Branches");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    crate::ui::chrome::muted_pill(ui, "refs");
+                });
+            });
             ui.separator();
 
             if let Some(err) = &branch_error {
@@ -324,20 +330,31 @@ fn branch_row(
     publish_branch: &mut Option<String>,
 ) {
     let selected = current_branch == Some(branch.name.as_str());
-    let label = if branch.is_head {
-        format!("● {}", branch.name)
-    } else {
-        format!("  {}", branch.name)
-    };
+    let label = branch.name.clone();
     let resp = ui.horizontal(|ui| {
-        let row = ui.selectable_label(selected, label);
+        let glyph = if branch.is_head {
+            "●"
+        } else if branch.is_remote {
+            "⇄"
+        } else {
+            "○"
+        };
+        let glyph_color = if branch.is_head {
+            egui::Color32::from_rgb(255, 139, 61)
+        } else if branch.is_remote {
+            egui::Color32::from_rgb(130, 170, 220)
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        ui.label(egui::RichText::new(glyph).color(glyph_color).monospace());
+        let row = ui.selectable_label(selected, egui::RichText::new(label).strong());
         // Upstream indicator: shows either "→ origin/main" (good) or
         // "(no upstream)" in muted red (needs setup). Saves the user a
         // trip into Settings just to see whether push will work.
         if !branch.is_remote {
             match &branch.upstream {
                 Some(u) => {
-                    ui.weak(egui::RichText::new(format!("→ {u}")).small());
+                    crate::ui::chrome::muted_pill(ui, format!("→ {u}"));
                     // Ahead/behind pill — shows the shape of the
                     // divergence at a glance. Hidden when both are zero
                     // so in-sync branches stay visually quiet. Color
@@ -359,19 +376,17 @@ fn branch_row(
                                 ));
                             }
                             for (text, color) in parts {
-                                ui.label(
-                                    egui::RichText::new(text).color(color).small().monospace(),
-                                )
+                                crate::ui::chrome::pill(ui, text, color)
                                 .on_hover_text(ahead_behind_tooltip(ahead, behind));
                             }
                         }
                     }
                 }
                 None => {
-                    ui.weak(
-                        egui::RichText::new("(no upstream)")
-                            .small()
-                            .color(egui::Color32::from_rgb(220, 150, 80)),
+                    crate::ui::chrome::pill(
+                        ui,
+                        "no upstream",
+                        egui::Color32::from_rgb(220, 150, 80),
                     );
                     if show_publish_button && ui.small_button("Publish…").clicked() {
                         *publish_branch = Some(branch.name.clone());

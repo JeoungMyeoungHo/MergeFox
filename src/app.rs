@@ -7207,8 +7207,8 @@ impl eframe::App for MergeFoxApp {
                 ui::welcome::show(ctx, self);
             }
             View::Workspace(_) => {
-                ui::top_bar::show(ctx, self);
                 ui::tabs::show(ctx, self);
+                ui::top_bar::show(ctx, self);
                 ui::sidebar::show(ctx, self);
                 ui::diff_view::show(ctx, self);
                 ui::main_panel::show(ctx, self);
