@@ -248,6 +248,7 @@ impl GraphView {
         // from the map is a deliberate "don't know / don't care"
         // signal, not an `Unknown` verdict.
         ci_status_cache: &std::collections::HashMap<gix::ObjectId, crate::providers::CheckSummary>,
+        accessibility_patterns: bool,
     ) -> GraphInteraction {
         let row_count = self.graph.rows.len();
         if row_count == 0 && working_entries.map(|e| e.is_empty()).unwrap_or(true) {
@@ -362,6 +363,7 @@ impl GraphView {
                     self.graph.rows.first().map(|r| r.lane),
                     working_selected,
                     &mut out,
+                    accessibility_patterns,
                 );
                 if out.clear_commit_selection {
                     self.selected_row = None;
@@ -432,7 +434,9 @@ impl GraphView {
 
                     let is_head = head_oid == Some(row.oid);
                     resp.context_menu(|ui| {
-                        if let Some(action) = render_commit_menu(ui, row, is_head) {
+                        if let Some(action) =
+                            render_commit_menu(ui, row, is_head, accessibility_patterns)
+                        {
                             out.action = Some(action);
                         }
                     });
@@ -457,7 +461,7 @@ impl GraphView {
                         );
                     }
                     if show_refs_column {
-                        paint_refs_cell(ui, cells.refs, row, is_head, prefs);
+                        paint_refs_cell(ui, cells.refs, row, is_head, prefs, accessibility_patterns);
                     }
                     if prefs.show_message {
                         paint_message_cell(ui, cells.message, row, ci_status_cache.get(&row.oid));
@@ -642,7 +646,12 @@ fn estimate_ref_column_width(graph: &CommitGraph) -> f32 {
 ///   - Branch tip (one or more local branches point here; may also be HEAD)
 ///
 /// Returns `Some(action)` when the user picks a menu item.
-fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<CommitAction> {
+fn render_commit_menu(
+    ui: &mut Ui,
+    row: &GraphRow,
+    is_head: bool,
+    accessibility_cues: bool,
+) -> Option<CommitAction> {
     let mut action: Option<CommitAction> = None;
     use crate::git::graph::RefKind;
     let local_branches: Vec<&str> = row
@@ -672,6 +681,13 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
                 action = Some(CommitAction::Push {
                     branch: (*b).to_string(),
                     force: false,
+                });
+                ui.close_menu();
+            }
+            if danger_button(ui, format!("Force push '{b}'"), accessibility_cues).clicked() {
+                action = Some(CommitAction::Push {
+                    branch: (*b).to_string(),
+                    force: true,
                 });
                 ui.close_menu();
             }
@@ -715,9 +731,12 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
                     });
                     ui.close_menu();
                 }
-                if ui
-                    .button("Mixed — keep working copy, reset index")
-                    .clicked()
+                if warn_button(
+                    ui,
+                    "Mixed — keep working copy, reset index",
+                    accessibility_cues,
+                )
+                .clicked()
                 {
                     action = Some(CommitAction::Reset {
                         branch: (*b).to_string(),
@@ -726,13 +745,7 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
                     });
                     ui.close_menu();
                 }
-                if ui
-                    .button(
-                        egui::RichText::new("Hard  — discard all changes")
-                            .color(Color32::LIGHT_RED),
-                    )
-                    .clicked()
-                {
+                if danger_button(ui, "Hard  — discard all changes", accessibility_cues).clicked() {
                     action = Some(CommitAction::Reset {
                         branch: (*b).to_string(),
                         mode: ResetMode::Hard,
@@ -746,11 +759,6 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
 
     if ui.button("Revert commit").clicked() {
         action = Some(CommitAction::Revert(row.oid));
-        ui.close_menu();
-    }
-
-    if ui.button("Split commit…").clicked() {
-        action = Some(CommitAction::SplitCommit(row.oid));
         ui.close_menu();
     }
 
@@ -771,12 +779,40 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
         ui.close_menu();
     }
 
-    // ---- HEAD-specific (drop / move) ----
+    if ui.button("Split commit…").clicked() {
+        action = Some(CommitAction::SplitCommit(row.oid));
+        ui.close_menu();
+    }
+    if ui.button("Recompose commit with AI (Preview)").clicked() {
+        action = Some(CommitAction::RecomposeCommitWithAi(row.oid));
+        ui.close_menu();
+    }
+    if ui
+        .button("Recompose children with AI (Preview)")
+        .on_hover_text("Planned workflow: rebuild descendant commits with AI-assisted messages / grouping.")
+        .clicked()
+    {
+        action = Some(CommitAction::RecomposeChildrenWithAi(row.oid));
+        ui.close_menu();
+    }
+    if ui
+        .button("Interactive rebase children")
+        .on_hover_text("Planned workflow: open a rebase plan for commits after this one.")
+        .clicked()
+    {
+        action = Some(CommitAction::InteractiveRebaseChildren(row.oid));
+        ui.close_menu();
+    }
+    if danger_button(ui, "Drop commit", accessibility_cues).clicked() {
+        action = Some(CommitAction::DropCommitPrompt(row.oid));
+        ui.close_menu();
+    }
     if is_head {
-        if ui.button("Drop commit").clicked() {
-            action = Some(CommitAction::DropCommitPrompt(row.oid));
-            ui.close_menu();
-        }
+        ui.add_enabled_ui(false, |ui| {
+            let _ = ui.button("Move commit up");
+            let _ = ui.button("Move commit down");
+        });
+    } else {
         if ui.button("Move commit up").clicked() {
             action = Some(CommitAction::MoveCommitUp(row.oid));
             ui.close_menu();
@@ -797,10 +833,7 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
                 });
                 ui.close_menu();
             }
-            if ui
-                .button(egui::RichText::new(format!("Delete '{b}'")).color(Color32::LIGHT_RED))
-                .clicked()
-            {
+            if danger_button(ui, format!("Delete '{b}'"), accessibility_cues).clicked() {
                 action = Some(CommitAction::DeleteBranchPrompt {
                     name: (*b).to_string(),
                     is_remote: false,
@@ -811,12 +844,7 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
     }
     for rb in row.refs.iter().filter(|r| r.kind == RefKind::RemoteBranch) {
         let name = rb.short.as_ref();
-        if ui
-            .button(
-                egui::RichText::new(format!("Delete remote '{name}'")).color(Color32::LIGHT_RED),
-            )
-            .clicked()
-        {
+        if danger_button(ui, format!("Delete remote '{name}'"), accessibility_cues).clicked() {
             action = Some(CommitAction::DeleteBranchPrompt {
                 name: name.to_string(),
                 is_remote: true,
@@ -835,6 +863,20 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
         action = Some(CommitAction::CopyShortSha(row.oid));
         ui.close_menu();
     }
+    if ui.button("Copy link to this commit on remote").clicked() {
+        action = Some(CommitAction::CopyRemoteCommitLink(row.oid));
+        ui.close_menu();
+    }
+    if ui.button("Create patch from commit").clicked() {
+        action = Some(CommitAction::CreatePatchFromCommit(row.oid));
+        ui.close_menu();
+    }
+    if ui.button("Share commit as Cloud Patch").clicked() {
+        action = Some(CommitAction::ShareCommitAsCloudPatch(row.oid));
+        ui.close_menu();
+    }
+
+    ui.separator();
     if ui.button("Create tag here…").clicked() {
         action = Some(CommitAction::CreateTagPrompt {
             at: row.oid,
@@ -886,6 +928,42 @@ fn render_commit_menu(ui: &mut Ui, row: &GraphRow, is_head: bool) -> Option<Comm
     }
 
     action
+}
+
+fn danger_color() -> Color32 {
+    Color32::from_rgb(238, 92, 92)
+}
+
+fn warn_color() -> Color32 {
+    Color32::from_rgb(225, 166, 82)
+}
+
+fn warn_button(ui: &mut Ui, text: impl Into<String>, accessibility_cues: bool) -> egui::Response {
+    ui.button(warn_text(text, accessibility_cues))
+}
+
+fn danger_button(ui: &mut Ui, text: impl Into<String>, accessibility_cues: bool) -> egui::Response {
+    ui.button(danger_text(text, accessibility_cues))
+}
+
+fn warn_text(text: impl Into<String>, accessibility_cues: bool) -> egui::RichText {
+    let text = text.into();
+    let label = if accessibility_cues {
+        format!("CAUTION - {text}")
+    } else {
+        text
+    };
+    egui::RichText::new(label).color(warn_color())
+}
+
+fn danger_text(text: impl Into<String>, accessibility_cues: bool) -> egui::RichText {
+    let text = text.into();
+    let label = if accessibility_cues {
+        format!("DANGER - {text}")
+    } else {
+        text
+    };
+    egui::RichText::new(label).color(danger_color())
 }
 
 fn paint_graph_cell(
@@ -1073,7 +1151,14 @@ fn render_column_header(ui: &mut Ui, layout: &ColumnLayout, scroll_x: f32) {
     }
 }
 
-fn paint_refs_cell(ui: &mut Ui, rect: Rect, row: &GraphRow, is_head: bool, prefs: &ColumnPrefs) {
+fn paint_refs_cell(
+    ui: &mut Ui,
+    rect: Rect,
+    row: &GraphRow,
+    is_head: bool,
+    prefs: &ColumnPrefs,
+    accessibility_patterns: bool,
+) {
     if !is_head && !prefs.show_refs {
         return;
     }
@@ -1153,13 +1238,15 @@ fn paint_refs_cell(ui: &mut Ui, rect: Rect, row: &GraphRow, is_head: bool, prefs
             // sits centered inside its own colour zone.
             let left_text = format!("← {local_name}");
             let right_text = format!("{remote_prefix} →");
+            let local_fg = crate::ui::theme::readable_text(LOCAL_BG);
+            let remote_fg = crate::ui::theme::readable_text(REMOTE_BG);
             let left_galley =
                 child
                     .painter()
-                    .layout_no_wrap(left_text, font.clone(), Color32::WHITE);
+                    .layout_no_wrap(left_text, font.clone(), local_fg);
             let right_galley = child
                 .painter()
-                .layout_no_wrap(right_text, font, Color32::WHITE);
+                .layout_no_wrap(right_text, font, remote_fg);
             let left_w = left_galley.size().x + pad.x * 2.0;
             let right_w = right_galley.size().x + pad.x * 2.0;
             let h = left_galley.size().y.max(right_galley.size().y) + pad.y * 2.0;
@@ -1184,7 +1271,7 @@ fn paint_refs_cell(ui: &mut Ui, rect: Rect, row: &GraphRow, is_head: bool, prefs
                     left_rect.center().y - left_galley.size().y * 0.5,
                 ),
                 left_galley,
-                Color32::WHITE,
+                local_fg,
             );
             // Right zone: remote blue with right-rounded corners.
             let right_rect = Rect::from_min_size(
@@ -1201,18 +1288,30 @@ fn paint_refs_cell(ui: &mut Ui, rect: Rect, row: &GraphRow, is_head: bool, prefs
                 },
                 REMOTE_BG,
             );
+            paint_ref_pattern(
+                child.painter(),
+                right_rect.shrink(1.0),
+                pattern_if_enabled(RefChipPattern::Diagonal, accessibility_patterns),
+                pattern_color(REMOTE_BG),
+            );
             child.painter().galley(
                 egui::pos2(
                     right_rect.center().x - right_galley.size().x * 0.5,
                     right_rect.center().y - right_galley.size().y * 0.5,
                 ),
                 right_galley,
-                Color32::WHITE,
+                remote_fg,
             );
             child.add_space(4.0);
         } else {
             // Local-only branch (no matching remote).
-            paint_ref_chip(&mut child, local_name, LOCAL_BG, Color32::WHITE);
+            paint_ref_chip(
+                &mut child,
+                local_name,
+                LOCAL_BG,
+                crate::ui::theme::readable_text(LOCAL_BG),
+                pattern_if_enabled(RefChipPattern::Solid, accessibility_patterns),
+            );
         }
     }
 
@@ -1223,7 +1322,8 @@ fn paint_refs_cell(ui: &mut Ui, rect: Rect, row: &GraphRow, is_head: bool, prefs
                 &mut child,
                 label.short.as_ref(),
                 REMOTE_BG,
-                Color32::from_rgb(210, 220, 240),
+                crate::ui::theme::readable_text(REMOTE_BG),
+                pattern_if_enabled(RefChipPattern::Diagonal, accessibility_patterns),
             );
         }
     }
@@ -1231,13 +1331,41 @@ fn paint_refs_cell(ui: &mut Ui, rect: Rect, row: &GraphRow, is_head: bool, prefs
     // Render tags.
     for label in row.refs.iter() {
         if label.kind == RefKind::Tag {
-            paint_ref_chip(&mut child, label.short.as_ref(), TAG_BG, TAG_FG);
+            paint_ref_chip(
+                &mut child,
+                label.short.as_ref(),
+                TAG_BG,
+                TAG_FG,
+                pattern_if_enabled(RefChipPattern::Dots, accessibility_patterns),
+            );
         }
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefChipPattern {
+    Solid,
+    Diagonal,
+    Dots,
+    Cross,
+}
+
+fn pattern_if_enabled(pattern: RefChipPattern, enabled: bool) -> RefChipPattern {
+    if enabled {
+        pattern
+    } else {
+        RefChipPattern::Solid
+    }
+}
+
 /// Paint a single ref chip (used for unmerged / standalone refs).
-fn paint_ref_chip(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32) {
+fn paint_ref_chip(
+    ui: &mut egui::Ui,
+    text: &str,
+    bg: Color32,
+    fg: Color32,
+    pattern: RefChipPattern,
+) {
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_string(), FontId::monospace(11.0), fg);
@@ -1245,8 +1373,86 @@ fn paint_ref_chip(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32) {
     let size = galley.size() + pad * 2.0;
     let (chip_rect, _) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter().rect_filled(chip_rect, 3.0, bg);
+    paint_ref_pattern(
+        ui.painter(),
+        chip_rect.shrink(1.0),
+        pattern,
+        pattern_color(bg),
+    );
     ui.painter().galley(chip_rect.min + pad, galley, fg);
     ui.add_space(4.0);
+}
+
+fn paint_ref_pattern(
+    painter: &Painter,
+    rect: Rect,
+    pattern: RefChipPattern,
+    color: Color32,
+) {
+    if pattern == RefChipPattern::Solid {
+        return;
+    }
+
+    let painter = painter.with_clip_rect(rect);
+    match pattern {
+        RefChipPattern::Solid => {}
+        RefChipPattern::Diagonal => {
+            let spacing = 5.0;
+            let mut x = rect.left() - rect.height();
+            while x < rect.right() {
+                painter.line_segment(
+                    [
+                        egui::pos2(x, rect.bottom()),
+                        egui::pos2(x + rect.height(), rect.top()),
+                    ],
+                    Stroke::new(1.0, color),
+                );
+                x += spacing;
+            }
+        }
+        RefChipPattern::Dots => {
+            let spacing = 6.0;
+            let mut y = rect.top() + 3.0;
+            while y < rect.bottom() {
+                let mut x = rect.left() + 3.0;
+                while x < rect.right() {
+                    painter.circle_filled(egui::pos2(x, y), 1.0, color);
+                    x += spacing;
+                }
+                y += spacing;
+            }
+        }
+        RefChipPattern::Cross => {
+            let spacing = 5.0;
+            let mut x = rect.left() - rect.height();
+            while x < rect.right() {
+                painter.line_segment(
+                    [
+                        egui::pos2(x, rect.bottom()),
+                        egui::pos2(x + rect.height(), rect.top()),
+                    ],
+                    Stroke::new(1.0, color),
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(x, rect.top()),
+                        egui::pos2(x + rect.height(), rect.bottom()),
+                    ],
+                    Stroke::new(1.0, color),
+                );
+                x += spacing;
+            }
+        }
+    }
+}
+
+fn pattern_color(bg: Color32) -> Color32 {
+    let luma = 0.2126 * bg.r() as f32 + 0.7152 * bg.g() as f32 + 0.0722 * bg.b() as f32;
+    if luma > 145.0 {
+        Color32::from_black_alpha(90)
+    } else {
+        Color32::from_white_alpha(80)
+    }
 }
 
 fn paint_message_cell(
@@ -1649,7 +1855,12 @@ fn summarize_working_tree(entries: &[crate::git::StatusEntry]) -> WorkingTreeSum
     }
 }
 
-fn paint_working_tree_refs_cell(ui: &mut Ui, rect: Rect, summary: &WorkingTreeSummary) {
+fn paint_working_tree_refs_cell(
+    ui: &mut Ui,
+    rect: Rect,
+    summary: &WorkingTreeSummary,
+    accessibility_patterns: bool,
+) {
     if rect.width() <= 0.0 {
         return;
     }
@@ -1660,11 +1871,13 @@ fn paint_working_tree_refs_cell(ui: &mut Ui, rect: Rect, summary: &WorkingTreeSu
     );
     child.set_clip_rect(rect);
 
+    let changes_bg = Color32::from_rgb(98, 124, 186);
     paint_ref_chip(
         &mut child,
         "CHANGES",
-        Color32::from_rgb(98, 124, 186),
-        Color32::WHITE,
+        changes_bg,
+        crate::ui::theme::readable_text(changes_bg),
+        pattern_if_enabled(RefChipPattern::Diagonal, accessibility_patterns),
     );
     if summary.conflicted > 0 {
         paint_ref_chip(
@@ -1672,6 +1885,7 @@ fn paint_working_tree_refs_cell(ui: &mut Ui, rect: Rect, summary: &WorkingTreeSu
             "CONFLICT",
             Color32::from_rgb(192, 86, 86),
             Color32::from_rgb(255, 240, 240),
+            pattern_if_enabled(RefChipPattern::Cross, accessibility_patterns),
         );
     }
 }
@@ -1859,6 +2073,7 @@ fn render_working_tree_row(
     connected_lane: Option<u16>,
     selected: &mut bool,
     out: &mut GraphInteraction,
+    accessibility_patterns: bool,
 ) {
     use egui::{Sense, Vec2};
 
@@ -1953,7 +2168,7 @@ fn render_working_tree_row(
     }
 
     if layout.show_refs_column {
-        paint_working_tree_refs_cell(ui, cells.refs, summary);
+        paint_working_tree_refs_cell(ui, cells.refs, summary, accessibility_patterns);
     }
 
     if layout.show_message {

@@ -1,6 +1,6 @@
 //! Repo tab strip.
 //!
-//! Sits between the top bar and the main panel. One tab per open repo,
+//! Sits above the repository toolbar. One tab per open repo,
 //! plus an optional launcher tab for opening / cloning another repo
 //! without leaving the current workspace.
 //!
@@ -9,10 +9,10 @@
 //!   * Ctrl+Shift+Tab     → prev tab
 //!   * Cmd+W / Ctrl+W     → close active tab
 
-use egui::{RichText, Stroke};
+use egui::{Frame, Margin, RichText, Rounding, Stroke};
 
 use crate::app::{MergeFoxApp, View};
-use crate::config::UiLanguage;
+use crate::config::{ThemeSettings, UiLanguage};
 
 pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let View::Workspace(tabs) = &app.view else {
@@ -36,7 +36,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let has_launcher = tabs.launcher_tab.is_some();
     let launcher_active = tabs.launcher_active;
     let launcher_title = launcher_title(app.config.ui_language.resolved()).to_string();
-    let visuals = ctx.style().visuals.clone();
+    let theme = app.config.theme.clone();
 
     let mut focus_repo: Option<usize> = None;
     let mut close_repo: Option<usize> = None;
@@ -45,8 +45,15 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let mut open_launcher = false;
 
     egui::TopBottomPanel::top("repo_tabs")
-        .exact_height(28.0)
+        .exact_height(32.0)
+        .frame(
+            Frame::none()
+                .fill(crate::ui::theme::tab_bar_fill(&theme))
+                .stroke(crate::ui::theme::subtle_stroke(&theme))
+                .inner_margin(Margin::symmetric(8.0, 4.0)),
+        )
         .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             ui.horizontal(|ui| {
                 egui::ScrollArea::horizontal()
                     .auto_shrink([false, true])
@@ -57,7 +64,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                                     ui,
                                     title,
                                     *active,
-                                    &visuals,
+                                    &theme,
                                     &mut focus_repo,
                                     &mut close_repo,
                                     i,
@@ -68,7 +75,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                                     ui,
                                     &launcher_title,
                                     launcher_active,
-                                    &visuals,
+                                    &theme,
                                     &mut focus_launcher,
                                     &mut close_launcher,
                                 );
@@ -101,34 +108,40 @@ fn paint_tab(
     ui: &mut egui::Ui,
     title: &str,
     active: bool,
-    visuals: &egui::Visuals,
+    theme: &ThemeSettings,
     focus: &mut Option<usize>,
     close: &mut Option<usize>,
     idx: usize,
 ) {
+    let visuals = ui.visuals();
+    let accent = crate::ui::theme::accent(theme);
     let (bg, fg) = if active {
         (
+            crate::ui::theme::active_tab_fill(theme),
             visuals
-                .selection
-                .bg_fill
-                .gamma_multiply(if visuals.dark_mode { 0.58 } else { 0.26 }),
-            visuals.strong_text_color(),
+                .override_text_color
+                .unwrap_or_else(|| visuals.strong_text_color()),
         )
     } else {
         (
-            visuals.widgets.inactive.weak_bg_fill,
-            visuals.widgets.inactive.fg_stroke.color,
+            crate::ui::theme::inactive_tab_fill(theme),
+            visuals
+                .override_text_color
+                .unwrap_or(visuals.widgets.inactive.fg_stroke.color)
+                .gamma_multiply(0.76),
         )
+    };
+    let stroke = if active {
+        Stroke::new(1.0, accent.gamma_multiply(0.86))
+    } else {
+        crate::ui::theme::subtle_stroke(theme)
     };
 
     egui::Frame::none()
         .fill(bg)
-        .stroke(Stroke::new(
-            1.0,
-            visuals.widgets.noninteractive.bg_stroke.color,
-        ))
-        .rounding(2.0)
-        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+        .stroke(stroke)
+        .rounding(Rounding::same(4.0))
+        .inner_margin(Margin::symmetric(9.0, 3.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let resp = ui.add(
@@ -146,44 +159,45 @@ fn paint_tab(
                 }
             });
         });
-    ui.add_space(4.0);
 }
 
 fn paint_launcher_tab(
     ui: &mut egui::Ui,
     title: &str,
     active: bool,
-    visuals: &egui::Visuals,
+    theme: &ThemeSettings,
     focus: &mut bool,
     close: &mut bool,
 ) {
+    let visuals = ui.visuals();
+    let accent = crate::ui::theme::accent(theme);
     let (bg, fg) = if active {
         (
+            crate::ui::theme::active_tab_fill(theme),
             visuals
-                .selection
-                .bg_fill
-                .gamma_multiply(if visuals.dark_mode { 0.46 } else { 0.20 }),
-            visuals.strong_text_color(),
+                .override_text_color
+                .unwrap_or_else(|| visuals.strong_text_color()),
         )
     } else {
         (
+            crate::ui::theme::tab_bar_fill(theme),
             visuals
-                .widgets
-                .inactive
-                .bg_fill
-                .gamma_multiply(if visuals.dark_mode { 0.92 } else { 1.0 }),
-            visuals.widgets.inactive.fg_stroke.color,
+                .override_text_color
+                .unwrap_or(visuals.widgets.inactive.fg_stroke.color)
+                .gamma_multiply(0.72),
         )
+    };
+    let stroke = if active {
+        Stroke::new(1.0, accent.gamma_multiply(0.72))
+    } else {
+        crate::ui::theme::subtle_stroke(theme)
     };
 
     egui::Frame::none()
         .fill(bg)
-        .stroke(Stroke::new(
-            1.0,
-            visuals.widgets.noninteractive.bg_stroke.color,
-        ))
-        .rounding(2.0)
-        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+        .stroke(stroke)
+        .rounding(Rounding::same(4.0))
+        .inner_margin(Margin::symmetric(9.0, 3.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let resp = ui.add(
@@ -201,7 +215,6 @@ fn paint_launcher_tab(
                 }
             });
         });
-    ui.add_space(4.0);
 }
 
 fn launcher_title(language: UiLanguage) -> &'static str {
