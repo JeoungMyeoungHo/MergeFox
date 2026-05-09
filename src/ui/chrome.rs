@@ -100,9 +100,9 @@ pub fn toolbar_button(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Respo
     )
 }
 
-/// pill-shaped pill-shaped primary button. Filled with the theme
-/// accent and used for the single "commit me right now" action that
-/// should stand out in the otherwise-monochrome toolbar.
+/// Pill-shaped primary button. Filled with the theme accent and used
+/// for the single "commit me right now" action that should stand out
+/// in the otherwise-monochrome toolbar.
 pub fn primary_button(
     ui: &mut egui::Ui,
     settings: &ThemeSettings,
@@ -118,8 +118,8 @@ pub fn primary_button(
     )
 }
 
-/// Render a row of mutually-exclusive options as a single -
-/// style segmented pill. Each option that's clicked returns its index
+/// Render a row of mutually-exclusive options as a single pill-
+/// shaped segmented control. Each option that's clicked returns its index
 /// via the closure; the caller decides what to do with that.
 ///
 /// Visually: one rounded outer frame; each option is a transparent

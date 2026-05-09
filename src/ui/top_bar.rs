@@ -68,8 +68,7 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let mut refresh_forge = false;
     // Local-action intents (Commit, Rebase, Undo, Redo, Recovery) —
     // these used to live in a second toolbar inside `main_panel`.
-    // Consolidated up here so the user has one toolbar for every verb,
-    // matching a single unified action bar.
+    // Consolidated up here so the user has one toolbar for every verb.
     let mut open_commit = false;
     let mut open_rebase = false;
     let mut do_undo = false;

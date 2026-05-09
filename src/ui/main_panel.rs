@@ -90,9 +90,9 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         // Single view-controls row: pane switcher + (graph) scope +
         // small icon buttons. All "do something" verbs (Commit, Rebase,
         // Undo, Redo, Fetch/Pull/Push) live in the top toolbar, so this
-        // row only carries view configuration. Same idiom as Fork /
-        // common graph-tool where the center pane has a single
-        // header strip rather than a second toolbar.
+        // row only carries view configuration — keeping the center
+        // pane to one header strip instead of stacking a second
+        // toolbar of half-redundant actions.
         let in_graph_view = matches!(ws.center_view_tab, CenterViewTab::Graph);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;

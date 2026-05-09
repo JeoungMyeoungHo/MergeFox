@@ -31,8 +31,8 @@ pub const COMPACT_LANE_WIDTH: f32 = 12.0;
 const DOT_RADIUS: f32 = 5.5;
 const LINE_WIDTH: f32 = 2.2;
 /// Width of the accent bar painted on the left edge of the selected
-/// row. "You are here" cue — keeps the active commit
-/// findable as the user scrolls.
+/// row. "You are here" cue — keeps the active commit findable as the
+/// user scrolls.
 const SELECTION_BAR_WIDTH: f32 = 3.0;
 
 /// Hard ceiling on the graph column's visible width. Beyond this, the
@@ -387,22 +387,47 @@ impl GraphView {
                     let row = &self.graph.rows[idx];
                     let in_basket = basket.contains(&row.oid);
 
-                    // Selection background — layered:
-                    //   1. Zebra stripe: every other row gets a faint
-                    //      tint so eyes can track wide rows. 
-                    //      uses this effect on its commit list.
-                    //   2. Basket membership → faint accent tint (distinct
-                    //      from the active-row highlight so a user can
-                    //      tell "selected for basket" apart from "diff
-                    //      is showing this commit").
-                    //   3. Active selected_row wins over basket tint
-                    //      so the currently-viewed row stays legible.
-                    //   4. Hover is below both.
+                    // Row state ramp:
+                    //
+                    //   stripe   neutral name-bg tint    — zebra (no hue)
+                    //   hover    toned-down accent       — same hue, ~50% saturation
+                    //   basket   cool secondary           — multi-select
+                    //   selected full accent             — current commit
+                    //
+                    // Hover and select share the same warm hue but
+                    // differ in *saturation* — hover is the "preview"
+                    // of select, while select is the committed state.
+                    // Stripe stays purely neutral so it doesn't compete
+                    // with the warm-hued action states above it.
+                    let dark = ui.visuals().dark_mode;
+                    let accent = ui.visuals().selection.bg_fill;
+                    let alpha_for = |dark_a: u8, light_a: u8| if dark { dark_a } else { light_a };
+                    let tint = |c: Color32, a: u8| -> Color32 {
+                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+                    };
+                    // Reduce saturation toward Rec.601 luma. factor=1.0
+                    // is original; factor=0.0 is fully grayscale. We
+                    // use ~0.5 for hover so the hue is recognisable
+                    // but reads as a "subdued" version of the accent.
+                    let tone_down = |c: Color32, factor: f32| -> Color32 {
+                        let l = 0.299 * c.r() as f32
+                            + 0.587 * c.g() as f32
+                            + 0.114 * c.b() as f32;
+                        let blend = |chan: u8| -> u8 {
+                            (l + (chan as f32 - l) * factor)
+                                .round()
+                                .clamp(0.0, 255.0) as u8
+                        };
+                        Color32::from_rgb(blend(c.r()), blend(c.g()), blend(c.b()))
+                    };
+
                     if idx % 2 == 1
                         && self.selected_row != Some(idx)
                         && !in_basket
                         && !resp.hovered()
                     {
+                        // Neutral zebra — no hue, just a brightness
+                        // bump from the panel bg.
                         ui.painter().rect_filled(
                             rect,
                             0.0,
@@ -410,36 +435,37 @@ impl GraphView {
                         );
                     }
                     if self.selected_row == Some(idx) {
-                        ui.painter().rect_filled(
-                            rect,
-                            0.0,
-                            ui.visuals()
-                                .selection
-                                .bg_fill
-                                .gamma_multiply(if ui.visuals().dark_mode { 0.42 } else { 0.18 }),
-                        );
-                        // Left accent bar — bright vertical stripe
-                        // marking the current commit the way 
-                        // marks the active row. Sits inside the row
-                        // rect's left edge, full height.
+                        ui.painter()
+                            .rect_filled(rect, 0.0, tint(accent, alpha_for(110, 60)));
+                        // Left accent bar — bright vertical stripe at
+                        // full opacity, anchoring the active row even
+                        // if the fill is partially obscured by the
+                        // graph lanes painted on top.
                         let bar = Rect::from_min_size(
                             rect.left_top(),
                             Vec2::new(SELECTION_BAR_WIDTH, rect.height()),
                         );
-                        ui.painter()
-                            .rect_filled(bar, 0.0, ui.visuals().selection.bg_fill);
+                        ui.painter().rect_filled(bar, 0.0, accent);
                     } else if in_basket {
-                        let accent = ui.visuals().selection.bg_fill;
-                        ui.painter().rect_filled(
-                            rect,
-                            0.0,
-                            accent.gamma_multiply(if ui.visuals().dark_mode { 0.18 } else { 0.09 }),
-                        );
+                        // Basket: cool secondary highlight distinct
+                        // from the warm selection accent — keeps "diff
+                        // is showing this" visually separate from
+                        // "queued for a multi-commit op".
+                        let basket_color = if dark {
+                            Color32::from_rgb(110, 170, 230)
+                        } else {
+                            Color32::from_rgb(60, 110, 180)
+                        };
+                        ui.painter()
+                            .rect_filled(rect, 0.0, tint(basket_color, alpha_for(60, 40)));
                     } else if resp.hovered() {
+                        // Toned-down accent: same hue as selection,
+                        // half the saturation. Reads as "this row is
+                        // about to become selected if you click".
                         ui.painter().rect_filled(
                             rect,
                             0.0,
-                            ui.visuals().faint_bg_color.gamma_multiply(1.4),
+                            tint(tone_down(accent, 0.5), alpha_for(80, 48)),
                         );
                     }
 
@@ -1210,10 +1236,10 @@ fn paint_refs_cell(
     child.set_clip_rect(rect);
 
     if is_head {
-        // Filled HEAD pill — bright accent bg, dark
-        // legible text. Stronger visual anchor than the outlined chip
-        // we used to ship; the user's current location should be the
-        // first thing the eye lands on in the refs column.
+        // Filled HEAD pill — bright accent bg, dark legible text.
+        // Stronger visual anchor than the outlined chip we used to
+        // ship; the user's current location should be the first thing
+        // the eye lands on in the refs column.
         let bg = Color32::from_rgb(255, 196, 84);
         let fg = Color32::from_rgb(36, 26, 16);
         let galley = child.painter().layout_no_wrap(
@@ -1417,7 +1443,7 @@ fn paint_ref_chip(
     let size = galley.size() + pad * 2.0;
     let (chip_rect, _) = ui.allocate_exact_size(size, Sense::hover());
     // Pill-shaped chip — radius == half height so the ends are full
-    // semicircles, matching a clean label silhouette.
+    // semicircles, giving each ref a clear "label" silhouette.
     let radius = chip_rect.height() * 0.5;
     ui.painter().rect_filled(chip_rect, radius, bg);
     paint_ref_pattern(
