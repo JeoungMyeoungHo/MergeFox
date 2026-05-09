@@ -6302,6 +6302,16 @@ impl MergeFoxApp {
         };
 
         // Remove the handle and act on the result.
+        //
+        // Failure routing: we used to set `last_error` and stop, which
+        // worked when the top bar still rendered that field as a red
+        // banner. Since 4a616eb the banner is gone and every other
+        // error site (`set_git_error`) goes through the toast stack —
+        // so push / pull / fetch failures were silently disappearing.
+        // We now mirror `set_git_error`'s shape: notify_err_with_detail
+        // for the toast + keep `last_error` for journal / diagnostics.
+        let mut deferred: Option<(String, Option<String>)> = None;
+        let mut missing_binary = false;
         if let View::Workspace(tabs) = &mut self.view {
             let ws = tabs.current_mut();
             let label = ws
@@ -6320,7 +6330,7 @@ impl MergeFoxApp {
                         self.hud = Some(Hud::new(diagnostic.user_message(&label), 1800));
                     } else {
                         if matches!(diagnostic.kind, crate::git::GitErrorKind::MissingBinary) {
-                            self.refresh_git_capability();
+                            missing_binary = true;
                         }
                         let message = self
                             .auth_failure_message_for_job(
@@ -6330,10 +6340,31 @@ impl MergeFoxApp {
                                 &label,
                             )
                             .unwrap_or_else(|| diagnostic.user_message(&label));
-                        self.last_error = Some(message);
+                        // The raw `git` stderr often carries actionable
+                        // hints the summarised `message` strips out
+                        // ("hint: ... non-fast-forward", branch / ref
+                        // names, server reject reasons). Surface it as
+                        // the toast's expandable detail line.
+                        let raw = e.to_string();
+                        let detail = if raw.trim().is_empty() || raw.trim() == message.trim() {
+                            None
+                        } else {
+                            Some(raw)
+                        };
+                        deferred = Some((message, detail));
                     }
                 }
             }
+        }
+        if missing_binary {
+            self.refresh_git_capability();
+        }
+        if let Some((message, detail)) = deferred {
+            match detail {
+                Some(d) => self.notify_err_with_detail(message.clone(), d),
+                None => self.notify_err(message.clone()),
+            }
+            self.last_error = Some(message);
         }
         self.rebuild_graph(scope);
     }
