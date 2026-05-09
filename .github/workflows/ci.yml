@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    # Weekly supply-chain audit. The job itself is gated below so regular
+    # push/PR builds don't spend time on a second advisory scan.
+    - cron: "17 3 * * 1"
 
 env:
   CARGO_TERM_COLOR: always

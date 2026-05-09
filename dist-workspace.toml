@@ -11,8 +11,10 @@ ci = "github"
 installers = ["shell", "powershell", "msi"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
-# Which actions to run on pull requests
-pr-run-mode = "plan"
+# Release packaging is intentionally tag-only. Regular PR/push CI still runs
+# build + test on Linux/macOS/Windows, while cargo-dist artifacts are built
+# only when a version tag is pushed.
+pr-run-mode = "skip"
 # Extra static files to include in each App (path relative to this Cargo.toml's dir)
 include = ["README.md", "LICENSE", "NOTICE", "CHANGELOG.md", "RELEASE.md"]
 # Path that installers should place binaries in

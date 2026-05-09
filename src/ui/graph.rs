@@ -25,11 +25,15 @@ use crate::actions::{CommitAction, ResetMode};
 use crate::git::{CommitGraph, GraphRow};
 use crate::ui::columns::ColumnPrefs;
 
-pub const ROW_HEIGHT: f32 = 24.0;
-pub const LANE_WIDTH: f32 = 16.0;
-pub const COMPACT_LANE_WIDTH: f32 = 10.0;
-const DOT_RADIUS: f32 = 4.5;
-const LINE_WIDTH: f32 = 1.8;
+pub const ROW_HEIGHT: f32 = 26.0;
+pub const LANE_WIDTH: f32 = 18.0;
+pub const COMPACT_LANE_WIDTH: f32 = 12.0;
+const DOT_RADIUS: f32 = 5.5;
+const LINE_WIDTH: f32 = 2.2;
+/// Width of the accent bar painted on the left edge of the selected
+/// row. "You are here" cue — keeps the active commit
+/// findable as the user scrolls.
+const SELECTION_BAR_WIDTH: f32 = 3.0;
 
 /// Hard ceiling on the graph column's visible width. Beyond this, the
 /// column stays this wide and the user scrolls horizontally inside it
@@ -384,13 +388,27 @@ impl GraphView {
                     let in_basket = basket.contains(&row.oid);
 
                     // Selection background — layered:
-                    //   1. Basket membership → faint accent tint (distinct
+                    //   1. Zebra stripe: every other row gets a faint
+                    //      tint so eyes can track wide rows. 
+                    //      uses this effect on its commit list.
+                    //   2. Basket membership → faint accent tint (distinct
                     //      from the active-row highlight so a user can
                     //      tell "selected for basket" apart from "diff
                     //      is showing this commit").
-                    //   2. Active selected_row wins over basket tint
+                    //   3. Active selected_row wins over basket tint
                     //      so the currently-viewed row stays legible.
-                    //   3. Hover is below both.
+                    //   4. Hover is below both.
+                    if idx % 2 == 1
+                        && self.selected_row != Some(idx)
+                        && !in_basket
+                        && !resp.hovered()
+                    {
+                        ui.painter().rect_filled(
+                            rect,
+                            0.0,
+                            ui.visuals().faint_bg_color.gamma_multiply(0.55),
+                        );
+                    }
                     if self.selected_row == Some(idx) {
                         ui.painter().rect_filled(
                             rect,
@@ -400,6 +418,16 @@ impl GraphView {
                                 .bg_fill
                                 .gamma_multiply(if ui.visuals().dark_mode { 0.42 } else { 0.18 }),
                         );
+                        // Left accent bar — bright vertical stripe
+                        // marking the current commit the way 
+                        // marks the active row. Sits inside the row
+                        // rect's left edge, full height.
+                        let bar = Rect::from_min_size(
+                            rect.left_top(),
+                            Vec2::new(SELECTION_BAR_WIDTH, rect.height()),
+                        );
+                        ui.painter()
+                            .rect_filled(bar, 0.0, ui.visuals().selection.bg_fill);
                     } else if in_basket {
                         let accent = ui.visuals().selection.bg_fill;
                         ui.painter().rect_filled(
@@ -411,7 +439,7 @@ impl GraphView {
                         ui.painter().rect_filled(
                             rect,
                             0.0,
-                            ui.visuals().faint_bg_color.gamma_multiply(1.1),
+                            ui.visuals().faint_bg_color.gamma_multiply(1.4),
                         );
                     }
 
@@ -1058,26 +1086,34 @@ fn paint_graph_cell(
     // multiple lines of history. This is the same idiom used across
     // common graph-based git viewers (including `gitk --topo-order`,
     // which shades merge nodes differently).
+    //
+    // Refinements over the bare gitk-style ring/dot:
+    //   * outer "halo" band (panel-bg) so the dot reads cleanly on top
+    //     of any pass-through lane line that happens to share the column
+    //   * thicker stroke around solid dots for better punch on dark bg
     let dot_pos = Pos2::new(lane_x(row.lane), mid_y);
     let base_color = lane_color(row.lane);
     let is_merge = row.edges_out.len() > 1;
+    let bg = painter.ctx().style().visuals.panel_fill;
+    // Halo: 1.5 px wider than the dot, painted in panel-bg so the lane
+    // line behind the dot doesn't appear to pass through it.
+    painter.circle_filled(dot_pos, DOT_RADIUS + 1.5, bg);
     if is_merge {
-        // Ring: stroked outer, filled inner hole in the panel's
-        // background so we punch a hole through any lane line that
-        // happens to pass through.
-        let bg = painter.ctx().style().visuals.panel_fill;
-        painter.circle_filled(dot_pos, DOT_RADIUS, bg);
+        // Ring with a colored inner core that's clearly distinct from a
+        // filled dot — keeps the "merge = ring" convention readable
+        // while feeling more substantial than the old hairline ring.
         painter.circle_stroke(
             dot_pos,
             DOT_RADIUS,
-            Stroke::new(LINE_WIDTH.max(1.6), base_color),
+            Stroke::new(LINE_WIDTH.max(2.0), base_color),
         );
+        painter.circle_filled(dot_pos, DOT_RADIUS - 2.0, bg);
     } else {
         painter.circle_filled(dot_pos, DOT_RADIUS, base_color);
         painter.circle_stroke(
             dot_pos,
             DOT_RADIUS,
-            Stroke::new(1.0, Color32::from_black_alpha(80)),
+            Stroke::new(1.4, Color32::from_black_alpha(140)),
         );
     }
 }
@@ -1174,17 +1210,22 @@ fn paint_refs_cell(
     child.set_clip_rect(rect);
 
     if is_head {
-        let fg = Color32::from_rgb(255, 220, 120);
-        let galley =
-            child
-                .painter()
-                .layout_no_wrap("HEAD".to_string(), FontId::monospace(11.0), fg);
-        let pad = Vec2::new(5.0, 2.0);
+        // Filled HEAD pill — bright accent bg, dark
+        // legible text. Stronger visual anchor than the outlined chip
+        // we used to ship; the user's current location should be the
+        // first thing the eye lands on in the refs column.
+        let bg = Color32::from_rgb(255, 196, 84);
+        let fg = Color32::from_rgb(36, 26, 16);
+        let galley = child.painter().layout_no_wrap(
+            "HEAD".to_string(),
+            FontId::monospace(11.0),
+            fg,
+        );
+        let pad = Vec2::new(7.0, 2.0);
         let size = galley.size() + pad * 2.0;
         let (chip_rect, _) = child.allocate_exact_size(size, Sense::hover());
-        child
-            .painter()
-            .rect_stroke(chip_rect, 3.0, Stroke::new(1.0, fg));
+        let radius = chip_rect.height() * 0.5;
+        child.painter().rect_filled(chip_rect, radius, bg);
         child.painter().galley(chip_rect.min + pad, galley, fg);
         child.add_space(4.0);
     }
@@ -1252,13 +1293,16 @@ fn paint_refs_cell(
             let h = left_galley.size().y.max(right_galley.size().y) + pad.y * 2.0;
             let total_w = left_w + right_w;
             let (chip_rect, _) = child.allocate_exact_size(Vec2::new(total_w, h), Sense::hover());
-            // Left zone: local green with left-rounded corners.
+            // Pill-shaped split chip: each half gets a full semicircle
+            // on its outer edge and a flat seam where they meet, so the
+            // composite reads as a single "synced" pill.
+            let pill_r = h * 0.5;
             let left_rect = Rect::from_min_size(chip_rect.min, Vec2::new(left_w, h));
             child.painter().rect_filled(
                 left_rect,
                 egui::Rounding {
-                    nw: 3.0,
-                    sw: 3.0,
+                    nw: pill_r,
+                    sw: pill_r,
                     ne: 0.0,
                     se: 0.0,
                 },
@@ -1283,8 +1327,8 @@ fn paint_refs_cell(
                 egui::Rounding {
                     nw: 0.0,
                     sw: 0.0,
-                    ne: 3.0,
-                    se: 3.0,
+                    ne: pill_r,
+                    se: pill_r,
                 },
                 REMOTE_BG,
             );
@@ -1369,10 +1413,13 @@ fn paint_ref_chip(
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_string(), FontId::monospace(11.0), fg);
-    let pad = Vec2::new(6.0, 2.0);
+    let pad = Vec2::new(7.0, 2.0);
     let size = galley.size() + pad * 2.0;
     let (chip_rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter().rect_filled(chip_rect, 3.0, bg);
+    // Pill-shaped chip — radius == half height so the ends are full
+    // semicircles, matching a clean label silhouette.
+    let radius = chip_rect.height() * 0.5;
+    ui.painter().rect_filled(chip_rect, radius, bg);
     paint_ref_pattern(
         ui.painter(),
         chip_rect.shrink(1.0),
@@ -2004,25 +2051,27 @@ fn draw_dashed_vline(painter: &Painter, from: Pos2, to: Pos2, stroke: Stroke) {
 }
 
 fn lane_color(lane: u16) -> Color32 {
-    // Pastel palette — low-saturation, high-value colours so even a merge-
-    // heavy history reads as a softly coloured ribbon instead of a candy-
-    // striped barcode. Hand-tuned so adjacent entries are distinguishable
-    // without being garish; cycles past 12 lanes.
-    const PASTEL: &[(u8, u8, u8)] = &[
-        (255, 183, 178), // pink
-        (255, 207, 175), // peach
-        (255, 231, 175), // cream
-        (206, 232, 185), // soft green
-        (180, 225, 219), // seafoam
-        (180, 210, 236), // sky blue
-        (204, 190, 236), // lavender
-        (240, 190, 220), // rose
-        (195, 225, 205), // mint
-        (235, 205, 185), // sand
-        (215, 225, 250), // periwinkle
-        (235, 230, 190), // butter
+    // Saturated lane palette. Each hue is hand-picked to be
+    // distinguishable from its neighbours at lane width and to remain
+    // legible against both the dark-orange MergeFox theme and the
+    // light theme. Lane 0 (typically `main` / HEAD) intentionally
+    // matches the app's warm accent so the primary line "owns" the
+    // graph; subsequent lanes spread around the wheel for contrast.
+    const PALETTE: &[(u8, u8, u8)] = &[
+        (255, 145, 70),  // amber (main / HEAD lane)
+        (98, 179, 245),  // azure
+        (130, 200, 120), // leaf green
+        (200, 140, 230), // violet
+        (255, 200, 90),  // gold
+        (90, 210, 200),  // teal
+        (240, 130, 170), // rose
+        (160, 200, 100), // lime
+        (140, 170, 240), // cornflower
+        (235, 165, 110), // copper
+        (180, 220, 235), // ice
+        (210, 170, 240), // lavender
     ];
-    let (r, g, b) = PASTEL[lane as usize % PASTEL.len()];
+    let (r, g, b) = PALETTE[lane as usize % PALETTE.len()];
     Color32::from_rgb(r, g, b)
 }
 

@@ -66,7 +66,32 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     let mut open_pr = false;
     let mut open_issue = false;
     let mut refresh_forge = false;
+    // Local-action intents (Commit, Rebase, Undo, Redo, Recovery) —
+    // these used to live in a second toolbar inside `main_panel`.
+    // Consolidated up here so the user has one toolbar for every verb,
+    // matching a single unified action bar.
+    let mut open_commit = false;
+    let mut open_rebase = false;
+    let mut do_undo = false;
+    let mut do_redo = false;
+    let mut open_panic = false;
     let labels = top_bar_labels(app.config.ui_language);
+
+    // Snapshot Undo/Redo enabled-state + tooltip hints from the journal
+    // before the UI closure (which can't borrow `ws` again once we hit
+    // the `&mut app` dispatch path below).
+    let (can_undo, can_redo, peek_undo_label, peek_redo_label) =
+        match ws.journal.as_ref() {
+            Some(j) => (
+                j.cursor.is_some(),
+                j.peek_redo().is_some(),
+                j.peek_undo().map(|e| e.operation.label()),
+                j.peek_redo().map(|e| e.operation.label()),
+            ),
+            None => (false, false, None, None),
+        };
+    let repo_clean = matches!(ws.repo.state(), crate::git::RepoState::Clean);
+    let panic_active = app.panic_detector_active();
 
     let cached_remotes: Vec<String> = ws
         .repo_ui_cache
@@ -273,6 +298,68 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
                     });
                 });
             });
+
+            // ---- Local actions: Commit (primary) + Rebase ----
+            // These were previously in a second toolbar inside the
+            // center pane. Same enabled gating as Fetch/Pull/Push (need
+            // a working git binary + no in-flight job) so the user
+            // doesn't see a Commit button that does nothing.
+            ui.separator();
+            ui.add_enabled_ui(!has_active_job && git_available, |ui| {
+                if crate::ui::chrome::primary_button(ui, &app.config.theme, "📝 Commit")
+                    .on_hover_text("Open the commit modal")
+                    .clicked()
+                {
+                    open_commit = true;
+                }
+                ui.add_enabled_ui(repo_clean, |ui| {
+                    if ui
+                        .button("⎇ Rebase…")
+                        .on_hover_text("Plan an interactive rebase for the current branch")
+                        .clicked()
+                    {
+                        open_rebase = true;
+                    }
+                });
+            });
+
+            // ---- Undo / Redo (+ Recovery if panic) ----
+            // Journal-based, doesn't need git. Always shown so the
+            // grayed-out hint helps users discover the gesture even
+            // with an empty journal.
+            ui.separator();
+            ui.add_enabled_ui(can_undo, |ui| {
+                let btn = ui.button("↶ Undo");
+                let btn = if let Some(s) = &peek_undo_label {
+                    btn.on_hover_text(format!("Cmd+Z — {s}"))
+                } else {
+                    btn.on_hover_text("Cmd+Z")
+                };
+                if btn.clicked() {
+                    do_undo = true;
+                }
+            });
+            ui.add_enabled_ui(can_redo, |ui| {
+                let btn = ui.button("↷ Redo");
+                let btn = if let Some(s) = &peek_redo_label {
+                    btn.on_hover_text(format!("Cmd+Shift+Z — {s}"))
+                } else {
+                    btn.on_hover_text("Cmd+Shift+Z")
+                };
+                if btn.clicked() {
+                    do_redo = true;
+                }
+            });
+            if panic_active {
+                if ui
+                    .button(egui::RichText::new("🆘 Recovery").color(egui::Color32::YELLOW))
+                    .on_hover_text("Lots of undo/redo lately — open recovery options")
+                    .clicked()
+                {
+                    open_panic = true;
+                }
+            }
+
             if !git_available {
                 ui.separator();
                 ui.colored_label(
@@ -431,6 +518,21 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
     }
     if open_settings {
         app.open_settings();
+    }
+    if open_commit {
+        app.commit_modal_open = true;
+    }
+    if open_rebase {
+        app.open_rebase_modal_for_head();
+    }
+    if do_undo {
+        app.undo();
+    }
+    if do_redo {
+        app.redo();
+    }
+    if open_panic {
+        app.open_panic_recovery();
     }
 }
 

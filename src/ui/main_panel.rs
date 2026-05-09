@@ -87,26 +87,78 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
         // related views of the same repo" rather than as a separate
         // pane / dock / window. The initial tab is picked per profile
         // at repo-open time and then free to toggle.
+        // Single view-controls row: pane switcher + (graph) scope +
+        // small icon buttons. All "do something" verbs (Commit, Rebase,
+        // Undo, Redo, Fetch/Pull/Push) live in the top toolbar, so this
+        // row only carries view configuration. Same idiom as Fork /
+        // common graph-tool where the center pane has a single
+        // header strip rather than a second toolbar.
+        let in_graph_view = matches!(ws.center_view_tab, CenterViewTab::Graph);
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if ui
-                .selectable_label(ws.center_view_tab == CenterViewTab::Graph, "Graph")
-                .on_hover_text("Commit graph — default view")
-                .clicked()
-                && ws.center_view_tab != CenterViewTab::Graph
-            {
-                intent.switch_tab = Some(CenterViewTab::Graph);
+            ui.spacing_mut().item_spacing.x = 5.0;
+            let cur = match ws.center_view_tab {
+                CenterViewTab::Graph => 0,
+                CenterViewTab::ProjectTree => 1,
+            };
+            if let Some(idx) = crate::ui::chrome::segmented_selector(
+                ui,
+                &theme_snapshot,
+                &["Graph", "Project"],
+                cur,
+            ) {
+                intent.switch_tab = Some(match idx {
+                    0 => CenterViewTab::Graph,
+                    _ => CenterViewTab::ProjectTree,
+                });
             }
-            if ui
-                .selectable_label(
-                    ws.center_view_tab == CenterViewTab::ProjectTree,
-                    "Project",
-                )
-                .on_hover_text("Browse the repository working tree")
-                .clicked()
-                && ws.center_view_tab != CenterViewTab::ProjectTree
-            {
-                intent.switch_tab = Some(CenterViewTab::ProjectTree);
+
+            if in_graph_view {
+                crate::ui::chrome::toolbar_divider(ui);
+                ui.label(egui::RichText::new("Scope").small().strong());
+                let scope_options = [
+                    GraphScope::CurrentBranch,
+                    GraphScope::AllLocal,
+                    GraphScope::AllRefs,
+                ];
+                let scope_labels: Vec<&str> =
+                    scope_options.iter().map(|s| s.label()).collect();
+                let scope_idx = scope_options
+                    .iter()
+                    .position(|s| *s == ws.graph_scope)
+                    .unwrap_or(0);
+                if let Some(idx) = crate::ui::chrome::segmented_selector(
+                    ui,
+                    &theme_snapshot,
+                    &scope_labels,
+                    scope_idx,
+                ) {
+                    if let Some(opt) = scope_options.get(idx) {
+                        intent.new_scope = Some(*opt);
+                    }
+                }
+
+                crate::ui::chrome::toolbar_divider(ui);
+                if ui
+                    .small_button("🔄")
+                    .on_hover_text("Rebuild the commit graph from disk")
+                    .clicked()
+                {
+                    intent.new_scope = Some(ws.graph_scope);
+                }
+                if ui
+                    .small_button("⚙ Columns")
+                    .on_hover_text("Show/hide columns (Branch, Graph, Message, Author, Date, Sha)")
+                    .clicked()
+                {
+                    intent.open_columns = true;
+                }
+                if ui
+                    .small_button("📜 Log")
+                    .on_hover_text("Open MCP activity log — recent git operations for debugging")
+                    .clicked()
+                {
+                    intent.open_activity_log = true;
+                }
             }
         });
         ui.add_space(2.0);
@@ -177,108 +229,10 @@ pub fn show(ctx: &egui::Context, app: &mut MergeFoxApp) {
             return;
         }
 
-        // ---------- toolbar ----------
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
-            ui.label(egui::RichText::new("Scope").small().strong());
-            for opt in [
-                GraphScope::CurrentBranch,
-                GraphScope::AllLocal,
-                GraphScope::AllRefs,
-            ] {
-                if ui
-                    .selectable_label(ws.graph_scope == opt, opt.label())
-                    .clicked()
-                    && ws.graph_scope != opt
-                {
-                    intent.new_scope = Some(opt);
-                }
-            }
-            ui.separator();
-            if ui.button("🔄 Refresh").clicked() {
-                intent.new_scope = Some(ws.graph_scope);
-            }
-            if ui.button("📝 Commit…").clicked() {
-                intent.open_commit = true;
-            }
-            ui.add_enabled_ui(
-                matches!(ws.repo.state(), crate::git::RepoState::Clean),
-                |ui| {
-                    if ui
-                        .button("⎇ Rebase…")
-                        .on_hover_text("Plan an interactive rebase for the current branch")
-                        .clicked()
-                    {
-                        intent.open_rebase = true;
-                    }
-                },
-            );
-
-            ui.separator();
-            if ui
-                .button("⚙ Columns")
-                .on_hover_text("Show/hide columns (Branch, Graph, Message, Author, Date, Sha)")
-                .clicked()
-            {
-                intent.open_columns = true;
-            }
-            if ui
-                .button("📜 Log")
-                .on_hover_text("Open MCP activity log — recent git operations for debugging")
-                .clicked()
-            {
-                intent.open_activity_log = true;
-            }
-
-            ui.separator();
-
-            // Undo/Redo
-            let (can_u, can_r, peek_u, peek_r) = match ws.journal.as_ref() {
-                Some(j) => (
-                    j.cursor.is_some(),
-                    j.peek_redo().is_some(),
-                    j.peek_undo().map(|e| e.operation.label()),
-                    j.peek_redo().map(|e| e.operation.label()),
-                ),
-                None => (false, false, None, None),
-            };
-            ui.add_enabled_ui(can_u, |ui| {
-                let btn = ui.button("↶ Undo");
-                let btn = if let Some(s) = &peek_u {
-                    btn.on_hover_text(format!("Cmd+Z — {s}"))
-                } else {
-                    btn.on_hover_text("Cmd+Z")
-                };
-                if btn.clicked() {
-                    intent.undo = true;
-                }
-            });
-            ui.add_enabled_ui(can_r, |ui| {
-                let btn = ui.button("↷ Redo");
-                let btn = if let Some(s) = &peek_r {
-                    btn.on_hover_text(format!("Cmd+Shift+Z — {s}"))
-                } else {
-                    btn.on_hover_text("Cmd+Shift+Z")
-                };
-                if btn.clicked() {
-                    intent.redo = true;
-                }
-            });
-
-            // Panic indicator — shown only when detection flags recent spam.
-            if panic_active {
-                ui.separator();
-                if ui
-                    .button(egui::RichText::new("🆘 Recovery").color(egui::Color32::YELLOW))
-                    .on_hover_text("Lots of undo/redo lately — open recovery options")
-                    .clicked()
-                {
-                    intent.open_panic = true;
-                }
-            }
-        });
-
-        ui.separator();
+        // Note: action verbs (Commit, Rebase, Fetch/Pull/Push, Undo,
+        // Redo, Recovery) live in the top toolbar — this center pane
+        // only owns view-controls (the row above) and the graph itself.
+        let _ = panic_active;
 
         // Banner: shown whenever a commit is selected. Previously we only
         // showed it once `current_diff` was ready, which made it blink in

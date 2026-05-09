@@ -99,3 +99,105 @@ pub fn toolbar_button(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Respo
         egui::Button::new(RichText::new(text.into()).small()),
     )
 }
+
+/// pill-shaped pill-shaped primary button. Filled with the theme
+/// accent and used for the single "commit me right now" action that
+/// should stand out in the otherwise-monochrome toolbar.
+pub fn primary_button(
+    ui: &mut egui::Ui,
+    settings: &ThemeSettings,
+    text: impl Into<String>,
+) -> egui::Response {
+    let accent = crate::ui::theme::accent(settings);
+    let fg = crate::ui::theme::readable_text(accent);
+    ui.add(
+        egui::Button::new(RichText::new(text.into()).strong().color(fg))
+            .fill(accent)
+            .stroke(Stroke::new(1.0, accent.gamma_multiply(0.7)))
+            .rounding(Rounding::same(12.0)),
+    )
+}
+
+/// Render a row of mutually-exclusive options as a single -
+/// style segmented pill. Each option that's clicked returns its index
+/// via the closure; the caller decides what to do with that.
+///
+/// Visually: one rounded outer frame; each option is a transparent
+/// button with no individual rounding, and the active option gets a
+/// solid accent fill. Saves the space + visual noise of three separate
+/// "selectable_label" calls.
+pub fn segmented_selector<S: AsRef<str>>(
+    ui: &mut egui::Ui,
+    settings: &ThemeSettings,
+    options: &[S],
+    selected_idx: usize,
+) -> Option<usize> {
+    let mut clicked: Option<usize> = None;
+    let accent = crate::ui::theme::accent(settings);
+    let inactive_fg = ui
+        .visuals()
+        .override_text_color
+        .unwrap_or(ui.visuals().widgets.inactive.fg_stroke.color)
+        .gamma_multiply(0.85);
+    let active_fg = crate::ui::theme::readable_text(accent);
+
+    Frame::none()
+        .fill(crate::ui::theme::toolbar_control_fill(settings))
+        .stroke(crate::ui::theme::subtle_stroke(settings))
+        .rounding(Rounding::same(11.0))
+        .inner_margin(Margin::symmetric(2.0, 2.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (idx, label) in options.iter().enumerate() {
+                    let is_active = idx == selected_idx;
+                    let (fill, fg) = if is_active {
+                        (accent, active_fg)
+                    } else {
+                        (Color32::TRANSPARENT, inactive_fg)
+                    };
+                    let resp = ui.add(
+                        egui::Button::new(
+                            RichText::new(label.as_ref())
+                                .small()
+                                .color(fg),
+                        )
+                        .fill(fill)
+                        .stroke(Stroke::NONE)
+                        .rounding(Rounding::same(9.0))
+                        .min_size(egui::vec2(0.0, 20.0)),
+                    );
+                    if resp.clicked() && !is_active {
+                        clicked = Some(idx);
+                    }
+                }
+            });
+        });
+    clicked
+}
+
+/// A 1-pixel vertical hairline used to break a toolbar into action
+/// groups. Reads as a quieter visual delimiter than `ui.separator()`
+/// (which is full-width and adds vertical breathing room we don't want
+/// in a compact toolbar row).
+pub fn toolbar_divider(ui: &mut egui::Ui) {
+    let visuals = ui.visuals();
+    let fg = visuals
+        .override_text_color
+        .unwrap_or(visuals.widgets.inactive.fg_stroke.color);
+    let bg = visuals.panel_fill;
+    let stroke_color = Color32::from_rgba_unmultiplied(
+        ((fg.r() as u16 + bg.r() as u16) / 2) as u8,
+        ((fg.g() as u16 + bg.g() as u16) / 2) as u8,
+        ((fg.b() as u16 + bg.b() as u16) / 2) as u8,
+        70,
+    );
+    let height = ui.spacing().interact_size.y * 0.6;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, height), egui::Sense::hover());
+    let cx = rect.center().x;
+    ui.painter().line_segment(
+        [egui::pos2(cx, rect.top()), egui::pos2(cx, rect.bottom())],
+        Stroke::new(1.0, stroke_color),
+    );
+    ui.add_space(2.0);
+}
